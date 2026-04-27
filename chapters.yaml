@@ -1,0 +1,264 @@
+# FreeBSD Internals for Students — Chapter Configuration
+# Each chapter is one agent run that produces a README file.
+#
+# Fields:
+#   title        — chapter heading
+#   output_file  — where to write (relative to FreeBSD src root)
+#   source_dirs  — directories the agent should explore
+#   source_files — specific files the agent should examine
+#   focus        — what aspect to emphasize
+#   key_questions — questions the chapter must answer
+#   mermaid      — what diagram to include (sequence / flowchart / class / state)
+
+chapters:
+  - title: "FreeBSD Source Tree Overview"
+    output_file: "README.md"
+    source_dirs: []
+    source_files:
+      - "README.md"
+      - "Makefile"
+      - "UPDATING"
+    focus: >
+      Map the FreeBSD source tree layout. Explain how the build system organizes
+      userland, kernel, libraries, and contributed code. Cover the roles of
+      bin/, sbin/, usr.bin/, usr.sbin/, lib/, sys/, stand/, contrib/, and gnu/.
+    key_questions:
+      - "How does the FreeBSD build system (make buildworld) traverse the tree?"
+      - "What is the separation between base system and contrib code?"
+      - "How are architecture-specific files organized?"
+    mermaid: flowchart
+
+  - title: "The FreeBSD Kernel — Structure and Entry Point"
+    output_file: "sys/README.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/amd64/amd64"
+      - "sys/arm64/arm64"
+    source_files:
+      - "sys/kern/init_main.c"
+      - "sys/amd64/amd64/locore.S"
+      - "sys/arm64/arm64/locore.S"
+      - "sys/kern/sys_init.c"
+    focus: >
+      Trace kernel startup from _start through cpu_startup to init_main.
+      Explain SI_SUB ordering, how subsystems are initialized, and the
+      difference between early boot and userland bootstrap.
+    key_questions:
+      - "What happens between the last instruction of the bootloader and the first userland process?"
+      - "How does the sysinit framework organize initialization?"
+      - "What is the role of locore.S on each architecture?"
+    mermaid: sequence
+
+  - title: "UEFI Bootloader-to-Kernel Handoff"
+    output_file: "stand/efi/loader/README.md"
+    source_dirs:
+      - "stand/efi/loader"
+      - "stand/efi/loader/arch/amd64"
+      - "stand/efi/loader/arch/arm64"
+    source_files:
+      - "stand/efi/loader/arch/amd64/elf64_freebsd.c"
+      - "stand/efi/loader/arch/arm64/elf64_freebsd.c"
+    focus: >
+      Document how loader.efi loads the kernel, passes the EFI memory map,
+      and hands off control. Compare x86_64 and ARM64 boot metadata mechanisms.
+    key_questions:
+      - "How does the bootloader pass the memory map to the kernel?"
+      - "What is struct bootinfo / bi_module and how is it used?"
+      - "Why is the EFI memory map critical for VM initialization?"
+    mermaid: sequence
+
+  - title: "Virtual Memory Subsystem"
+    output_file: "sys/vm/README.md"
+    source_dirs:
+      - "sys/vm"
+      - "sys/amd64/amd64"
+    source_files:
+      - "sys/vm/vm_page.c"
+      - "sys/vm/vm_map.c"
+      - "sys/vm/vm_object.c"
+      - "sys/vm/pmap.h"
+      - "sys/amd64/amd64/pmap.c"
+    focus: >
+      Explain the FreeBSD VM architecture: vm_map entries, vm_objects,
+      vm_pages, and the pmap layer. Cover page faults, virtual-to-physical
+      translation, and the buddy allocator.
+    key_questions:
+      - "How does FreeBSD organize virtual address spaces?"
+      - "What is the relationship between vm_map, vm_object, and vm_page?"
+      - "How does the pmap layer abstract hardware page tables?"
+    mermaid: class
+
+  - title: "Process Management and Scheduling"
+    output_file: "sys/kern/README_process.md"
+    source_dirs:
+      - "sys/kern"
+    source_files:
+      - "sys/kern/kern_fork.c"
+      - "sys/kern/kern_exit.c"
+      - "sys/kern/sched_4bsd.c"
+      - "sys/kern/sys_process.c"
+    focus: >
+      Cover process creation (fork/exec), the process struct (struct proc),
+      thread representation (struct thread), and the 4BSD scheduler.
+      Explain run queues, time slicing, and CPU assignment.
+    key_questions:
+      - "How does fork() create a new process in FreeBSD?"
+      - "What is the relationship between proc and thread structures?"
+      - "How does the 4BSD scheduler decide which thread runs next?"
+    mermaid: sequence
+
+  - title: "The Buffer Cache and I/O Subsystem"
+    output_file: "sys/vm/README_bcache.md"
+    source_dirs:
+      - "sys/vm"
+      - "sys/sys"
+    source_files:
+      - "sys/vm/buf2.c"
+      - "sys/vm/pageable.c"
+      - "sys/sys/buf.h"
+    focus: >
+      Explain the buffer cache (buf), its relationship to the VM system,
+      and how disk I/O flows from VFS through the buffer cache to bio
+      providers. Cover bufstate, dirty buffers, and writeback.
+    key_questions:
+      - "What is the struct buf and how does it cache disk blocks?"
+      - "How does the buffer cache interact with the VM page cache?"
+      - "What happens when a dirty buffer is written back to disk?"
+    mermaid: flowchart
+
+  - title: "Virtual File System (VFS) Layer"
+    output_file: "sys/fs/README.md"
+    source_dirs:
+      - "sys/fs"
+      - "sys/kern"
+    source_files:
+      - "sys/kern/vfs_mount.c"
+      - "sys/kern/vfs_lookup.c"
+      - "sys/kern/vfs_syscalls.c"
+      - "sys/sys/mount.h"
+      - "sys/sys/vnode.h"
+    focus: >
+      Document the VFS abstraction layer: how FreeBSD provides a uniform
+      interface over UFS, ZFS, tmpfs, and network filesystems. Cover
+      vnode operations, mount points, and the namecache.
+    key_questions:
+      - "How does VFS abstract different filesystem implementations?"
+      - "What is a vnode and how does it relate to inodes?"
+      - "How does pathname resolution work (VOP_LOOKUP)?"
+    mermaid: class
+
+  - title: "UFS Filesystem Implementation"
+    output_file: "sys/ufs/README.md"
+    source_dirs:
+      - "sys/ufs"
+    source_files:
+      - "sys/ufs/ufs/ufsmount.h"
+      - "sys/ufs/ufs/ufs_extern.h"
+      - "sys/ufs/ffs/ffs_alloc.c"
+      - "sys/ufs/ffs/ffs_softdep.c"
+    focus: >
+      Explain UFS on-disk format: superblock, cylinder groups, inodes,
+      and data blocks. Cover the Fast Filesystem (FFS) improvements,
+      soft updates, and allocation strategies.
+    key_questions:
+      - "How are cylinder groups organized and why do they matter?"
+      - "What is the soft updates mechanism and what problem does it solve?"
+      - "How does FFS allocate inodes and data blocks?"
+    mermaid: flowchart
+
+  - title: "Network Stack Architecture"
+    output_file: "sys/net/README.md"
+    source_dirs:
+      - "sys/net"
+      - "sys/netinet"
+    source_files:
+      - "sys/net/socket.c"
+      - "sys/net/netisr.c"
+      - "sys/net/if.c"
+      - "sys/netinet/ip_input.c"
+      - "sys/netinet/ip_output.c"
+      - "sys/netinet/tcp_input.c"
+    focus: >
+      Trace the network input and output paths: from driver receive
+      interrupt through netisr, protocol dispatch, socket buffers, and
+      into userland. Cover the socket API, ifnet, and network threads.
+    key_questions:
+      - "How does a packet travel from NIC driver to userland socket?"
+      - "What is netisr and why does FreeBSD use network threads?"
+      - "How are socket buffers (sbappend/sbreserve) managed?"
+    mermaid: sequence
+
+  - title: "Device Driver Framework"
+    output_file: "sys/kern/README_driver.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/dev"
+    source_files:
+      - "sys/kern/subr_bus.c"
+      - "sys/kern/bus.h"
+      - "sys/dev/cd9660/cd9660_node.c"
+    focus: >
+      Document the FreeBSD bus/device/driver framework: how devices are
+      enumerated, how drivers attach, and the resource management system.
+      Cover the devclass, device_t, and the attach/detach lifecycle.
+    key_questions:
+      - "How does the FreeBSD device framework discover and attach drivers?"
+      - "What is the bus_space/bus_tag abstraction?"
+      - "How do drivers request and manage resources (IRQ, DMA, I/O ports)?"
+    mermaid: sequence
+
+  - title: "Interrupt Handling"
+    output_file: "sys/kern/README_intr.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/amd64/include"
+      - "sys/arm64/arm64"
+    source_files:
+      - "sys/kern/kern_intr.c"
+      - "sys/amd64/amd64/machintr.c"
+    focus: >
+      Explain how FreeBSD handles hardware interrupts: from the hardware
+      interrupt through the IDT/GIC to the ithread framework. Cover
+      fast interrupts, filter/action pairs, and SMP interrupt routing.
+    key_questions:
+      - "How does an interrupt go from hardware to driver callback?"
+      - "What is the filter/action interrupt registration model?"
+      - "How does FreeBSD handle interrupts in an SMP environment?"
+    mermaid: sequence
+
+  - title: "Jails and System Isolation"
+    output_file: "sys/kern/README_jail.md"
+    source_dirs:
+      - "sys/kern"
+    source_files:
+      - "sys/kern/kern_jail.c"
+      - "sys/sys/jail.h"
+    focus: >
+      Document the FreeBSD jail implementation: how jails provide system
+      isolation, the jail parameter structure, and the security boundaries.
+      Cover network stacks, mount namespaces, and capabilities.
+    key_questions:
+      - "How does a jail isolate a process from the host system?"
+      - "What syscalls are restricted in a jail and how?"
+      - "What is the difference between jail parameters (allow.*)?"
+    mermaid: flowchart
+
+  - title: "The FreeBSD Build System"
+    output_file: "share/mk/README.md"
+    source_dirs:
+      - "share/mk"
+      - "tools/build"
+    source_files:
+      - "Makefile.inc1"
+      - "share/mk/bsd.sys.mk"
+      - "share/mk/bsd.kern.mk"
+      - "share/mk/bsd.prog.mk"
+    focus: >
+      Explain how FreeBSD builds: the Makefile hierarchy, .conf files,
+      options handling, and the difference between buildworld and buildkernel.
+      Cover the staging areas and dependency tracking.
+    key_questions:
+      - "How does 'make buildworld' orchestrate the full build?"
+      - "What is the role of Makefile.inc1?"
+      - "How are kernel .conf files processed into source sets?"
+    mermaid: flowchart

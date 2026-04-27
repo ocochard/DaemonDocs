@@ -1,0 +1,2510 @@
+#!/usr/bin/env python3
+"""
+FreeBSD Internals for Students — Documentation Generator
+
+Uses smolagents to produce README.md files throughout the FreeBSD
+source tree. Each chapter is driven by chapters.yaml and the agent has
+access to:
+  - The FreeBSD source code  (read_freebsd_source)
+  - A semantic search index of FreeBSD books (search_books)
+  - The source tree structure (explore_tree)
+
+Usage:
+  python3 FreeBSD/generate-doc.py                 # run all chapters
+  python3 FreeBSD/generate-doc.py --chapter 2     # run only chapter 2 (1-based)
+  python3 FreeBSD/generate-doc.py --index-only    # just build the book index
+  python3 FreeBSD/generate-doc.py --force         # regenerate even if exists
+  python3 FreeBSD/generate-doc.py --dry-run       # show what would happen
+  python3 FreeBSD/generate-doc.py --reindex       # rebuild book index from scratch
+
+Environment:
+  FREEBSD_SRC  — root of FreeBSD git tree (default: $HOME/freebsd-src)
+  BOOKS_DIR    — directory with PDF/CHM/EPUB books (default: $HOME/books)
+
+Requirements:
+  python3 -m pip install --user -r FreeBSD/requirements.txt
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import textwrap
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import yaml
+from PyPDF2 import PdfReader
+from smolagents import CodeAgent, OpenAIServerModel, Tool
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SRC_ROOT = os.path.expandvars(
+    os.environ.get("FREEBSD_SRC", "${HOME}/freebsd-src")
+)
+BOOKS_DIR = os.path.expandvars(
+    os.environ.get("BOOKS_DIR", "${HOME}/books")
+)
+INDEX_DIR = SCRIPT_DIR / ".index"
+CHAPTERS_FILE = SCRIPT_DIR / "chapters.yaml"
+
+# FreeBSD documentation project (Handbook, articles, etc.)
+FREEBSD_DOC = os.path.expandvars(
+    os.environ.get("FREEBSD_DOC", "${HOME}/freebsd-doc/documentation/content/en")
+)
+
+# Adjust for your local LLM server
+MODEL_CONFIG = {
+    "model_id": "qwen36-coder",
+    "api_base": "http://localhost:8080/v1",
+    "api_key": "none",
+}
+
+# ---------------------------------------------------------------------------
+# 1. Book Text Extraction (PDF / CHM / EPUB)
+# ---------------------------------------------------------------------------
+
+
+def _extract_pdf(filepath: str) -> List[str]:
+    """Extract text from PDF — one string per page."""
+    pages = []
+    try:
+        reader = PdfReader(filepath)
+        for page in reader.pages:
+            txt = page.extract_text()
+            if txt:
+                pages.append(txt)
+    except Exception as e:
+        print(f"    warning: could not extract {filepath}: {e}")
+    return pages
+
+
+def _extract_chm(filepath: str) -> List[str]:
+    """
+    Extract text from CHM via hhextract (hh suite).
+    CHM = Microsoft ITSF format — not a standard ZIP.
+    Falls back to a warning if hhextract is not available.
+    """
+    tmp_dir = INDEX_DIR / "chm_tmp"
+    tmp_dir.mkdir(exist_ok=True)
+
+    ret = os.system(f"hhextract -o '{tmp_dir}' '{filepath}' 2>/dev/null")
+    if ret != 0:
+        print(f"    warning: cannot extract CHM {os.path.basename(filepath)}")
+        print(f"            install 'hhextract' (hh suite) to support CHM books")
+        return []
+
+    pages = []
+    for html_file in sorted(tmp_dir.glob("**/*.html"), key=lambda x: x.name):
+        try:
+            text = re.sub(r"<[^>]+>", " ", html_file.read_text(errors="ignore"))
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > 50:
+                pages.append(text)
+        except Exception:
+            continue
+    return pages
+
+
+def _extract_epub(filepath: str) -> List[str]:
+    """EPUB is a ZIP of XHTML files — extract text from each."""
+    pages = []
+    try:
+        with zipfile.ZipFile(filepath, "r") as z:
+            for name in sorted(z.namelist()):
+                if name.endswith((".xhtml", ".html")):
+                    content = z.read(name).decode("utf-8", errors="ignore")
+                    text = re.sub(r"<[^>]+>", " ", content)
+                    text = re.sub(r"\s+", " ", text).strip()
+                    if len(text) > 50:
+                        pages.append(text)
+    except Exception as e:
+        print(f"    warning: could not extract EPUB {filepath}: {e}")
+    return pages
+
+
+def build_book_corpus(books_dir: str, force: bool = False) -> str:
+    """
+    Extract text from all books in books_dir.
+    Incremental: skip unchanged files (by hash).
+    Returns path to the consolidated corpus file.
+    """
+    corpus_file = INDEX_DIR / "books_corpus.txt"
+    hash_file = INDEX_DIR / "book_hashes.json"
+    INDEX_DIR.mkdir(exist_ok=True)
+
+    # Previous hashes
+    prev_hashes = {}
+    if hash_file.exists():
+        prev_hashes = json.loads(hash_file.read_text())
+
+    # Discover books
+    book_files = []
+    for ext in ("*.pdf", "*.PDF", "*.chm", "*.CHM", "*.epub", "*.EPUB"):
+        book_files.extend(glob.glob(os.path.join(books_dir, "**", ext), recursive=True))
+    book_files = sorted(set(book_files))
+
+    if not book_files:
+        print(f"  warning: no book files found in {books_dir}")
+        return str(corpus_file)
+
+    extractors = {
+        ".pdf": _extract_pdf,
+        ".chm": _extract_chm,
+        ".epub": _extract_epub,
+    }
+
+    all_entries = []  # (book_name, page_text)
+    current_hashes = {}
+
+    for bp in book_files:
+        h = hashlib.md5(open(bp, "rb").read()[:8192]).hexdigest()
+        current_hashes[bp] = h
+
+        if not force and prev_hashes.get(bp) == h:
+            print(f"  skip  {os.path.basename(bp)} (unchanged)")
+            continue
+
+        print(f"  extract {os.path.basename(bp)} ...")
+        ext = os.path.splitext(bp)[1].lower()
+        extractor = extractors.get(ext)
+        if extractor:
+            pages = extractor(bp)
+            all_entries.extend((os.path.basename(bp), p) for p in pages)
+            print(f"         {len(pages)} pages")
+
+    # Write corpus — preserve existing FreeBSD docs (appended by extract_freebsd_docs)
+    # On incremental runs, all_entries only has changed books, so we need to keep
+    # unchanged book content + FreeBSD docs from the previous corpus.
+    previous_corpus = ""
+    if not force and corpus_file.exists():
+        previous_corpus = corpus_file.read_text(encoding="utf-8", errors="ignore")
+
+    with open(corpus_file, "w", encoding="utf-8") as f:
+        # Write previous content (unchanged books + FreeBSD docs)
+        if previous_corpus:
+            # Strip entries that are being re-extracted (they'll be rewritten below)
+            if all_entries:
+                re_extracted = {os.path.basename(bp) for bp in book_files
+                                if prev_hashes.get(bp) != current_hashes.get(bp)
+                                or (force and bp in current_hashes)}
+                # Keep only segments whose source is NOT being re-extracted
+                segments = re.split(r"### SOURCE: (.+?) ###", previous_corpus)
+                # segments: [before, source1, text1, source2, text2, ...]
+                kept = segments[0:1]  # leading text before first source
+                for i in range(1, len(segments), 2):
+                    src = segments[i].strip()
+                    if src not in re_extracted:
+                        kept.append(segments[i])
+                        kept.append(segments[i + 1])
+                previous_corpus = "".join(kept) if kept else ""
+            f.write(previous_corpus)
+        # Write newly extracted book pages
+        for book_name, page_text in all_entries:
+            f.write(f"\n\n### SOURCE: {book_name} ###\n\n")
+            f.write(page_text)
+
+    hash_file.write_text(json.dumps(current_hashes, indent=2))
+    print(f"\n  corpus: {len(all_entries)} pages from {len(current_hashes)} books\n")
+    return str(corpus_file)
+
+
+def _clean_troff(text: str) -> str:
+    """
+    Convert troff/groff man page source to readable plain text.
+
+    Handles indentation (.in), paragraph macros (.PP, .LP, .P),
+    section headings (.SH), function names (.Fn), file paths (.Pa),
+    emphasis (.Em), bold (.Bf/.Ef), and removes control requests.
+
+    Pure Python — no unfmt/mandoc dependency needed.
+    """
+    lines = text.split("\n")
+    cleaned = []
+    indent = 0
+
+    for line in lines:
+        # Handle indentation
+        if line.startswith(".in +"):
+            indent += 1
+            continue
+        elif line.startswith(".in -"):
+            indent = max(0, indent - 1)
+            continue
+        elif line.startswith(".in") and "\\&" not in line:
+            # Reset indent on bare .in
+            m = re.match(r"\.in\s*(\d*)", line)
+            if m:
+                indent = int(m.group(1) or 0)
+            continue
+
+        # Section headings
+        m = re.match(r"\.SH\s+(.+)", line)
+        if m:
+            cleaned.append("\n" + m.group(1).strip().upper() + "\n" + "=" * len(m.group(1)))
+            continue
+
+        # Sub-section headings
+        m = re.match(r"\.SS\s+(.+)", line)
+        if m:
+            cleaned.append("\n" + m.group(1).strip() + "\n" + "-" * len(m.group(1)))
+            continue
+
+        # Paragraph macros — skip, just add blank line
+        if line.strip() in (".PP", ".LP", ".P", ".np", ".LP0"):
+            if cleaned and cleaned[-1]:
+                cleaned.append("")
+            continue
+
+        # Block formatting
+        if line.strip().startswith(".Bf"):
+            continue
+        if line.strip() in (".Ef", ".Fl", ".Bl -bullet", ".Bl -dash",
+                            ".Bl -item", ".Bl -enum", ".El", ".It"):
+            continue
+
+        # Remove other troff requests (lines starting with .)
+        if re.match(r"^\.\w+", line) and not re.match(r"^\.\s*$", line):
+            continue
+
+        # Clean inline macros
+        t = line
+        t = re.sub(r"\\f[BIPR]", "", t)       # font changes
+        t = re.sub(r"\\f\^", "", t)           # font reset
+        t = re.sub(r"\\[fFnPaIcE]*\[?", "", t)  # remaining macro noise
+
+        # Expand common inline macros
+        t = re.sub(r"\.Em\s+(.+)", r"\1", t)     # emphasis
+        t = re.sub(r"\.Fa\s+(.+)", r"\1", t)     # function arg
+        t = re.sub(r"\.Fn\s+(.+)", r"\1", t)     # function name
+        t = re.sub(r"\.Pa\s+(.+)", r"\1", t)     # path
+        t = re.sub(r"\.Sy\s+(.+)", r"\1", t)     # synonym
+        t = re.sub(r"\.Dv\s+(.+)", r"\1", t)     # device/value
+        t = re.sub(r"\.Va\s+(.+)", r"\1", t)     # variable
+        t = re.sub(r"\.Fl\s+(\S+)", r"\1", t)    # flag
+
+        # Remove special characters
+        t = t.replace("\\&", "")    # escaped space
+        t = t.replace("\\~", "~")   # tilde
+        t = t.replace("\\-", "-")   # hyphen
+        t = t.replace("\\(em", "\"")  # em dash
+        t = t.replace("\\(en", "'")   # en dash
+        t = t.replace("\\(aq", "'")   # apostrophe
+
+        # Apply indentation
+        if t.strip():
+            cleaned.append("    " * indent + t.strip())
+        else:
+            cleaned.append("")
+
+    # Collapse excessive blank lines
+    result = "\n".join(cleaned)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
+def _clean_asciidoc(text: str) -> str:
+    """
+    Convert AsciiDoc source to readable plain text.
+
+    Strips AsciiDoc markup: includes, conditional blocks, attributes,
+    role markers, section headers, and list markers. Keeps the prose.
+    """
+    lines = text.split("\n")
+    cleaned = []
+
+    for line in lines:
+        # Skip include directives
+        if line.strip().startswith("include::"):
+            continue
+        # Skip conditional blocks
+        if line.strip().startswith("ifdef::") or line.strip().startswith("ifndef::"):
+            continue
+        if line.strip() in ("endif::[]", "endif::"):
+            continue
+        # Skip attribute definitions
+        if re.match(r"^[=:]\w+", line) or line.strip().startswith(":"):
+            continue
+        # Skip YAML frontmatter delimiters
+        if line.strip() == "---":
+            continue
+        # Skip role/anchor markers
+        if line.strip().startswith("[[") or line.strip().startswith("[["):
+            continue
+
+        t = line
+        # Remove AsciiDoc section headers (= Header)
+        t = re.sub(r"^={1,6}\s+", "", t)
+        # Remove bold/italic markup
+        t = re.sub(r"[*_`]{1,3}([^*_`]+)[*_`]{1,3}", r"\1", t)
+        # Remove link syntax [[anchor]], link:url[text], https:url[]
+        t = re.sub(r"\[\[.*?\]\]", "", t)
+        t = re.sub(r"link:\S+\[([^\]]*)\]", r"\1", t)
+        t = re.sub(r"https?://\S+\[\]", "", t)
+        # Remove role markers
+        t = re.sub(r"\[^.*?\]", "", t)
+        # Remove list markers
+        t = re.sub(r"^(?:[*\-•]|\d+\.)\s+", "", t)
+        # Remove inline source code backticks
+        t = t.replace("`, ", " ").replace(", `", " ").replace("`", "")
+
+        if t.strip():
+            cleaned.append(t.strip())
+        else:
+            cleaned.append("")
+
+    result = "\n".join(cleaned)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
+def _extract_git_log(src_root: str, path: str, max_commits: int = 15) -> str:
+    """
+    Extract meaningful commit messages for a source file from git log.
+
+    Returns commit subject + body for the most recent N commits touching
+    this file. This gives the agent context on WHY code was written a
+    certain way — design decisions, bug fixes, refactoring rationale.
+
+    Uses `git log --follow` to track file renames.
+    """
+    full = os.path.join(src_root, path)
+    try:
+        result = subprocess.run(
+            ["git", "-C", src_root, "log", "--follow",
+             f"--format=%h%n%s%n%b%n---COMMIT_SEP---",
+             "-n", str(max_commits), "--", full],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+
+        commits = result.stdout.split("---COMMIT_SEP---")
+        entries = []
+        for commit in commits:
+            commit = commit.strip()
+            if not commit:
+                continue
+            lines = commit.split("\n")
+            hash_ = lines[0] if lines else ""
+            subject = lines[1] if len(lines) > 1 else ""
+            body = "\n".join(lines[2:]) if len(lines) > 2 else ""
+
+            # Skip merge commits and trivial messages
+            if subject.startswith("Merge ") or len(subject) < 10:
+                continue
+
+            entry = f"  {hash_}: {subject}"
+            if body.strip():
+                entry += f"\n  {body.strip()[:300]}"
+            entries.append(entry)
+
+        return "\n\n".join(entries[:max_commits])
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        return ""
+
+
+def extract_freebsd_docs(src_root: str, corpus_file: str) -> int:
+    """
+    Extract FreeBSD man pages (man9), technical papers, kernel docs,
+    freebsd-doc handbook articles, and git commit log context
+    into the book corpus. Appends to the existing corpus file.
+
+    Sources:
+      - share/man/man9/* — kernel API man pages (troff format)
+      - share/doc/papers/* — technical papers
+      - sys/README.md — kernel source roadmap
+      - tools/kerneldoc/ — Doxygen subsystem descriptions
+      - $HOME/freebsd-doc/documentation/content/en/ — Handbook, FAQ, articles (AsciiDoc)
+      - git log of key source files — developer commit messages (design rationale)
+
+    Returns the number of documents extracted.
+    """
+    all_entries = []  # (source_label, text)
+
+    # --- man9 kernel API man pages ---
+    man9_dir = os.path.join(src_root, "share", "man", "man9")
+    if os.path.isdir(man9_dir):
+        for fname in sorted(os.listdir(man9_dir)):
+            if not fname.endswith(".man9") and not fname.endswith(".9"):
+                continue
+            fpath = os.path.join(man9_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                raw = Path(fpath).read_text(errors="ignore")
+                text = _clean_troff(raw)
+                if len(text) > 200:  # skip empty/broken pages
+                    label = f"FreeBSD man9: {fname}"
+                    all_entries.append((label, text))
+            except Exception:
+                continue
+
+    # --- technical papers ---
+    papers_dir = os.path.join(src_root, "share", "doc", "papers")
+    if os.path.isdir(papers_dir):
+        for fname in sorted(os.listdir(papers_dir)):
+            fpath = os.path.join(papers_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                if fname.endswith((".txt", ".md", ".asc")):
+                    text = Path(fpath).read_text(errors="ignore")
+                elif fname.endswith((".gz", ".bz2")):
+                    # Skip compressed — would need decompression
+                    continue
+                else:
+                    # Try as plain text
+                    text = Path(fpath).read_text(errors="ignore")
+                if len(text) > 200:
+                    label = f"FreeBSD paper: {fname}"
+                    all_entries.append((label, text))
+            except Exception:
+                continue
+
+    # --- sys/README.md (kernel roadmap) ---
+    sys_readme = os.path.join(src_root, "sys", "README.md")
+    if os.path.isfile(sys_readme):
+        try:
+            text = Path(sys_readme).read_text(errors="ignore")
+            if len(text) > 100:
+                all_entries.append(("FreeBSD sys/README.md", text))
+        except Exception:
+            pass
+
+    # --- tools/kerneldoc Doxyfiles (subsystem descriptions) ---
+    kerneldoc_dir = os.path.join(src_root, "tools", "kerneldoc")
+    if os.path.isdir(kerneldoc_dir):
+        for fname in sorted(os.listdir(kerneldoc_dir)):
+            if not fname.startswith("Doxyfile-"):
+                continue
+            fpath = os.path.join(kerneldoc_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                text = Path(fpath).read_text(errors="ignore")
+                if len(text) > 50:
+                    label = f"FreeBSD kerneldoc: {fname}"
+                    all_entries.append((label, text[:3000]))  # limit size
+            except Exception:
+                continue
+
+    # --- freebsd-doc handbook/articles (AsciiDoc, English only) ---
+    freebsd_doc_dir = FREEBSD_DOC
+    if os.path.isdir(freebsd_doc_dir):
+        for root, _dirs, files in os.walk(freebsd_doc_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".adoc"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    raw = Path(fpath).read_text(errors="ignore")
+                    text = _clean_asciidoc(raw)
+                    if len(text) > 200:
+                        rel = os.path.relpath(fpath, freebsd_doc_dir)
+                        label = f"FreeBSD Handbook: {rel}"
+                        all_entries.append((label, text))
+                except Exception:
+                    continue
+
+    # --- git commit log for key kernel subsystems (design rationale) ---
+    key_paths_for_log = [
+        "sys/kern/init_main.c",
+        "sys/vm/vm_page.c",
+        "sys/vm/vm_map.c",
+        "sys/vm/vm_object.c",
+        "sys/kern/kern_fork.c",
+        "sys/kern/kern_exit.c",
+        "sys/kern/kern_jail.c",
+        "sys/kern/vfs_mount.c",
+        "sys/kern/vfs_lookup.c",
+        "sys/net/socket.c",
+        "sys/net/netisr.c",
+        "sys/net/if.c",
+        "sys/netinet/ip_input.c",
+        "sys/ufs/ffs/ffs_softdep.c",
+        "sys/kern/subr_bus.c",
+        "sys/kern/kern_intr.c",
+        "sys/vm/buf2.c",
+    ]
+    for kp in key_paths_for_log:
+        full = os.path.join(src_root, kp)
+        if os.path.isfile(full):
+            log_text = _extract_git_log(src_root, kp)
+            if log_text:
+                label = f"FreeBSD git log: {kp}"
+                all_entries.append((label, log_text))
+
+    # Write to corpus — first strip any existing FreeBSD docs entries to avoid duplicates
+    if os.path.exists(corpus_file):
+        old_content = Path(corpus_file).read_text(encoding="utf-8", errors="ignore")
+        # Remove existing FreeBSD-sourced entries (man9, paper, Handbook, git log, kerneldoc, sys/README)
+        segments = re.split(r"### SOURCE: (.+?) ###", old_content)
+        kept = [segments[0]] if segments else []  # leading text before first source
+        freebsd_prefixes = ("FreeBSD man9:", "FreeBSD paper:", "FreeBSD Handbook:",
+                            "FreeBSD git log:", "FreeBSD kerneldoc:", "FreeBSD sys/")
+        for i in range(1, len(segments), 2):
+            src = segments[i].strip()
+            if not any(src.startswith(p) for p in freebsd_prefixes):
+                kept.append(segments[i])
+                if i + 1 < len(segments):
+                    kept.append(segments[i + 1])
+        old_content = "".join(kept) if kept else ""
+
+        with open(corpus_file, "w", encoding="utf-8") as f:
+            f.write(old_content)
+            for label, text in all_entries:
+                f.write(f"\n\n### SOURCE: {label} ###\n\n")
+                f.write(text)
+    else:
+        with open(corpus_file, "a", encoding="utf-8") as f:
+            for label, text in all_entries:
+                f.write(f"\n\n### SOURCE: {label} ###\n\n")
+                f.write(text)
+
+    # Count by category
+    man_count = sum(1 for l, _ in all_entries if "man9" in l)
+    paper_count = sum(1 for l, _ in all_entries if "paper" in l)
+    handbook_count = sum(1 for l, _ in all_entries if "Handbook" in l)
+    git_count = sum(1 for l, _ in all_entries if "git log" in l)
+    other_count = sum(
+        1 for l, _ in all_entries
+        if "man9" not in l and "paper" not in l
+        and "Handbook" not in l and "git log" not in l
+    )
+    parts = []
+    if man_count:
+        parts.append(f"{man_count} man9 pages")
+    if paper_count:
+        parts.append(f"{paper_count} papers")
+    if handbook_count:
+        parts.append(f"{handbook_count} handbook articles")
+    if git_count:
+        parts.append(f"{git_count} git log contexts")
+    if other_count:
+        parts.append(f"{other_count} other docs")
+
+    if parts:
+        print(f"  FreeBSD docs: {', '.join(parts)}")
+    else:
+        print(f"  FreeBSD docs: none found (src tree may be incomplete)")
+
+    return len(all_entries)
+
+
+# ---------------------------------------------------------------------------
+# 2. TF-IDF Semantic Search (numpy only — no heavy ML deps)
+# ---------------------------------------------------------------------------
+
+
+class TfidfIndex:
+    """
+    Lightweight TF-IDF index over text chunks.
+    Uses numpy for vector math — no scikit-learn or PyTorch needed.
+    """
+
+    CHUNK_SIZE = 1200
+    CHUNK_OVERLAP = 200
+
+    def __init__(self):
+        self.chunks = []        # list of (source_label, text)
+        self.vocab = {}         # term → col_index
+        self.tf_idf_matrix = None  # numpy 2darray, rows=chunks
+        self.sources = []       # parallel list of source labels
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text.lower())
+
+    @staticmethod
+    def _split_by_paragraphs(text: str) -> List[str]:
+        """Split text into paragraphs (separated by blank lines)."""
+        paragraphs = re.split(r'\n\s*\n', text)
+        return [p.strip() for p in paragraphs if len(p.strip()) > 30]
+
+    @staticmethod
+    def _split_by_asciidoc_sections(text: str) -> List[str]:
+        """Split AsciiDoc text by level-1/level-2 headers (== Title)."""
+        parts = re.split(r'\n==+\s+', text)
+        return [p.strip() for p in parts if len(p.strip()) > 100]
+
+    @staticmethod
+    def _split_by_git_commits(text: str) -> List[str]:
+        """Split git log text by commit entries (hash on its own line)."""
+        parts = re.split(r'\n(?=[0-9a-f]{7,})', text)
+        return [p.strip() for p in parts if len(p.strip()) > 50]
+
+    @staticmethod
+    def _merge_paragraphs(paragraphs: List[str], max_size: int) -> List[str]:
+        """Merge paragraphs into chunks up to max_size chars, keeping boundaries."""
+        if not paragraphs:
+            return []
+        chunks = []
+        current = paragraphs[0]
+        for para in paragraphs[1:]:
+            # Try adding the next paragraph
+            candidate = current + "\n\n" + para
+            if len(candidate) <= max_size:
+                current = candidate
+            else:
+                chunks.append(current)
+                current = para
+        chunks.append(current)
+        return chunks
+
+    def _chunk_text(self, text: str, source: str):
+        """Split text into overlapping chunks by semantic boundaries."""
+        # Detect source type from source label
+        is_asciidoc = "freebsd-doc" in source.lower() or "handbook" in source.lower()
+        is_git_log = source.startswith("FreeBSD git log")
+        is_manpage = source.startswith("FreeBSD man9")
+
+        paragraphs = []
+        if is_asciidoc:
+            paragraphs = self._split_by_asciidoc_sections(text)
+        elif is_git_log:
+            paragraphs = self._split_by_git_commits(text)
+        else:
+            paragraphs = self._split_by_paragraphs(text)
+
+        if not paragraphs:
+            # Fallback to fixed-size chunking
+            self._chunk_text_fixed(text, source)
+            return
+
+        # Merge paragraphs into chunks respecting boundaries
+        merged = self._merge_paragraphs(paragraphs, self.CHUNK_SIZE)
+
+        # Add overlap between chunks
+        for i, chunk in enumerate(merged):
+            if len(chunk) < 100:
+                continue
+            # Add tail overlap from next chunk
+            if i + 1 < len(merged):
+                next_chunk = merged[i + 1]
+                overlap_text = "\n\n" + next_chunk[:self.CHUNK_OVERLAP]
+                chunk = chunk + overlap_text
+            self.chunks.append((source, chunk))
+
+    def _chunk_text_fixed(self, text: str, source: str):
+        """Fallback: split text into overlapping fixed-size chunks."""
+        for i in range(0, max(0, len(text) - self.CHUNK_OVERLAP),
+                       self.CHUNK_SIZE - self.CHUNK_OVERLAP):
+            chunk = text[i : i + self.CHUNK_SIZE]
+            if len(chunk) > 200:  # skip tiny fragments
+                self.chunks.append((source, chunk))
+
+    def build(self, corpus_path: str):
+        """Build index from corpus file."""
+        print("  tokenizing corpus ...")
+        content = Path(corpus_path).read_text(encoding="utf-8", errors="ignore")
+
+        # Split by source markers
+        segments = re.split(r"### SOURCE: (.+?) ###", content)
+        # segments: [before, source1, text1, source2, text2, ...]
+        for i in range(1, len(segments), 2):
+            self._chunk_text(segments[i + 1], segments[i].strip())
+
+        if not self.chunks:
+            print("  warning: no chunks extracted from corpus")
+            return
+
+        # Build vocabulary
+        doc_freq: Dict[str, int] = {}
+        chunk_terms: List[set] = []
+
+        for _, chunk in self.chunks:
+            terms = set(self._tokenize(chunk))
+            chunk_terms.append(terms)
+            for t in terms:
+                doc_freq[t] = doc_freq.get(t, 0) + 1
+
+        # Filter: keep terms that appear in 2..0.5*N documents
+        n = len(self.chunks)
+        self.vocab = {
+            t: idx for idx, (t, df) in enumerate(
+                [(k, v) for k, v in sorted(doc_freq.items()) if 2 <= v <= n * 0.5],
+            )
+        }
+        print(f"  vocabulary: {len(self.vocab)} terms, {len(self.chunks)} chunks")
+
+        # Build TF-IDF matrix
+        matrix = np.zeros((n, len(self.vocab)), dtype=np.float32)
+        for row, terms in enumerate(chunk_terms):
+            tf: Dict[str, int] = {}
+            for t in self._tokenize(self.chunks[row][1]):
+                if t in self.vocab:
+                    tf[t] = tf.get(t, 0) + 1
+            for t, count in tf.items():
+                col = self.vocab[t]
+                idf = math.log(n / (1 + doc_freq[t])) + 1
+                matrix[row, col] = count * idf
+
+        # L2 normalize rows
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        self.tf_idf_matrix = matrix / norms
+        self.sources = [s for s, _ in self.chunks]
+
+    def search(self, query: str, top_k: int = 4) -> List[Tuple[str, str]]:
+        """Return list of (source, chunk_text) most similar to query."""
+        if self.tf_idf_matrix is None or not self.vocab:
+            return []
+
+        qvec = np.zeros(len(self.vocab), dtype=np.float32)
+        for t in self._tokenize(query):
+            if t in self.vocab:
+                qvec[self.vocab[t]] += 1
+
+        norm = np.linalg.norm(qvec)
+        if norm == 0:
+            return []
+        qvec /= norm
+
+        scores = self.tf_idf_matrix @ qvec
+        top_idx = np.argsort(-scores)[:top_k]
+
+        results = []
+        for idx in top_idx:
+            if scores[idx] > 0:
+                results.append((self.sources[idx], self.chunks[idx][1]))
+        return results
+
+    def save(self, path: str):
+        path = str(path)
+        np.save(f"{path}_matrix.npy", self.tf_idf_matrix)
+        with open(f"{path}_meta.json", "w") as f:
+            json.dump({
+                "vocab": self.vocab,
+                "chunks": self.chunks,
+                "sources": self.sources,
+            }, f)
+
+    def load(self, path: str):
+        path = str(path)
+        self.tf_idf_matrix = np.load(f"{path}_matrix.npy")
+        meta = json.loads(Path(f"{path}_meta.json").read_text())
+        self.vocab = meta["vocab"]
+        self.chunks = meta["chunks"]
+        self.sources = meta["sources"]
+
+
+def get_or_build_index(corpus_path: str, force: bool = False) -> TfidfIndex:
+    """Load saved index or build from corpus."""
+    index_path = INDEX_DIR / "tfidf_index"
+
+    if not force and Path(f"{index_path}_matrix.npy").exists():
+        print("  loading saved TF-IDF index ...")
+        idx = TfidfIndex()
+        idx.load(str(index_path))
+        print(f"  index: {len(idx.chunks)} chunks, {len(idx.vocab)} terms")
+        return idx
+
+    print("  building TF-IDF index ...")
+    idx = TfidfIndex()
+    idx.build(corpus_path)
+    idx.save(str(index_path))
+    print("  index saved.\n")
+    return idx
+
+
+# ---------------------------------------------------------------------------
+# 3. smolagent Tools
+# ---------------------------------------------------------------------------
+
+
+class ReadFreeBSDSource(Tool):
+    """Read source code files from the FreeBSD tree."""
+
+    name = "read_freebsd_source"
+    description = (
+        "Read a source file from the FreeBSD source tree. "
+        "Returns up to 4000 chars. Use relative paths like "
+        "'sys/kern/init_main.c' or 'sys/vm/vm_page.c'."
+    )
+    inputs = {
+        "path": {
+            "type": "string",
+            "description": "Path relative to FreeBSD src root",
+        }
+    }
+    output_type = "string"
+
+    def forward(self, path: str) -> str:
+        full = os.path.join(SRC_ROOT, path)
+        try:
+            if not os.path.exists(full):
+                # Try glob for partial matches
+                candidates = glob.glob(full.replace("*", "*"))
+                if candidates:
+                    return f"File not found at exact path, similar files:\n" + "\n".join(
+                        os.path.relpath(c, SRC_ROOT) for c in candidates[:10]
+                    )
+                return f"Error: '{path}' not found in {SRC_ROOT}"
+            content = Path(full).read_text(errors="ignore")
+            if len(content) > 4000:
+                content = content[:4000] + "\n... (truncated)"
+            return f"--- {path} ---\n" + content
+        except Exception as e:
+            return f"Error reading {path}: {e}"
+
+
+class SearchBooks(Tool):
+    """Semantic search over the FreeBSD book corpus using TF-IDF."""
+
+    name = "search_books"
+    description = (
+        "Search the FreeBSD documentation corpus for concepts, architecture "
+        "descriptions, and historical context. The corpus includes:\n"
+        "  - FreeBSD books (PDFs): McKusick, Device Drivers, etc.\n"
+        "  - FreeBSD man9 kernel API man pages\n"
+        "  - FreeBSD Handbook and articles (AsciiDoc)\n"
+        "  - Technical papers from the source tree\n"
+        "  - Git commit messages (design rationale from developers)\n"
+        "Returns the most relevant excerpts with source attribution.\n"
+        "Good queries: 'virtual memory architecture', 'buffer cache',\n"
+        "'soft updates', 'jail security model', 'netisr design'."
+    )
+    inputs = {
+        "query": {
+            "type": "string",
+            "description": "Concept or keyword to search for",
+        }
+    }
+    output_type = "string"
+
+    def __init__(self, index: TfidfIndex):
+        super().__init__()
+        self.index = index
+
+    def forward(self, query: str) -> str:
+        results = self.index.search(query, top_k=4)
+        if not results:
+            return (
+                f"No book excerpts found for '{query}'. "
+                "Try broader terms or check the spelling."
+            )
+        lines = [f"=== Book search results for: {query} ===\n"]
+        for source, chunk in results:
+            lines.append(f"[Source: {source}]")
+            lines.append(chunk[:600])
+            lines.append("")
+        return "\n".join(lines)
+
+
+class ExploreTree(Tool):
+    """List directory contents in the FreeBSD source tree."""
+
+    name = "explore_tree"
+    description = (
+        "List files and directories in the FreeBSD source tree. "
+        "Use this to discover what files exist before reading them. "
+        "Returns up to 80 entries. Example: 'sys/vm' or 'stand/efi/loader'."
+    )
+    inputs = {
+        "path": {
+            "type": "string",
+            "description": "Path relative to FreeBSD src root",
+        }
+    }
+    output_type = "string"
+
+    def forward(self, path: str) -> str:
+        full = os.path.join(SRC_ROOT, path)
+        try:
+            if not os.path.isdir(full):
+                return f"Not a directory: '{path}'"
+            entries = []
+            for e in sorted(os.listdir(full)):
+                fp = os.path.join(full, e)
+                kind = "📁" if os.path.isdir(fp) else "📄"
+                entries.append(f"  {kind} {e}")
+            entries = entries[:80]
+            return f"--- {path} ---\n" + "\n".join(entries)
+        except Exception as e:
+            return f"Error listing {path}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# 3d. Follow-Imports Tool (trace #include to resolve struct defs)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_include_path(base_file: str, include_path: str,
+                          src_root: str) -> str | None:
+    """Resolve an #include path relative to the containing file.
+
+    FreeBSD uses both absolute (from src root) and relative includes.
+    Returns the resolved path relative to src_root, or None if not found.
+    """
+    base_dir = os.path.dirname(os.path.join(src_root, base_file))
+
+    # Try as relative to the containing file's directory
+    rel = os.path.normpath(os.path.join(base_dir, include_path))
+    if os.path.exists(rel):
+        return os.path.relpath(rel, src_root)
+
+    # Try as absolute from src root (FreeBSD style: #include <sys/xxx.h>)
+    if os.path.exists(os.path.join(src_root, include_path)):
+        return include_path
+
+    # Try with common FreeBSD include directories
+    for inc_dir in ["sys", "include", "lib", "cddl", "usr.sbin"]:
+        candidate = os.path.join(inc_dir, include_path)
+        if os.path.exists(os.path.join(src_root, candidate)):
+            return candidate
+
+    return None
+
+
+def _extract_includes(content: str) -> List[str]:
+    """Extract #include paths from C source code."""
+    includes = []
+    for m in re.finditer(r'#include\s+["<]([^">]+)[">]', content):
+        includes.append(m.group(1))
+    return includes
+
+
+def _extract_struct_defs(content: str, file_path: str) -> List[str]:
+    """Extract struct definitions from C source code."""
+    defs = []
+    # Match: struct name { ... };
+    for m in re.finditer(
+        r'struct\s+(\w+)\s*\{([^}]+)\}',
+        content,
+        re.DOTALL
+    ):
+        name = m.group(1)
+        body = m.group(2).strip()
+        # Extract field names (simplified)
+        fields = []
+        for line in body.split('\n'):
+            line = line.strip()
+            if line and not line.startswith('//') and not line.startswith('/*'):
+                # Skip typedef, enum, nested structs for simplicity
+                if line.startswith('typedef') or line.startswith('enum'):
+                    continue
+                # Try to extract field name (rough heuristic)
+                parts = line.split()
+                if parts:
+                    fields.append(parts[-1].rstrip(';,').rstrip('*'))
+        defs.append(f"struct {name} (from {file_path}):\n  fields: {', '.join(fields[:10])}")
+    return defs
+
+
+def _extract_func_sigs(content: str, file_path: str) -> List[str]:
+    """Extract function signatures from C source code."""
+    sigs = []
+    # Match: type func_name(args) { or static type func_name(args) {
+    for m in re.finditer(
+        r'(?:static\s+|inline\s+|extern\s+)*'
+        r'[\w\s\*]+\s+(\w+)\s*\([^)]*\)\s*\{',
+        content
+    ):
+        name = m.group(1)
+        # Skip common non-function keywords
+        if name in ('if', 'else', 'while', 'for', 'switch', 'return',
+                    'struct', 'union', 'enum', 'typedef', 'define'):
+            continue
+        sigs.append(f"{name} (from {file_path})")
+    return sigs
+
+
+class ResolveCDefinition(Tool):
+    """Trace #include chains to find C struct/function/macro definitions.
+
+    This tool follows #include directives through the FreeBSD source tree
+    to locate where symbols are actually defined, helping the writer agent
+    verify struct layouts, function signatures, and macro definitions.
+    """
+
+    name = "resolve_c_definition"
+    description = (
+        "Find the definition of a C struct, function, macro, or type alias "
+        "in the FreeBSD source tree. Follows #include chains automatically. "
+        "Returns the definition with file path and context. "
+        "Examples: 'struct vm_page', 'uma_zcreate', 'VNET_DEFINE'"
+    )
+    inputs = {
+        "symbol": {
+            "type": "string",
+            "description": "Symbol name to find (e.g., 'struct vm_page', 'uma_zcreate', 'VNET_DEFINE')",
+        },
+        "start_file": {
+            "type": "string",
+            "description": "Optional: start tracing #includes from this file (e.g., 'sys/vm/vm_map.c'). If omitted, searches entire tree.",
+        }
+    }
+    output_type = "string"
+
+    def forward(self, symbol: str, start_file: str = "") -> str:
+        """Search for and return the C definition of a symbol."""
+        # Clean up symbol name
+        symbol = symbol.strip()
+        if symbol.startswith("struct "):
+            struct_name = symbol[7:].strip()
+            search_type = "struct"
+        elif symbol.startswith("typedef ") or symbol.startswith("typedef"):
+            # Extract the actual type name from typedef
+            match = re.search(r'typedef\s+\w+\s+(\w+)', symbol)
+            if match:
+                symbol = match.group(1)
+            search_type = "typedef"
+        else:
+            search_type = "general"
+
+        results = []
+
+        # Search strategy:
+        # 1. If start_file provided, trace its #includes first
+        # 2. Then search entire source tree
+
+        files_to_search = set()
+
+        if start_file and os.path.exists(os.path.join(SRC_ROOT, start_file)):
+            # Trace #include chain from start file
+            visited = set()
+            queue = [start_file]
+            while queue:
+                current = queue.pop(0)
+                if current in visited:
+                    continue
+                visited.add(current)
+                files_to_search.add(current)
+
+                try:
+                    full_path = os.path.join(SRC_ROOT, current)
+                    content = Path(full_path).read_text(errors="ignore")
+                    includes = _extract_includes(content)
+                    for inc in includes:
+                        resolved = _resolve_include_path(current, inc, SRC_ROOT)
+                        if resolved and resolved not in visited:
+                            queue.append(resolved)
+                except Exception:
+                    pass
+
+        # 2. Search entire source tree for the symbol
+        # (only if we haven't already covered it)
+        if not files_to_search or search_type == "struct":
+            # Search for struct definitions
+            for root, dirs, files in os.walk(os.path.join(SRC_ROOT, "sys")):
+                for fname in files:
+                    if not (fname.endswith('.c') or fname.endswith('.h')):
+                        continue
+                    fpath = os.path.relpath(os.path.join(root, fname), SRC_ROOT)
+                    if fpath in files_to_search:
+                        continue
+                    try:
+                        content = Path(os.path.join(root, fname)).read_text(errors="ignore")
+                        if search_type == "struct":
+                            if f'struct {struct_name}' in content or f'struct {struct_name} ' in content:
+                                files_to_search.add(fpath)
+                        elif search_type == "general":
+                            # Search for function, macro, or typedef
+                            patterns = [
+                                rf'\b{re.escape(symbol)}\b',
+                                rf'\b{re.escape(symbol)}\s*\(',
+                                rf'\b{re.escape(symbol)}\s*\{{',
+                            ]
+                            for pattern in patterns:
+                                if re.search(pattern, content):
+                                    files_to_search.add(fpath)
+                                    break
+                    except Exception:
+                        continue
+
+        # 3. Extract definitions from found files
+        found_defs = []
+        for fpath in sorted(files_to_search):
+            try:
+                full_path = os.path.join(SRC_ROOT, fpath)
+                content = Path(full_path).read_text(errors="ignore")
+
+                if search_type == "struct":
+                    struct_defs = _extract_struct_defs(content, fpath)
+                    for sd in struct_defs:
+                        if struct_name in sd:
+                            found_defs.append(sd)
+                elif search_type == "general":
+                    # Search for the symbol in various forms
+                    func_sigs = _extract_func_sigs(content, fpath)
+                    for fs in func_sigs:
+                        if symbol in fs:
+                            found_defs.append(fs)
+
+                    # Also search for #define macros
+                    for m in re.finditer(
+                        rf'#define\s+{re.escape(symbol)}\s+(.+)',
+                        content
+                    ):
+                        macro_body = m.group(1).strip()[:200]
+                        found_defs.append(f"#define {symbol} {macro_body} (from {fpath})")
+
+            except Exception:
+                continue
+
+        if not found_defs:
+            # Try a broader search - just grep for the symbol
+            broader_results = []
+            for root, dirs, files in os.walk(os.path.join(SRC_ROOT, "sys")):
+                for fname in files[:50]:  # Limit to avoid slow walks
+                    if not (fname.endswith('.c') or fname.endswith('.h')):
+                        continue
+                    fpath = os.path.relpath(os.path.join(root, fname), SRC_ROOT)
+                    try:
+                        content = Path(os.path.join(root, fname)).read_text(errors="ignore")
+                        if search_type == "struct":
+                            if f'struct {struct_name}' in content:
+                                broader_results.append(fpath)
+                        else:
+                            if re.search(rf'\b{re.escape(symbol)}\b', content):
+                                broader_results.append(fpath)
+                    except Exception:
+                        continue
+                if broader_results:
+                    break  # Found something, stop
+
+            if broader_results:
+                return (
+                    f"No exact definition found for '{symbol}', "
+                    f"but it appears in these files:\n" +
+                    "\n".join(f"  - {f}" for f in broader_results[:10]) +
+                    "\n\nTry reading one of these files with read_freebsd_source."
+                )
+
+            return f"Could not find definition for '{symbol}' in {SRC_ROOT}"
+
+        return f"=== Definition for '{symbol}' ===\n" + "\n".join(found_defs[:15])
+
+
+def gather_source_context(chapter: dict) -> str:
+    """Read existing documentation in the target area for context.
+
+    Returns a string with existing README content and kerneldoc descriptions.
+    Empty string if nothing found.
+    """
+    output_file = chapter.get("output_file", "README.md")
+    output_dir = os.path.dirname(os.path.join(SRC_ROOT, output_file))
+    parts = []
+
+    # 1. Read existing README in target directory
+    existing_readme = os.path.join(output_dir, "README.md")
+    if os.path.exists(existing_readme):
+        try:
+            with open(existing_readme) as f:
+                content = f.read()
+            # Skip our own backup marker
+            if "freebsd-docs.bak" not in content:
+                parts.append(f"## Existing README in target directory ({output_dir}/README.md)\n\n```\n{content[:5000]}\n```\n")
+        except Exception:
+            pass
+
+    # 2. Read sys/README.md for kernel chapters
+    sys_readme = os.path.join(SRC_ROOT, "sys", "README.md")
+    if os.path.exists(sys_readme) and "sys/" in output_file:
+        try:
+            with open(sys_readme) as f:
+                content = f.read()
+            parts.append(f"## sys/README.md (kernel roadmap)\n\n```\n{content[:5000]}\n```\n")
+        except Exception:
+            pass
+
+    # 3. Read kerneldoc Doxyfile descriptions
+    kerneldoc_dir = os.path.join(SRC_ROOT, "tools", "kerneldoc")
+    if os.path.isdir(kerneldoc_dir):
+        for fname in sorted(os.listdir(kerneldoc_dir)):
+            if fname.startswith("Doxyfile-") and fname.endswith(".md"):
+                fpath = os.path.join(kerneldoc_dir, fname)
+                try:
+                    with open(fpath) as f:
+                        content = f.read()
+                    parts.append(f"## Kerneldoc: {fname}\n\n```\n{content[:3000]}\n```\n")
+                except Exception:
+                    pass
+
+    # 4. Read Doxyfile-dev_* for subsystem descriptions
+    for fname in sorted(os.listdir(kerneldoc_dir)) if os.path.isdir(kerneldoc_dir) else []:
+        if fname.startswith("Doxyfile-dev-") and fname.endswith(".md"):
+            fpath = os.path.join(kerneldoc_dir, fname)
+            try:
+                with open(fpath) as f:
+                    content = f.read()
+                parts.append(f"## Kerneldoc dev: {fname}\n\n```\n{content[:3000]}\n```\n")
+            except Exception:
+                pass
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 4. Chapter Prompt Builder
+# ---------------------------------------------------------------------------
+
+
+def build_chapter_prompt(chapter: dict) -> str:
+    """Build the instruction prompt for the writer agent."""
+    src_files = chapter.get("source_files", [])
+    src_dirs = chapter.get("source_dirs", [])
+    focus = chapter.get("focus", "")
+    questions = chapter.get("key_questions", [])
+    diagram = chapter.get("mermaid", "flowchart")
+
+    # Gather existing documentation context
+    source_context = gather_source_context(chapter)
+
+    steps = []
+    step_n = 1
+
+    if source_context:
+        steps.append(
+            f"STEP {step_n}: Read the existing documentation below for context "
+            f"about what's already documented. Do NOT duplicate content — extend "
+            f"and complement what exists.\n\n{source_context}"
+        )
+        step_n += 1
+    elif src_dirs:
+        steps.append(
+            f"STEP {step_n}: Use explore_tree to survey these directories:\n"
+            + "\n".join(f"        - {d}" for d in src_dirs)
+        )
+        step_n += 1
+    else:
+        steps.append(f"STEP {step_n}: Understand the context from the files below.")
+        step_n += 1
+
+    if src_files:
+        steps.append(
+            f"STEP {step_n}: Use read_freebsd_source to examine key files:\n"
+            + "\n".join(f"        - {f}" for f in src_files)
+        )
+        step_n += 1
+
+    steps.append(
+        f"STEP {step_n}: Use search_books to find architectural theory and "
+        "historical context for the concepts covered in this chapter."
+    )
+    step_n += 1
+
+    steps.append(
+        f"STEP {step_n}: Use resolve_c_definition to verify struct layouts, "
+        "function signatures, and macro definitions. For example:\n"
+        "  - resolve_c_definition(symbol='struct vm_page')\n"
+        "  - resolve_c_definition(symbol='uma_zcreate', start_file='sys/vm/uma_core.c')\n"
+        "This tool follows #include chains to find actual definitions."
+    )
+    step_n += 1
+
+    question_text = "\n".join(f"    - {q}" for q in questions)
+    steps.append(
+        f"STEP {step_n}: Write a README.md with three reading levels:\n"
+        f"    - **Quick Summary** — 3-4 paragraphs, no code (beginners)\n"
+        f"    - **Deep Dive** — source code walkthrough, struct analysis (intermediate)\n"
+        f"    - **Advanced Notes** — debugging with DTrace, performance, pitfalls (advanced)\n"
+        f"    - Addresses these key questions:\n{question_text}\n"
+        f"    - Includes a Mermaid {diagram} diagram (see below)\n"
+        f"    - References specific source files with line-level details\n"
+        f"    - Connects theory (from books) to implementation (from source)"
+    )
+
+    diagram_hints = {
+        "sequence": (
+            "    - Mermaid sequence diagram: show the flow of control/data\n"
+            "      between components (e.g., [UEFI] → [loader] → [kernel])\n"
+            "      Use: ```mermaid\\nsequenceDiagram\\n  Participant A\\n  A->>B: action\n"
+            "      ```"
+        ),
+        "flowchart": (
+            "    - Mermaid flowchart: show the data flow or component hierarchy\n"
+            "      Use: ```mermaid\\nflowchart TD\\n  A[Component] --> B[Subcomponent]\n"
+            "      ```"
+        ),
+        "class": (
+            "    - Mermaid class diagram: show key structs and their relationships\n"
+            "      Use: ```mermaid\\nclassDiagram\\n  class StructName {\\n    +field type\\n  }\n"
+            "      ```"
+        ),
+        "state": (
+            "    - Mermaid state diagram: show state transitions\n"
+            "      Use: ```mermaid\\nstateDiagram-v2\\n  [*] --> Idle\\n  Idle --> Active: event\n"
+            "      ```"
+        ),
+    }
+
+    steps.append(f"    - Diagram format hint:{diagram_hints.get(diagram, '')}")
+
+    return textwrap.dedent(f"""\
+        You are writing a chapter for "FreeBSD Internals for Students" — a
+        textbook that helps students understand operating system concepts by
+        studying real FreeBSD source code.
+
+        ## Chapter: {chapter['title']}
+
+        ## Focus
+        {focus}
+
+        ## Instructions
+        {chr(10).join(f"{s}" for s in steps)}
+
+        ## Mandatory Output Template
+
+        You MUST output ALL of the following sections in this exact order.
+        Do NOT skip any section. Do NOT add sections outside this template.
+        Each section must have substantive content (at least 3-5 sentences).
+
+        ---BEGIN TEMPLATE---
+
+        # {chapter['title']}
+
+        ## Quick Summary
+        (3-4 paragraphs: what this subsystem does and why it matters.
+        No code — accessible to any CS student who knows C.)
+
+        ## Architecture
+        (technical explanation with specific source file references)
+
+        ## Key Data Structures
+        (C structs with field explanations, quoting from actual header files)
+
+        ## Deep Dive
+        (Source code walkthrough: trace through key functions step-by-step,
+        referencing specific files with code snippets. This is the intermediate
+        reading level.)
+
+        ## Flow / Diagram
+        (Mermaid {diagram} diagram — valid syntax, not a placeholder)
+
+        ## Advanced Notes
+        (Practical insights for advanced students: debugging with DTrace,
+        performance implications, race conditions, common pitfalls,
+        connection to OS theory from textbooks.)
+
+        ## Comparison
+        (How other OSes implement the same concept. Focus on Linux: note
+        key structural differences — e.g., FreeBSD's vm_map vs Linux's
+        vm_area_struct, UMA vs SLUB, sx locks vs rw_semaphore. Also mention
+        macOS/XNU, NetBSD, or OpenBSD where relevant. Keep it brief — 2-4
+        paragraphs. Do not fabricate Linux file paths or line numbers.)
+
+        ## See Also
+        (related chapters and source directories to explore next)
+
+        ---END TEMPLATE---
+
+        **Rules:**
+        - Always reference specific file paths (e.g., `sys/vm/vm_page.c`)
+        - Include C code snippets where they illuminate the design
+        - Connect textbook theory to actual FreeBSD implementation
+        - Make it accessible to a CS student who knows C but not kernel internals
+        - Output ONLY the Markdown content — no preamble, no explanation
+        - EVERY section header above MUST appear in your output
+        - If you cannot fill a section with real content, write "See related
+          chapters for coverage of this topic" rather than skipping it
+    """).lstrip()
+
+
+def build_review_prompt(chapter: dict, draft: str) -> str:
+    """Build the review prompt for the reviewer agent."""
+    questions = chapter.get("key_questions", [])
+    src_files = chapter.get("source_files", [])
+    diagram = chapter.get("mermaid", "flowchart")
+    question_text = "\n".join(f"- {q}" for q in questions)
+
+    return textwrap.dedent(f"""\
+        You are reviewing a draft chapter for "FreeBSD Internals for Students."
+        Your job is to find problems — be strict but fair.
+
+        ## Chapter: {chapter['title']}
+
+        ## Key Questions That Must Be Answered
+        {question_text}
+
+        ## Expected Source Files Referenced
+        {chr(10).join(f"- {f}" for f in src_files)}
+
+        ## Review Rubric
+
+        Grade each criterion PASS / FAIL with a brief explanation:
+
+        1. **Completeness** — Are ALL key questions above answered in the draft?
+           Not hinted at — actually answered with technical detail.
+
+        2. **Accuracy** — Does the draft reference real FreeBSD concepts correctly?
+           No invented structs, no made-up function names, no wrong file paths.
+           Flag anything that looks like a hallucination.
+
+        3. **Source Coverage** — Are the expected source files examined and
+           discussed? Not just listed — actually explained with code snippets.
+
+        4. **Mermaid Diagram** — Is there a valid Mermaid {diagram} diagram?
+           Check syntax: correct keywords, no missing brackets, proper arrows.
+           Does it actually illustrate the subsystem (not a generic placeholder)?
+
+        5. **Student Accessibility** — Is the tone educational? Does it explain
+           WHY things work, not just WHAT they do? Are there analogies or
+           connections to OS theory?
+
+        6. **Structure** — Does the draft have ALL 9 required sections with
+           substantive content? Check for each:
+           - `## Quick Summary` — 3-4 paragraphs, no code (beginners)
+           - `## Architecture` — technical explanation with source references
+           - `## Key Data Structures` — C structs with field explanations
+           - `## Deep Dive` — source code walkthrough with code snippets
+           - `## Flow / Diagram` — valid Mermaid diagram (not placeholder)
+           - `## Advanced Notes` — DTrace, performance, pitfalls (advanced)
+           - `## Comparison` — Linux/macOS/NetBSD structural differences
+           - `## See Also` — related chapters/directories
+           FAIL if ANY section is missing, empty, or a single sentence.
+
+        ## Draft to Review
+
+        {draft}
+
+        ## Your Output
+
+        Output a JSON object with this structure — nothing else:
+
+        {{
+          "grade": "PASS" or "NEEDS_REVISION",
+          "criteria": {{
+            "completeness": "PASS/FAIL: reason",
+            "accuracy": "PASS/FAIL: reason",
+            "source_coverage": "PASS/FAIL: reason",
+            "mermaid_diagram": "PASS/FAIL: reason",
+            "accessibility": "PASS/FAIL: reason",
+            "structure": "PASS/FAIL: reason"
+          }},
+          "issues": [
+            "Specific issue 1 with actionable fix",
+            "Specific issue 2 with actionable fix"
+          ],
+          "praise": [
+            "What works well — keep this in the revision"
+          ]
+        }}
+
+        If 4 or more criteria FAIL → grade is NEEDS_REVISION.
+        If 3 or fewer FAIL → grade is PASS (issues are minor polish).
+        Be specific in issues: "The struct vm_page is described with fields that
+        don't match sys/vm/vm_page.h" not "the data structures section is weak."
+    """).lstrip()
+
+
+def build_revision_prompt(chapter: dict, draft: str, review: str) -> str:
+    """Build the revision prompt for the writer agent to fix issues."""
+    return textwrap.dedent(f"""\
+        You are revising a chapter for "FreeBSD Internals for Students."
+        A reviewer found issues — fix them all.
+
+        ## Chapter: {chapter['title']}
+
+        ## Review Feedback
+
+        {review}
+
+        ## Current Draft
+
+        {draft}
+
+        ## Your Task
+
+        1. Address EVERY issue in the reviewer's list.
+        2. For each fix, use read_freebsd_source to verify the correct
+           struct definitions, function signatures, and file paths.
+        3. Keep everything the reviewer praised — don't rewrite good sections.
+        4. If the reviewer flagged a hallucinated struct/function, look up
+           the REAL definition in the source code and correct it.
+        5. If the Mermaid diagram was flagged, fix the syntax and make sure
+           it accurately represents the subsystem.
+
+        Output ONLY the complete corrected Markdown — no preamble, no
+        explanation of changes. The reader should not see the review process,
+        only the final polished chapter.
+    """).lstrip()
+
+
+# ---------------------------------------------------------------------------
+# 5. Agent Factory
+# ---------------------------------------------------------------------------
+
+
+def create_writer_agent(index: TfidfIndex):
+    """Create the writer CodeAgent — reads source, searches books, writes docs."""
+    model = OpenAIServerModel(
+        model_id=MODEL_CONFIG["model_id"],
+        api_base=MODEL_CONFIG["api_base"],
+        api_key=MODEL_CONFIG["api_key"],
+    )
+
+    return CodeAgent(
+        tools=[
+            ReadFreeBSDSource(),
+            SearchBooks(index),
+            ExploreTree(),
+            ResolveCDefinition(),
+        ],
+        model=model,
+        additional_authorized_imports=["re", "os", "pathlib", "json"],
+        max_steps=25,
+    )
+
+
+def create_reviewer_agent(index: TfidfIndex):
+    """Create the reviewer agent — critiques drafts, no source tools needed."""
+    model = OpenAIServerModel(
+        model_id=MODEL_CONFIG["model_id"],
+        api_base=MODEL_CONFIG["api_base"],
+        api_key=MODEL_CONFIG["api_key"],
+    )
+
+    return CodeAgent(
+        tools=[
+            SearchBooks(index),
+        ],
+        model=model,
+        additional_authorized_imports=["json", "re"],
+        max_steps=10,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. Orchestrator
+# ---------------------------------------------------------------------------
+
+
+def load_chapters() -> List[dict]:
+    """Load chapter definitions from chapters.yaml."""
+    if not CHAPTERS_FILE.exists():
+        print(f"Error: {CHAPTERS_FILE} not found")
+        sys.exit(1)
+    with open(CHAPTERS_FILE) as f:
+        data = yaml.safe_load(f)
+    return data.get("chapters", [])
+
+
+def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
+                dry_run: bool = False) -> bool:
+    """Run the multi-pass pipeline: write → review → revise → write.
+
+    writer      — the writer CodeAgent
+    reviewer    — the reviewer CodeAgent
+    max_revisions — how many revision rounds to allow (0 = single pass, no review)
+    """
+    title = chapter["title"]
+    output_file = chapter.get("output_file", "README.md")
+    output_path = os.path.join(SRC_ROOT, output_file)
+    backup_path = output_path + ".freebsd-docs.bak"
+
+    print(f"\n{'=' * 70}")
+    print(f"  Chapter: {title}")
+    print(f"  Output:  {output_path}")
+    print(f"  Revisions: up to {max_revisions}")
+    print(f"{'=' * 70}")
+
+    if dry_run:
+        print("  [dry-run] would generate README.md")
+        return False
+
+    # Backup existing output
+    if os.path.exists(output_path):
+        print(f"  backing up existing file → .freebsd-docs.bak")
+        os.rename(output_path, backup_path)
+
+    # ---- Pass 1: initial draft ----
+    prompt = build_chapter_prompt(chapter)
+    print("  [draft] writing initial chapter ...")
+
+    try:
+        draft = writer.run(prompt)
+    except Exception as e:
+        print(f"  ✗ initial draft failed: {e}")
+        if os.path.exists(backup_path):
+            os.rename(backup_path, output_path)
+        return False
+
+    # ---- Review + revision loop ----
+    revision = 0
+    while max_revisions > 0 and revision < max_revisions:
+        revision += 1
+        print(f"  [review {revision}] evaluating draft ...")
+
+        try:
+            review_prompt = build_review_prompt(chapter, draft)
+            review_raw = reviewer.run(review_prompt)
+        except Exception as e:
+            print(f"  ✗ review {revision} failed: {e}")
+            break
+
+        # Parse the JSON review
+        review_json = _extract_json(review_raw)
+        if review_json is None:
+            print(f"  ⚠ review {revision}: could not parse JSON, stopping review")
+            break
+
+        grade = review_json.get("grade", "PASS")
+        issues = review_json.get("issues", [])
+        praise = review_json.get("praise", [])
+        criteria = review_json.get("criteria", {})
+
+        # Print review summary
+        fail_count = sum(1 for v in criteria.values() if v.startswith("FAIL"))
+        print(f"         grade={grade}  ({6 - fail_count}/6 criteria pass)")
+        if issues:
+            for iss in issues[:5]:
+                print(f"         - {iss}")
+        if praise:
+            for p in praise[:3]:
+                print(f"         ✓ {p}")
+
+        if grade == "PASS" or not issues:
+            print(f"  [review {revision}] chapter passes — no revision needed")
+            break
+
+        # ---- Revision pass ----
+        print(f"  [revision {revision}] rewriting to address {len(issues)} issue(s) ...")
+
+        try:
+            revision_prompt = build_revision_prompt(chapter, draft, review_raw)
+            draft = writer.run(revision_prompt)
+        except Exception as e:
+            print(f"  ✗ revision {revision} failed: {e}")
+            break
+
+    # ---- Fact-checking pass ----
+    print("  [fact-check] verifying file paths, structs, functions ...")
+    facts = fact_check_draft(draft, SRC_ROOT)
+    if facts['total_issues'] > 0:
+        print(f"         found {facts['total_issues']} issue(s):")
+        if facts['file_paths_not_found']:
+            print(f"         - missing paths: {', '.join(facts['file_paths_not_found'])}")
+        if facts['file_paths_corrected']:
+            for old, right in (x.split(' → ') for x in facts['file_paths_corrected']):
+                print(f"         - path correction: `{old}` → `{right}`")
+        if facts['structs_not_found']:
+            print(f"         - missing structs: {', '.join(facts['structs_not_found'])}")
+        if facts['funcs_not_found']:
+            print(f"         - missing functions: {', '.join(facts['funcs_not_found'])}")
+
+        # One revision round to fix fact-checking issues
+        print("  [fact-fix] rewriting to address fact-check issues ...")
+        try:
+            fact_prompt = _build_fact_check_prompt(chapter, draft, facts)
+            draft = writer.run(fact_prompt)
+        except Exception as e:
+            print(f"  ✗ fact-check revision failed: {e}")
+    else:
+        print("         all claims verified — no issues found")
+
+    # ---- Final output ----
+    # Ensure result has the chapter header
+    if not draft.startswith(f"# {title}"):
+        draft = f"# {title}\n\n" + draft
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(draft)
+
+    lines = draft.count("\n")
+    rev_label = f" after {revision} revision(s)" if revision > 0 else ""
+    print(f"  ✓ wrote {lines} lines to {output_path}{rev_label}")
+    return True
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    """Extract a JSON object from LLM output (may have prose around it)."""
+    # Try the full text first
+    try:
+        return json.loads(text.strip())
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try to find a JSON block
+    # Match { ... } with nested braces
+    depth = 0
+    start = None
+    for i, c in enumerate(text):
+        if c == '{':
+            if start is None:
+                start = i
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                return json.loads(text[start:i+1])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 4b. Structured Fact-Checking
+# ---------------------------------------------------------------------------
+
+
+def _extract_file_paths(text: str) -> List[str]:
+    """Extract claimed FreeBSD source file paths from markdown text."""
+    # Match paths like sys/vm/vm_page.c, share/man/man9/foo.9, etc.
+    # Look for backtick-quoted or bare paths
+    paths = []
+    for m in re.finditer(
+        r'(?:`)([^`\s]+(?:/[^`\s]+)*\.(?:c|h|s|rs|md|9|4|5|7|8))', text
+    ):
+        p = m.group(1)
+        if p.startswith('sys/') or p.startswith('share/') or p.startswith('stand/'):
+            paths.append(p)
+    # Also match bare paths (not in backticks but still file-like)
+    for m in re.finditer(
+        r'(?:^|\s)(sys/\S+\.(?:c|h|s|rs)|share/\S+\.(?:9|4|5|7|8|adoc))', text
+    ):
+        p = m.group(1).strip()
+        if p not in paths:
+            paths.append(p)
+    return list(set(paths))
+
+
+def _extract_struct_names(text: str) -> List[str]:
+    """Extract claimed struct names from markdown text."""
+    structs = []
+    # Match patterns like "struct vm_page", "struct vnode", "struct foo_bar"
+    for m in re.finditer(r'\bstruct\s+([a-zA-Z_]\w*)\b', text):
+        name = m.group(1)
+        # Skip common non-struct words
+        if name not in ('struct', 'structs', 'structname'):
+            structs.append(name)
+    return list(set(structs))
+
+
+def _extract_function_names(text: str) -> List[str]:
+    """Extract claimed function names from markdown text."""
+    funcs = []
+    # Match patterns like `vm_page_insert()`, vm_page_insert, vm_foo(),
+    # Fn vm_foo, or "the foo() function"
+    # Backtick-quoted function calls
+    for m in re.finditer(r'`([a-zA-Z_]\w*)\s*\(\s*\)`', text):
+        funcs.append(m.group(1))
+    # Backtick-quoted function names without parens
+    for m in re.finditer(r'`([a-zA-Z_]\w*)`', text):
+        name = m.group(1)
+        if name not in funcs:
+            funcs.append(name)
+    # "the foo() function" pattern
+    for m in re.finditer(r'the\s+([a-zA-Z_]\w*)\s*\(\s*\)\s+function', text):
+        name = m.group(1)
+        if name not in funcs:
+            funcs.append(name)
+    return list(set(funcs))
+
+
+def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
+    """Verify that claimed file paths exist in the source tree.
+
+    Returns a list of "path: not found" strings for missing files.
+    Also tries glob fallback for close matches.
+    """
+    not_found = []
+    for p in paths:
+        full = os.path.join(src_root, p)
+        if os.path.exists(full):
+            continue
+        # Try glob fallback
+        pattern = os.path.join(src_root, p.split('/')[0], '**', p.split('/')[-1])
+        matches = list(glob.glob(pattern, recursive=True))
+        if matches:
+            # Found a close match — note the correction
+            not_found.append(f"{p} → {os.path.relpath(matches[0], src_root)}")
+        else:
+            not_found.append(p)
+    return not_found
+
+
+def _verify_structs(structs: List[str], src_root: str) -> List[str]:
+    """Verify that claimed struct names exist in the source tree.
+
+    Returns a list of struct names that could not be found.
+    """
+    not_found = []
+    for s in structs:
+        # Search for "struct s {" or "struct s {" in .c and .h files
+        cmd = (
+            f"grep -r 'struct {s} \\{{' "
+            f"{shlex.quote(os.path.join(src_root, 'sys'))}/ 2>/dev/null | head -1"
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                timeout=5)
+        if result.returncode != 0 or not result.stdout.strip():
+            not_found.append(s)
+    return not_found
+
+
+def _verify_functions(funcs: List[str], src_root: str) -> List[str]:
+    """Verify that claimed function names exist in the source tree.
+
+    Returns a list of function names that could not be found.
+    """
+    not_found = []
+    for f in funcs:
+        # Search for "void f(" or "int f(" or "static ... f(" patterns
+        cmd = (
+            f"grep -rE '(void|int|static|struct|enum|uint|char|u_int|u_char|error_t)\\s+{re.escape(f)}\\s*\\(' "
+            f"{shlex.quote(os.path.join(src_root, 'sys'))}/ 2>/dev/null | head -1"
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                timeout=5)
+        if result.returncode != 0 or not result.stdout.strip():
+            not_found.append(f)
+    return not_found
+
+
+def fact_check_draft(draft: str, src_root: str) -> dict:
+    """Run structured fact-checking on a draft chapter.
+
+    Returns a dict with:
+        - 'file_paths_not_found': list of missing paths
+        - 'file_paths_corrected': list of "wrong → right" pairs
+        - 'structs_not_found': list of missing struct names
+        - 'funcs_not_found': list of missing function names
+        - 'total_issues': count of all issues
+    """
+    file_paths = _extract_file_paths(draft)
+    structs = _extract_struct_names(draft)
+    funcs = _extract_function_names(draft)
+
+    paths_missing = _verify_file_paths(file_paths, src_root)
+    paths_corrected = [x for x in paths_missing if ' → ' in x]
+    paths_missing = [x for x in paths_missing if ' → ' not in x]
+
+    structs_missing = _verify_structs(structs, src_root)
+    funcs_missing = _verify_functions(funcs, src_root)
+
+    return {
+        'file_paths_not_found': paths_missing,
+        'file_paths_corrected': paths_corrected,
+        'structs_not_found': structs_missing,
+        'funcs_not_found': funcs_missing,
+        'total_issues': (len(paths_missing) + len(paths_corrected) +
+                         len(structs_missing) + len(funcs_missing)),
+    }
+
+
+def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
+    """Build a prompt for the writer to fix fact-checking issues."""
+    issues = []
+    if facts['file_paths_not_found']:
+        issues.append(
+            f"File paths that do not exist in the source tree: "
+            f"{', '.join(facts['file_paths_not_found'])}. "
+            f"Remove or correct these references."
+        )
+    if facts['file_paths_corrected']:
+        corrections = '; '.join(
+            f"`{old}` should be `{right}`"
+            for old, right in (x.split(' → ') for x in facts['file_paths_corrected'])
+        )
+        issues.append(f"Corrected paths: {corrections}.")
+    if facts['structs_not_found']:
+        issues.append(
+            f"Structs not found in source tree: "
+            f"{', '.join(facts['structs_not_found'])}. "
+            f"Remove or correct these with real definitions from header files."
+        )
+    if facts['funcs_not_found']:
+        issues.append(
+            f"Functions not found in source tree: "
+            f"{', '.join(facts['funcs_not_found'])}. "
+            f"Remove or correct these with real function signatures."
+        )
+
+    return textwrap.dedent(f"""\
+        You are revising a chapter for "FreeBSD Internals for Students."
+        A fact-checking pass found issues with your draft.
+
+        ## Chapter: {chapter['title']}
+
+        ## Fact-Checking Issues
+
+        {chr(10).join(f"- {iss}" for iss in issues)}
+
+        ## Current Draft
+
+        {draft}
+
+        ## Your Task
+
+        1. Fix EVERY fact-checking issue listed above.
+        2. For corrected paths, use the correct path.
+        3. For missing structs/functions, look them up in the actual source
+           code using read_freebsd_source. If they truly don't exist, remove
+           the reference.
+        4. Keep everything else unchanged.
+
+        Output ONLY the complete corrected Markdown — no preamble, no
+        explanation of changes.
+    """).lstrip()
+
+
+# ---------------------------------------------------------------------------
+# 4c. Cross-README Navigation Links
+# ---------------------------------------------------------------------------
+
+
+# Chapter relationship map — which chapters reference each other
+CHAPTER_RELS = {
+    "FreeBSD Source Tree Overview": ["The FreeBSD Kernel — Structure and Entry Point"],
+    "The FreeBSD Kernel — Structure and Entry Point": [
+        "FreeBSD Source Tree Overview",
+        "UEFI Bootloader-to-Kernel Handoff",
+        "Process Management and Scheduling",
+    ],
+    "UEFI Bootloader-to-Kernel Handoff": [
+        "The FreeBSD Kernel — Structure and Entry Point",
+        "The FreeBSD Build System",
+    ],
+    "Virtual Memory Subsystem": [
+        "The FreeBSD Kernel — Structure and Entry Point",
+        "The Buffer Cache and I/O Subsystem",
+        "Virtual File System (VFS) Layer",
+    ],
+    "Process Management and Scheduling": [
+        "The FreeBSD Kernel — Structure and Entry Point",
+        "Interrupt Handling",
+        "Jails and System Isolation",
+    ],
+    "The Buffer Cache and I/O Subsystem": [
+        "Virtual Memory Subsystem",
+        "Virtual File System (VFS) Layer",
+        "UFS Filesystem Implementation",
+    ],
+    "Virtual File System (VFS) Layer": [
+        "Virtual Memory Subsystem",
+        "The Buffer Cache and I/O Subsystem",
+        "UFS Filesystem Implementation",
+        "Network Stack Architecture",
+    ],
+    "UFS Filesystem Implementation": [
+        "Virtual File System (VFS) Layer",
+        "The Buffer Cache and I/O Subsystem",
+    ],
+    "Network Stack Architecture": [
+        "Virtual File System (VFS) Layer",
+        "Device Driver Framework",
+    ],
+    "Device Driver Framework": [
+        "Network Stack Architecture",
+        "Interrupt Handling",
+    ],
+    "Interrupt Handling": [
+        "Device Driver Framework",
+        "Process Management and Scheduling",
+    ],
+    "Jails and System Isolation": [
+        "Process Management and Scheduling",
+        "The FreeBSD Kernel — Structure and Entry Point",
+    ],
+    "The FreeBSD Build System": [
+        "UEFI Bootloader-to-Kernel Handoff",
+        "FreeBSD Source Tree Overview",
+    ],
+}
+
+
+def build_navigation(chapters: List[dict]) -> dict:
+    """Build navigation links across all READMEs and a master index.
+
+    Returns a dict mapping output_file -> updated markdown content.
+    Also writes a master README at SRC_ROOT/README.all-chapters.md.
+    """
+    # Build a title -> output_file lookup
+    title_map = {}
+    rel_map = {}
+    for ch in chapters:
+        title = ch["title"]
+        output_file = ch.get("output_file", "README.md")
+        title_map[title] = output_file
+        rel_map[output_file] = ch
+
+    updated = {}
+
+    for ch in chapters:
+        output_file = ch.get("output_file", "README.md")
+        output_path = os.path.join(SRC_ROOT, output_file)
+        if not os.path.exists(output_path):
+            continue
+
+        with open(output_path) as f:
+            content = f.read()
+
+        title = ch["title"]
+        rel_dir = os.path.dirname(output_file) or "."
+
+        # Build navigation sidebar
+        nav_links = []
+        all_chapters = []
+        related = CHAPTER_RELS.get(title, [])
+
+        for other in chapters:
+            other_title = other["title"]
+            other_file = other.get("output_file", "README.md")
+            if other_file == output_file:
+                continue
+            other_dir = os.path.dirname(other_file) or "."
+            # Calculate relative path from current file's directory
+            if rel_dir == other_dir:
+                rel_link = f"[{other_title}]({os.path.basename(other_file)})"
+            else:
+                rel_link = f"[{other_title}](../{'/'.join(['..'] * (rel_dir.count('/') + 1) if rel_dir != '.' else '')}{other_dir}/{os.path.basename(other_file)})"
+            all_chapters.append(rel_link)
+            if other_title in related:
+                nav_links.append(rel_link)
+
+        # Build the sidebar
+        sidebar_lines = [
+            "<!-- This file is auto-generated by generate-doc.py -- do not edit manually -->",
+            "",
+            "---",
+            "**Navigation:**",
+        ]
+        if nav_links:
+            sidebar_lines.append(f"  **Related:** {' | '.join(nav_links[:5])}")
+        sidebar_lines.append(f"  **All chapters:** {' | '.join(all_chapters[:8])}{' ...'}")
+        sidebar_lines.append("---")
+        sidebar_lines.append("")
+
+        # Insert sidebar after the title (first line starting with #)
+        lines = content.split("\n")
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            if line.startswith("# "):
+                insert_idx = i + 1
+                break
+
+        lines.insert(insert_idx, "\n".join(sidebar_lines))
+        content = "\n".join(lines)
+
+        # Update "See Also" section with cross-links
+        content = _add_see_also_links(content, title, title_map, output_file)
+
+        updated[output_file] = content
+
+    # Write updated files
+    written = 0
+    for output_file, content in updated.items():
+        output_path = os.path.join(SRC_ROOT, output_file)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        written += 1
+
+    # Write master README
+    master_path = os.path.join(SRC_ROOT, "README.all-chapters.md")
+    master_lines = [
+        "# FreeBSD Internals for Students — Chapter Index",
+        "",
+        "AI-generated documentation of FreeBSD internals. Each chapter is placed",
+        "in the relevant FreeBSD source directory so a student can find educational",
+        "material right next to the code.",
+        "",
+        "## Chapters",
+        "",
+    ]
+    for i, ch in enumerate(chapters, 1):
+        title = ch["title"]
+        output_file = ch.get("output_file", "README.md")
+        output_path = os.path.join(SRC_ROOT, output_file)
+        if os.path.exists(output_path):
+            master_lines.append(f"{i}. [{title}]({output_file})")
+        else:
+            master_lines.append(f"{i}. [{title}] — not yet generated")
+    master_lines.append("")
+    master_lines.append("---")
+    master_lines.append(f"*Generated by generate-doc.py — {len(chapters)} chapters*")
+
+    with open(master_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(master_lines))
+
+    print(f"  [navigation] updated {written} READMEs, wrote {master_path}")
+    return updated
+
+
+def _add_see_also_links(content: str, title: str, title_map: dict,
+                        current_file: str) -> str:
+    """Add cross-links to the See Also section of a README."""
+    related = CHAPTER_RELS.get(title, [])
+    if not related:
+        return content
+
+    # Find the See Also section
+    see_also_idx = content.find("\n## See Also\n")
+    if see_also_idx == -1:
+        see_also_idx = content.find("\n## See Also")
+    if see_also_idx == -1:
+        return content
+
+    # Build cross-links
+    links = []
+    for rel_title in related:
+        rel_file = title_map.get(rel_title)
+        if rel_file and rel_file != current_file:
+            rel_dir = os.path.dirname(rel_file) or "."
+            if rel_dir == ".":
+                links.append(f"[{rel_title}]({os.path.basename(rel_file)})")
+            else:
+                parts = rel_dir.split("/")
+                depth = len(parts) + 1
+                prefix = "../" * depth
+                links.append(f"[{rel_title}]({prefix}{rel_file})")
+
+    if not links:
+        return content
+
+    # Insert links after the See Also header
+    insert_pos = see_also_idx + len("## See Also")
+    link_text = "\n" + "\n".join(f"- {l}" for l in links) + "\n"
+    return content[:insert_pos] + link_text + content[insert_pos:]
+
+
+# ---------------------------------------------------------------------------
+# 4d. Cross-Chapter Reference Index
+# ---------------------------------------------------------------------------
+
+
+def _extract_overview(content: str, max_chars: int = 300) -> str:
+    """Extract the Quick Summary section from a README as a summary."""
+    start = content.find("## Quick Summary")
+    if start == -1:
+        # Fallback to old name
+        start = content.find("## Overview")
+    if start == -1:
+        # Try without ##
+        start = content.find("# Quick Summary")
+        if start == -1:
+            start = content.find("# Overview")
+    if start == -1:
+        return ""
+    # Find the section header that was found
+    section_header = "## Quick Summary"
+    if "## Quick Summary" not in content:
+        section_header = "## Overview"
+    # Find the next section header
+    end = len(content)
+    for header in ["## Architecture", "## Key Data Structures", "## Deep Dive",
+                   "## Flow / Diagram", "## Advanced Notes", "## Comparison",
+                   "## See Also"]:
+        pos = content.find(header, start + 10)
+        if pos > start and pos < end:
+            end = pos
+    overview = content[start + len(section_header):end].strip()
+    # Take first 2 paragraphs
+    paragraphs = re.split(r'\n\s*\n', overview)
+    paragraphs = [p.strip() for p in paragraphs if p.strip()]
+    summary = "\n\n".join(paragraphs[:2])
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rsplit(' ', 1)[0] + "..."
+    return summary
+
+
+def _extract_glossary_terms(content: str) -> List[str]:
+    """Extract key FreeBSD-specific terms from a README."""
+    terms = set()
+    # C structs: "struct foo"
+    for m in re.finditer(r'\bstruct\s+([a-zA-Z_]\w*)\b', content):
+        name = m.group(1)
+        if name not in ('struct', 'structs', 'structname'):
+            terms.add(name)
+    # FreeBSD-specific identifiers (common kernel terms)
+    known_terms = [
+        'vm_map', 'vm_page', 'vnode', 'pmap', 'proc', 'thread', 'sched',
+        'buf', 'bufobj', 'filedesc', 'kerneldesc', 'sysent', 'ucred',
+        'label', 'mount', 'namecache', 'bufcache', 'uma_zone', 'vm_domain',
+        'vm_object', 'vm_pageq', 'vm_zone', 'vmmeter', 'pcb', 'td', 'mdcpu',
+        'cpu_info', 'scheddom', 'runq', 'pri', 'tdq', 'pcb', 'mdglobal',
+        'intr_event', 'intr_handle', 'callout', 'sx', 'mtx', 'rwlock',
+        'lockmgr', 'sbuf', 'uma', 'zone', 'taskqueue', 'task', 'workqueue',
+        'vnet', 'domainset', 'blist', 'bqueue', 'bioq', 'bufqueue',
+        'fifofs', 'sockbuf', 'sockbuf', 'socket', 'domain', 'protosw',
+        'ifnet', 'ifqueue', 'ifaddr', 'rtentry', 'rtsock', 'rt_metrics',
+        'in_ifaddr', 'in_multi', 'mbuf', 'pkthdr', 'sk_buff',
+    ]
+    for term in known_terms:
+        if re.search(r'\b' + re.escape(term) + r'\b', content):
+            terms.add(term)
+    return sorted(terms)
+
+
+def build_chapter_index(chapters: List[dict], src_root: str,
+                        output_dir: str) -> str:
+    """Build CHAPTER_INDEX.md with TOC, cross-references, and glossary.
+
+    output_dir — where to write (typically SCRIPT_DIR, the project root)
+    """
+    print("  reading generated READMEs for index content ...")
+
+    # Collect per-chapter data
+    chapter_data = []
+    all_glossary_terms = set()
+    term_chapters = {}  # term -> list of chapter titles
+
+    for ch in chapters:
+        title = ch["title"]
+        output_file = ch.get("output_file", "README.md")
+        output_path = os.path.join(src_root, output_file)
+
+        if not os.path.exists(output_path):
+            chapter_data.append({
+                'title': title,
+                'output_file': output_file,
+                'overview': None,
+                'glossary': [],
+            })
+            continue
+
+        with open(output_path) as f:
+            content = f.read()
+
+        overview = _extract_overview(content)
+        glossary = _extract_glossary_terms(content)
+        chapter_data.append({
+            'title': title,
+            'output_file': output_file,
+            'overview': overview,
+            'glossary': glossary,
+        })
+        for term in glossary:
+            all_glossary_terms.add(term)
+            if term not in term_chapters:
+                term_chapters[term] = []
+            term_chapters[term].append(title)
+
+    # Build the index document
+    lines = [
+        "# FreeBSD Internals for Students — Chapter Index",
+        "",
+        "AI-generated documentation of FreeBSD internals. Each chapter is placed",
+        "in the relevant FreeBSD source directory so a student can find educational",
+        "material right next to the code.",
+        "",
+        "---",
+        "",
+        "## Table of Contents",
+        "",
+    ]
+
+    for i, cd in enumerate(chapter_data, 1):
+        title = cd['title']
+        output_file = cd['output_file']
+        overview = cd['overview']
+
+        if overview:
+            lines.append(f"{i}. **[{title}]({output_file})**")
+            lines.append(f"   {overview}")
+        else:
+            lines.append(f"{i}. [{title}]({output_file}) — not yet generated")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+    lines.append("## Cross-References")
+    lines.append("")
+
+    # Group chapters by relationship
+    for title, related in CHAPTER_RELS.items():
+        if not related:
+            continue
+        rel_links = []
+        for rel_title in related:
+            # Find the output file for this related chapter
+            for cd in chapter_data:
+                if cd['title'] == rel_title:
+                    rel_links.append(f"[{rel_title}]({cd['output_file']})")
+                    break
+            else:
+                rel_links.append(rel_title)
+        lines.append(f"- **{title}** → {', '.join(rel_links)}")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## Glossary")
+    lines.append("")
+    lines.append("Key FreeBSD-specific terms found across all chapters, with which")
+    lines.append("chapters discuss them:")
+    lines.append("")
+
+    # Sort glossary terms alphabetically
+    for term in sorted(all_glossary_terms):
+        chapters_list = term_chapters.get(term, [])
+        if chapters_list:
+            ch_links = []
+            for ct in chapters_list:
+                for cd in chapter_data:
+                    if cd['title'] == ct:
+                        ch_links.append(f"[{ct}]({cd['output_file']})")
+                        break
+                else:
+                    ch_links.append(ct)
+            lines.append(f"- **{term}**: {', '.join(ch_links)}")
+        else:
+            lines.append(f"- **{term}**")
+    lines.append("")
+    lines.append(f"*{len(all_glossary_terms)} terms across {len(chapter_data)} chapters*")
+
+    # Write the index
+    index_path = os.path.join(output_dir, "CHAPTER_INDEX.md")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"  [index] wrote {index_path} ({len(all_glossary_terms)} terms, "
+          f"{len(chapter_data)} chapters)")
+    return index_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FreeBSD Internals for Students — Documentation Generator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--chapter", type=int, default=0,
+        help="Run only this chapter (1-based). 0 = all chapters.",
+    )
+    parser.add_argument(
+        "--index-only", action="store_true",
+        help="Build book index and exit (don't run agent).",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Regenerate even if README.md already exists.",
+    )
+    parser.add_argument(
+        "--reindex", action="store_true",
+        help="Rebuild book index from scratch (ignore cached hashes).",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would happen without running agents.",
+    )
+    parser.add_argument(
+        "--max-revisions", type=int, default=2,
+        help="Max review+revise rounds per chapter (0 = no review, default=2).",
+    )
+    parser.add_argument(
+        "--nav-only", action="store_true",
+        help="Rebuild cross-README navigation links only (no agent runs).",
+    )
+    parser.add_argument(
+        "--index", action="store_true",
+        help="Rebuild CHAPTER_INDEX.md (TOC, glossary, cross-refs) only.",
+    )
+    args = parser.parse_args()
+
+    # Validate environment
+    if not os.path.isdir(SRC_ROOT):
+        print(f"Error: FreeBSD source not found at {SRC_ROOT}")
+        print(f"       Set FREEBSD_SRC to point to your tree.")
+        sys.exit(1)
+
+    if not os.path.isdir(BOOKS_DIR):
+        print(f"Error: Books directory not found at {BOOKS_DIR}")
+        print(f"       Set BOOKS_DIR to point to your books.")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("  FreeBSD Internals for Students — Doc Generator")
+    print("=" * 60)
+    print(f"  Source:  {SRC_ROOT}")
+    print(f"  Books:   {BOOKS_DIR}")
+    print(f"  Index:   {INDEX_DIR}")
+    print()
+
+    # Phase 1: Extract books and build index
+    print("[Phase 1] Book corpus extraction")
+    corpus_path = build_book_corpus(BOOKS_DIR, force=args.reindex)
+
+    print("[Phase 1b] FreeBSD source documentation")
+    extract_freebsd_docs(SRC_ROOT, corpus_path)
+    print()
+
+    print("[Phase 2] TF-IDF index")
+    index = get_or_build_index(corpus_path, force=args.reindex)
+
+    if args.index_only:
+        print("Done (index-only mode).")
+        return
+
+    if args.nav_only:
+        chapters = load_chapters()
+        print(f"\n[Phase 4] Cross-README navigation links")
+        build_navigation(chapters)
+        print("Done (nav-only mode).")
+        return
+
+    if args.index:
+        chapters = load_chapters()
+        print(f"\n[Phase 5] Cross-chapter reference index")
+        build_chapter_index(chapters, SRC_ROOT, str(SCRIPT_DIR))
+        print("Done (index-only mode).")
+        return
+
+    # Phase 3: Run agent per chapter
+    chapters = load_chapters()
+    if args.chapter:
+        if 1 <= args.chapter <= len(chapters):
+            chapters = [chapters[args.chapter - 1]]
+        else:
+            print(f"Error: --chapter must be 1..{len(chapters)}")
+            sys.exit(1)
+
+    # Filter out already-done chapters (unless --force)
+    to_run = []
+    for ch in chapters:
+        out = os.path.join(SRC_ROOT, ch.get("output_file", "README.md"))
+        if not args.force and os.path.exists(out):
+            print(f"  skip  {ch['title']} (README.md exists, use --force)")
+        else:
+            to_run.append(ch)
+
+    if not to_run and not args.dry_run:
+        print("\nAll chapters done. Use --force to regenerate.")
+        return
+    elif not to_run and args.dry_run:
+        print("\nAll chapters would be skipped (all README.md exist). Use --force.")
+        return
+
+    print(f"\n[Phase 3] {len(to_run)} chapter(s) to process")
+
+    if args.dry_run:
+        for ch in to_run:
+            run_chapter(ch, None, None, 0, dry_run=True)
+        print(f"\n{'=' * 60}")
+        print(f"  Dry-run complete")
+        print(f"{'=' * 60}")
+        return
+
+    writer = create_writer_agent(index)
+    reviewer = create_reviewer_agent(index)
+    ok = 0
+    for ch in to_run:
+        if run_chapter(ch, writer, reviewer, args.max_revisions):
+            ok += 1
+
+    # Post-processing: cross-README navigation links
+    if ok > 0:
+        print(f"\n[Phase 4] Cross-README navigation links")
+        build_navigation(chapters)
+
+        # Post-processing: cross-chapter reference index
+        print(f"\n[Phase 5] Cross-chapter reference index")
+        build_chapter_index(chapters, SRC_ROOT, str(SCRIPT_DIR))
+
+    print(f"\n{'=' * 60}")
+    print(f"  Done: {ok}/{len(to_run)} chapters generated")
+    print(f"{'=' * 60}")
+
+
+if __name__ == "__main__":
+    main()

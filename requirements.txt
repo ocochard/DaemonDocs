@@ -1,0 +1,15 @@
+# FreeBSD Documentation Generator - Dependencies
+# All packages must work on FreeBSD (no SWIG/CMake builds)
+#
+# Install: python3 -m pip install --user -r FreeBSD/requirements.txt
+
+smolagents>=1.20.0
+openai>=2.0.0         # needed by smolagents OpenAIServerModel
+PyPDF2>=3.0.0
+pyyaml>=6.0
+numpy>=1.24.0
+
+# Optional (if available on your platform):
+# pymupdf          # better PDF extraction (requires SWIG)
+# chm              # CHM file support (requires compilation)
+# sentence-transformers  # embedding-based RAG (requires PyTorch)
