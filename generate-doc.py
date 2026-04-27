@@ -904,34 +904,127 @@ class TfidfIndex:
         return results
 
     def save(self, path: str):
+        """Atomically persist the index.
+
+        np.save and the meta JSON go to temp paths first, then both get
+        renamed into place. If anything fails partway, leftover temp files
+        are removed and the previous on-disk index (if any) stays intact.
+
+        This matters because a corrupted matrix.npy or truncated meta.json
+        would silently produce empty book-search results on the next run —
+        chapters would be generated with no book grounding and the only
+        symptom would be visibly worse output.
+        """
         path = str(path)
-        np.save(f"{path}_matrix.npy", self.tf_idf_matrix)
-        with open(f"{path}_meta.json", "w") as f:
-            json.dump({
+        matrix_path = f"{path}_matrix.npy"
+        meta_path = f"{path}_meta.json"
+        matrix_tmp = f"{matrix_path}.tmp.{os.getpid()}"
+        meta_tmp = f"{meta_path}.tmp.{os.getpid()}"
+
+        # np.save auto-appends ".npy" if the path doesn't already end in it,
+        # so we write to a path that already does — otherwise os.replace below
+        # would look for the wrong filename and fail.
+        matrix_tmp_actual = matrix_tmp + ".npy"
+
+        try:
+            # np.save needs a real file path — write to a temp, then rename.
+            np.save(matrix_tmp, self.tf_idf_matrix)
+            # _atomic_write handles the meta JSON (fsync + os.replace).
+            _atomic_write(meta_path, json.dumps({
                 "vocab": self.vocab,
                 "chunks": self.chunks,
                 "sources": self.sources,
-            }, f)
+            }))
+            # If meta wrote successfully, swap in the matrix.
+            os.replace(matrix_tmp_actual, matrix_path)
+        except Exception:
+            for tmp in (matrix_tmp, matrix_tmp_actual, meta_tmp):
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            raise
 
-    def load(self, path: str):
+    def load(self, path: str) -> bool:
+        """Load a saved index and validate it. Returns True on success.
+
+        Returns False (instead of raising or returning a half-loaded index)
+        when:
+          - either file is missing
+          - the .npy is unreadable / truncated
+          - the JSON is malformed
+          - the matrix shape is inconsistent with the meta
+            (vocab size != n_columns, n_rows != len(chunks) != len(sources))
+
+        The caller should treat False as "rebuild from corpus" rather than
+        carrying on with empty searches.
+        """
         path = str(path)
-        self.tf_idf_matrix = np.load(f"{path}_matrix.npy")
-        meta = json.loads(Path(f"{path}_meta.json").read_text())
-        self.vocab = meta["vocab"]
-        self.chunks = meta["chunks"]
-        self.sources = meta["sources"]
+        matrix_path = f"{path}_matrix.npy"
+        meta_path = f"{path}_meta.json"
+
+        if not (os.path.exists(matrix_path) and os.path.exists(meta_path)):
+            return False
+
+        try:
+            matrix = np.load(matrix_path)
+        except Exception as e:
+            print(f"  ⚠ index matrix unreadable ({e}) — will rebuild")
+            return False
+
+        try:
+            meta = json.loads(Path(meta_path).read_text())
+        except Exception as e:
+            print(f"  ⚠ index meta unreadable ({e}) — will rebuild")
+            return False
+
+        vocab = meta.get("vocab")
+        chunks = meta.get("chunks")
+        sources = meta.get("sources")
+
+        if not isinstance(vocab, dict) or not isinstance(chunks, list) \
+                or not isinstance(sources, list):
+            print("  ⚠ index meta has unexpected types — will rebuild")
+            return False
+
+        if matrix.ndim != 2:
+            print(f"  ⚠ index matrix has wrong rank {matrix.ndim} — will rebuild")
+            return False
+
+        n_rows, n_cols = matrix.shape
+        if n_rows != len(chunks) or n_rows != len(sources) or n_cols != len(vocab):
+            print(
+                f"  ⚠ index shape mismatch "
+                f"(matrix={n_rows}x{n_cols}, "
+                f"chunks={len(chunks)}, sources={len(sources)}, vocab={len(vocab)}) "
+                f"— will rebuild"
+            )
+            return False
+
+        self.tf_idf_matrix = matrix
+        self.vocab = vocab
+        self.chunks = chunks
+        self.sources = sources
+        return True
 
 
 def get_or_build_index(corpus_path: str, force: bool = False) -> TfidfIndex:
-    """Load saved index or build from corpus."""
+    """Load saved index or build from corpus.
+
+    If the saved index fails any validation check (corrupt .npy, malformed
+    meta, shape mismatch), we transparently fall back to a rebuild rather
+    than crash or proceed with a broken index.
+    """
     index_path = INDEX_DIR / "tfidf_index"
 
     if not force and Path(f"{index_path}_matrix.npy").exists():
         print("  loading saved TF-IDF index ...")
         idx = TfidfIndex()
-        idx.load(str(index_path))
-        print(f"  index: {len(idx.chunks)} chunks, {len(idx.vocab)} terms")
-        return idx
+        if idx.load(str(index_path)):
+            print(f"  index: {len(idx.chunks)} chunks, {len(idx.vocab)} terms")
+            return idx
+        print("  saved index could not be validated — rebuilding from corpus")
 
     print("  building TF-IDF index ...")
     idx = TfidfIndex()
