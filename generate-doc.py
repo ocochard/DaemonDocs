@@ -2137,21 +2137,43 @@ def _extract_json(text: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
+## Top-level directories of the FreeBSD source tree that are worth
+## fact-checking when the writer cites a path. Anything outside this
+## set (build artefacts, OS-specific dirs, etc.) is skipped because the
+## verification step would produce noise rather than catch real
+## hallucinations. Keep this in sync with the actual src layout.
+_FREEBSD_TOP_DIRS = (
+    'sys/', 'share/', 'stand/', 'lib/', 'libexec/',
+    'bin/', 'sbin/', 'usr.bin/', 'usr.sbin/',
+    'contrib/', 'tools/', 'gnu/', 'cddl/', 'crypto/',
+    'kerberos5/', 'rescue/', 'secure/', 'tests/', 'targets/',
+    'release/', 'sbin/', 'etc/',
+)
+
+
 def _extract_file_paths(text: str) -> List[str]:
     """Extract claimed FreeBSD source file paths from markdown text."""
     # Match paths like sys/vm/vm_page.c, share/man/man9/foo.9, etc.
     # Look for backtick-quoted or bare paths
+    # Trailing `(?!\w)` prevents the extension alternation from biting
+    # into a longer extension — without it, `.s` would match the `s` in
+    # `gdb-add-index.sh` and yield a bogus `.s` path.
     paths = []
     for m in re.finditer(
-        r'(?:`)([^`\s]+(?:/[^`\s]+)*\.(?:c|h|s|rs|md|9|4|5|7|8))', text
+        r'(?:`)([^`\s]+(?:/[^`\s]+)*\.(?:c|h|s|rs|md|9|4|5|7|8))(?!\w)', text
     ):
         p = m.group(1)
-        if p.startswith('sys/') or p.startswith('share/') or p.startswith('stand/'):
+        if p.startswith(_FREEBSD_TOP_DIRS):
             paths.append(p)
-    # Also match bare paths (not in backticks but still file-like)
-    for m in re.finditer(
-        r'(?:^|\s)(sys/\S+\.(?:c|h|s|rs)|share/\S+\.(?:9|4|5|7|8|adoc))', text
-    ):
+    # Also match bare paths (not in backticks but still file-like).
+    # The character class is intentionally restrictive so we don't pick
+    # up surrounding punctuation.
+    top_alt = "|".join(re.escape(d.rstrip('/')) for d in _FREEBSD_TOP_DIRS)
+    bare_re = (
+        r'(?:^|\s)((?:' + top_alt + r')/\S+\.'
+        r'(?:c|h|s|rs|9|4|5|7|8|adoc|mk|sh|py))(?!\w)'
+    )
+    for m in re.finditer(bare_re, text):
         p = m.group(1).strip()
         if p not in paths:
             paths.append(p)
@@ -2195,7 +2217,10 @@ def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
     """Verify that claimed file paths exist in the source tree.
 
     Returns a list of "path: not found" strings for missing files.
-    Also tries glob fallback for close matches.
+    Also tries a glob fallback for close matches and emits a "wrong → right"
+    correction — but only when the proposed correction is itself a real
+    file, so we never suggest the writer rewrite to a path that also
+    doesn't exist.
     """
     not_found = []
     for p in paths:
@@ -2205,9 +2230,15 @@ def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
         # Try glob fallback
         pattern = os.path.join(src_root, p.split('/')[0], '**', p.split('/')[-1])
         matches = list(glob.glob(pattern, recursive=True))
-        if matches:
-            # Found a close match — note the correction
-            not_found.append(f"{p} → {os.path.relpath(matches[0], src_root)}")
+        # Filter to candidates that actually exist on disk. Glob already
+        # returns existing entries, but be defensive against symlinks or
+        # races between glob and the os.path.exists() recheck below.
+        candidate = next(
+            (m for m in matches if os.path.exists(m) and os.path.isfile(m)),
+            None,
+        )
+        if candidate is not None:
+            not_found.append(f"{p} → {os.path.relpath(candidate, src_root)}")
         else:
             not_found.append(p)
     return not_found
@@ -2679,33 +2710,63 @@ def _add_see_also_links(content: str, title: str, title_map: dict,
 # ---------------------------------------------------------------------------
 
 
+## Headers that mark the *start* of the overview section we want to lift
+## out for the master index. Listed by preference — the first one found
+## wins. Match is case-insensitive and tolerates either `#` or `##` so a
+## chapter that drifts on capitalisation or heading level still parses.
+_OVERVIEW_HEADERS = ("Quick Summary", "Overview")
+
+## Headers that mark the *end* of the overview section. Anything between
+## the start header and the first of these is the summary. Same case
+## tolerance as above.
+_OVERVIEW_END_HEADERS = (
+    "Architecture", "Key Data Structures", "Deep Dive",
+    "Flow / Diagram", "Advanced Notes", "Comparison", "See Also",
+)
+
+
+def _find_md_header(content: str, name: str, start_at: int = 0) -> int:
+    """Return the offset of the next markdown header `name` (case-insensitive,
+    `#` or `##`), or -1 if not found. The match is anchored at start of line
+    so it doesn't fire inside a code block or paragraph that mentions the
+    phrase.
+    """
+    # `[ ]{0,3}` — literal spaces only. Plain `\s` matches newlines, which
+    # combined with `^` in multiline mode would slide the match to the
+    # newline *before* the header, throwing off the header-line bounds.
+    pattern = r'(?im)^[ ]{0,3}#{1,2}[ \t]+' + re.escape(name) + r'[ \t]*$'
+    m = re.search(pattern, content[start_at:])
+    if m is None:
+        return -1
+    return start_at + m.start()
+
+
 def _extract_overview(content: str, max_chars: int = 300) -> str:
     """Extract the Quick Summary section from a README as a summary."""
-    start = content.find("## Quick Summary")
-    if start == -1:
-        # Fallback to old name
-        start = content.find("## Overview")
-    if start == -1:
-        # Try without ##
-        start = content.find("# Quick Summary")
-        if start == -1:
-            start = content.find("# Overview")
+    # Find the first overview-style header (case-insensitive, # or ##).
+    start = -1
+    matched_header_end = 0
+    for name in _OVERVIEW_HEADERS:
+        pos = _find_md_header(content, name)
+        if pos != -1:
+            start = pos
+            # Find the end of this header line so the body extraction
+            # doesn't include the header text itself.
+            nl = content.find('\n', pos)
+            matched_header_end = nl + 1 if nl != -1 else len(content)
+            break
     if start == -1:
         return ""
-    # Find the section header that was found
-    section_header = "## Quick Summary"
-    if "## Quick Summary" not in content:
-        section_header = "## Overview"
-    # Find the next section header
+
+    # Find the next section header that bounds the overview.
     end = len(content)
-    for header in ["## Architecture", "## Key Data Structures", "## Deep Dive",
-                   "## Flow / Diagram", "## Advanced Notes", "## Comparison",
-                   "## See Also"]:
-        pos = content.find(header, start + 10)
-        if pos > start and pos < end:
+    for name in _OVERVIEW_END_HEADERS:
+        pos = _find_md_header(content, name, start_at=matched_header_end)
+        if pos != -1 and pos < end:
             end = pos
-    overview = content[start + len(section_header):end].strip()
-    # Take first 2 paragraphs
+
+    overview = content[matched_header_end:end].strip()
+    # Take first 2 paragraphs.
     paragraphs = re.split(r'\n\s*\n', overview)
     paragraphs = [p.strip() for p in paragraphs if p.strip()]
     summary = "\n\n".join(paragraphs[:2])
