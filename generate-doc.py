@@ -1996,7 +1996,7 @@ def create_writer_agent(index: TfidfIndex):
         ],
         model=model,
         additional_authorized_imports=["re", "os", "pathlib", "json"],
-        max_steps=25,
+        max_steps=40,
     )
 
 
@@ -2014,7 +2014,7 @@ def create_reviewer_agent(index: TfidfIndex):
         ],
         model=model,
         additional_authorized_imports=["json", "re"],
-        max_steps=10,
+        max_steps=15,
     )
 
 
