@@ -12,7 +12,11 @@
 
 chapters:
   - title: "FreeBSD Source Tree Overview"
-    output_file: "README.md"
+    # NOTE: output is README_internals.md, not README.md — upstream FreeBSD
+    # already ships a README.md at the tree root (and we read it as a source
+    # file below). Writing there would clobber upstream and cause a
+    # read-vs-write collision in run_chapter().
+    output_file: "README_internals.md"
     source_dirs: []
     source_files:
       - "README.md"
