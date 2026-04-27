@@ -27,8 +27,19 @@ chapters:
       - "Architecture"
       - "Flow / Diagram"
       - "Advanced Notes"
-      - "Comparison"
       - "See Also"
+    # Tree-overview scope. Without this guard the writer pulls struct
+    # snippets and code walks from sys/vm and sys/kern into the main
+    # README, which then duplicates (and often contradicts) the
+    # subsystem-specific chapters. Keep it strictly directory-purpose.
+    scope_guard: >
+      This is a tree-level overview. Do NOT feature specific subsystem
+      structs (vm_page, vm_map, struct proc, struct vnode, struct
+      vm_pagequeue, etc.) or code from inside sys/vm, sys/kern, etc.
+      Those belong to their own chapters. When you mention sys/vm or
+      sys/kern, give a one-sentence directory-purpose only and refer the
+      reader to the relevant chapter. No struct field-by-field tables,
+      no function-body excerpts, no #include details.
     source_dirs: []
     source_files:
       - "README.md"

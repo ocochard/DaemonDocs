@@ -1604,6 +1604,7 @@ def build_chapter_prompt(chapter: dict) -> str:
     focus = chapter.get("focus", "")
     questions = chapter.get("key_questions", [])
     diagram = chapter.get("mermaid", "flowchart")
+    scope_guard = (chapter.get("scope_guard") or "").strip()
 
     # Gather existing documentation context
     source_context = gather_source_context(chapter)
@@ -1708,6 +1709,22 @@ def build_chapter_prompt(chapter: dict) -> str:
     first, sep, rest = raw_body.partition("\n")
     template_body = first + (sep + textwrap.indent(rest, "        ") if sep else "")
 
+    # Optional per-chapter scope guard (chapters.yaml `scope_guard:`).
+    # Same indentation rule as template_body — first line is already at the
+    # f-string scaffolding column; pre-indent every subsequent line.
+    if scope_guard:
+        sg_first, sg_sep, sg_rest = scope_guard.partition("\n")
+        sg_body = sg_first + (
+            sg_sep + textwrap.indent(sg_rest, "        ") if sg_sep else ""
+        )
+        scope_guard_block = (
+            "\n        ## Scope Guard\n"
+            "        (HARD RULE — do not violate, even if a referenced file tempts you to.)\n"
+            f"        {sg_body}\n"
+        )
+    else:
+        scope_guard_block = ""
+
     return textwrap.dedent(f"""\
         You are writing a chapter for "FreeBSD Internals" — a
         guide that helps anyone interested in operating systems understand
@@ -1717,7 +1734,7 @@ def build_chapter_prompt(chapter: dict) -> str:
 
         ## Focus
         {focus}
-
+        {scope_guard_block}
         ## Instructions
         {chr(10).join(f"{s}" for s in steps)}
 

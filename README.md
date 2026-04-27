@@ -205,6 +205,7 @@ Each chapter has:
 - `key_questions` — questions the chapter must answer
 - `mermaid` — diagram type: `sequence`, `flowchart`, `class`, or `state`
 - `sections` — *(optional)* which template sections this chapter should produce. Defaults to the full set: `Quick Summary`, `Architecture`, `Key Data Structures`, `Deep Dive`, `Flow / Diagram`, `Advanced Notes`, `Comparison`, `See Also`. A tree-overview chapter, for example, can drop `Key Data Structures` and `Deep Dive` because there's no specific subsystem to feature. The catalog of valid section names lives in `_SECTION_CATALOG` in `generate-doc.py`.
+- `scope_guard` — *(optional)* free-text hard rule injected into the writer prompt under `## Scope Guard`. Use this when section selection alone isn't enough to keep the writer on-topic. The tree-overview chapter uses it to forbid pulling subsystem internals (vm_page, struct proc, etc.) from referenced source directories.
 
 Current chapters (13):
 1. FreeBSD Source Tree Overview
@@ -276,7 +277,7 @@ differences, not code details. 2-4 paragraphs.)
 (related chapters and source directories)
 ```
 
-A chapter can opt out of sections that don't fit by declaring `sections:` in `chapters.yaml`. Chapter 1 (the tree overview) drops `Key Data Structures` and `Deep Dive` for that reason — there are no single structs or functions worth featuring at the tree-level view, and forcing those sections led the writer to invent thin, out-of-context examples.
+A chapter can opt out of sections that don't fit by declaring `sections:` in `chapters.yaml`. Chapter 1 (the tree overview) drops `Key Data Structures`, `Deep Dive`, and `Comparison` for that reason — there are no single structs or functions worth featuring at the tree-level view, and forcing those sections led the writer to invent thin, out-of-context examples. A chapter can also add a `scope_guard:` block to forbid specific patterns the writer would otherwise drift into.
 
 Rules:
 - Always reference specific file paths (e.g., `sys/vm/vm_page.c`)
