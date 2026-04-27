@@ -2461,6 +2461,18 @@ _FACT_CHECK_IGNORE = frozenset({
     "SUBDIR", "SUBDIRS", "SRCS", "INCS", "MAN",
     # Filenames the writer references as identifiers
     "Makefile", "UPDATING", "COPYRIGHT", "README",
+    # Common parameter / variable names that the writer back-ticks but
+    # that are not themselves function symbols. They show up as noise
+    # when the writer references function signatures like
+    # `SYSINIT(name, sub, order, func, udata)` — the args (name, sub,
+    # order, func, udata) get pulled as separate "function" candidates.
+    "init", "func", "order", "udata", "sid", "name", "sub", "arg",
+    "data", "ptr", "ret", "rv", "td", "p", "q", "n", "i", "j", "k",
+    # Globals / sentinels frequently mentioned by name but not callable
+    "thread0", "proc0", "session0", "pgrp0", "thread0_st", "btext",
+    "TDP_NOFAULTING",
+    # Generic kernel sysctls / runtime knobs commonly referenced
+    "bootverbose", "kdb", "ddb",
     # Linux structs / funcs that legitimately appear in Comparison sections
     # (they don't exist in the FreeBSD tree, but flagging them as
     # "missing" wastes a fact-fix step).
@@ -2470,6 +2482,20 @@ _FACT_CHECK_IGNORE = frozenset({
     # macOS/XNU
     "kernel_bootstrap", "IOKit",
 })
+
+# Well-known C macro prefixes that should never be treated as function
+# names by the fact-checker. The writer routinely back-ticks these (e.g.
+# `SI_SUB_DRIVERS`, `SI_ORDER_FIRST`, `SDT_PROBE_DEFINE`) and they get
+# extracted as bare identifiers — but they're #define'd macros, not
+# callable functions. Grepping for them in the source tree finds the
+# definition fine, but our function-shape filter (`ID *( *ID(`) misses
+# them, so they wrongly land in funcs_not_found.
+_MACRO_PREFIX_RE = re.compile(
+    r'^(?:SI_SUB|SI_ORDER|SYSINIT|SYSUNINIT|SDT_PROBE|TUNABLE|'
+    r'CTASSERT|MALLOC_DEFINE|MALLOC_DECLARE|TAILQ|LIST|STAILQ|'
+    r'SLIST|RB|MTX|SX|RW|KASSERT|MPASS|VOP|FEATURE|EVENTHANDLER)'
+    r'(?:_[A-Z0-9_]+)?$'
+)
 
 
 # Match the `## Comparison` H2 section (and "Comparison with X" variants)
@@ -2501,6 +2527,9 @@ def _filter_known_noise(names: List[str]) -> List[str]:
         # All-caps WITH_*, WITHOUT_*, MK_*, NO_* — kernel/make config knobs
         if re.match(r'^(?:WITH|WITHOUT|MK|NO)_[A-Z0-9_]+$', n):
             continue
+        # Well-known C macro families (SI_SUB_*, SDT_PROBE_*, TAILQ_*, etc.)
+        if _MACRO_PREFIX_RE.match(n):
+            continue
         out.append(n)
     return out
 
@@ -2518,24 +2547,31 @@ def _extract_struct_names(text: str) -> List[str]:
 
 
 def _extract_function_names(text: str) -> List[str]:
-    """Extract claimed function names from markdown text."""
-    funcs = []
-    # Match patterns like `vm_page_insert()`, vm_page_insert, vm_foo(),
-    # Fn vm_foo, or "the foo() function"
-    # Backtick-quoted function calls
-    for m in re.finditer(r'`([a-zA-Z_]\w*)\s*\(\s*\)`', text):
-        funcs.append(m.group(1))
-    # Backtick-quoted function names without parens
-    for m in re.finditer(r'`([a-zA-Z_]\w*)`', text):
-        name = m.group(1)
-        if name not in funcs:
-            funcs.append(name)
-    # "the foo() function" pattern
-    for m in re.finditer(r'the\s+([a-zA-Z_]\w*)\s*\(\s*\)\s+function', text):
-        name = m.group(1)
-        if name not in funcs:
-            funcs.append(name)
-    return _filter_known_noise(list(set(funcs)))
+    """Extract claimed function names from markdown text.
+
+    Only returns identifiers that have *call evidence* — backticks with
+    parentheses (`foo()`), an unbacked "the foo() function" prose
+    pattern, or `function-name()` mid-prose. Bare backticked
+    identifiers are skipped because they are dominated by struct
+    fields, type names, sysctls, parameter names and macro tokens —
+    grepping all of those wastes fact-fix steps.
+    """
+    funcs = set()
+    # Backtick-quoted function calls: `vm_page_insert()`
+    for m in re.finditer(r'`([a-zA-Z_]\w*)\s*\(\s*[^`]*\)`', text):
+        funcs.add(m.group(1))
+    # "the foo() function" prose pattern
+    for m in re.finditer(r'\b(?:the|a|an)\s+([a-zA-Z_]\w*)\s*\(\s*\)\s+function', text):
+        funcs.add(m.group(1))
+    # "foo() function" / "function foo()"
+    for m in re.finditer(r'\b([a-zA-Z_]\w*)\s*\(\s*\)\s+function\b', text):
+        funcs.add(m.group(1))
+    for m in re.finditer(r'\bfunction\s+([a-zA-Z_]\w*)\s*\(\s*\)', text):
+        funcs.add(m.group(1))
+    # "calls foo()" / "invokes foo()"
+    for m in re.finditer(r'\b(?:calls?|invokes?|returns? from)\s+`?([a-zA-Z_]\w*)`?\s*\(\s*\)', text):
+        funcs.add(m.group(1))
+    return _filter_known_noise(list(funcs))
 
 
 def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
