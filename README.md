@@ -1,19 +1,19 @@
-# FreeBSD Internals for Students
+# FreeBSD Internals
 
 [![GitHub](https://img.shields.io/badge/GitHub-DaemonDocs-181717?logo=github)](https://github.com/ocochard/DaemonDocs)
 
-AI-generated documentation of FreeBSD internals. Each chapter produces a `README.md` placed directly in the relevant FreeBSD source directory — so a student can `git clone` the tree and find educational material right next to the code.
+AI-generated documentation of FreeBSD internals. Each chapter produces a `README.md` placed directly in the relevant FreeBSD source directory — so anyone can `git clone` the tree and find educational material right next to the code.
 
 ## Vision
 
-Build documentation of FreeBSD internals by having AI agents study the FreeBSD source code and cross-reference it with FreeBSD books. The output is a set of `README.md` files placed throughout the FreeBSD source tree — so a student or developer can `git clone` the tree and find educational material right next to the code.
+Build documentation of FreeBSD internals by having AI agents study the FreeBSD source code and cross-reference it with FreeBSD books. The output is a set of `README.md` files placed throughout the FreeBSD source tree — so any reader can `git clone` the tree and find educational material right next to the code.
 
 The reference works are:
 - *The Design and Implementation of FreeBSD* (McKusick et al.)
 - *FreeBSD Device Drivers* (Pfeffer et al.)
 - *Designing BSD: Rootkits* (for kernel hacking concepts)
 
-The goal is **not** to reproduce man pages. The goal is to help a CS student who knows C but has never touched a kernel understand how an operating system actually works — by studying real, shipping code.
+The goal is **not** to reproduce man pages. The goal is to help anyone who knows C but has never touched a kernel — students, developers, hobbyists — understand how an operating system actually works by studying real, shipping code.
 
 ---
 
@@ -184,7 +184,7 @@ The reviewer grades on 6 criteria:
 2. **Accuracy** — no hallucinated structs/functions/paths
 3. **Source Coverage** — expected files actually discussed (not just listed)
 4. **Mermaid Diagram** — valid syntax, meaningful content
-5. **Student Accessibility** — explains WHY, not just WHAT
+5. **Accessibility** — explains WHY, not just WHAT
 6. **Structure** — all 9 required sections present
 
 Default: `--max-revisions 2` (one draft + up to two revision rounds).
@@ -242,7 +242,7 @@ Each file follows a strict 9-section template:
 
 ## Quick Summary
 (3-4 paragraphs: what this subsystem does and why it matters.
-No code — accessible to any CS student who knows C.)
+No code — accessible to any reader who knows C.)
 
 ## Architecture
 (technical explanation with source file references)
@@ -258,7 +258,7 @@ with code snippets. Intermediate reading level.)
 (Mermaid diagram — sequence, flowchart, class, or state)
 
 ## Advanced Notes
-(Practical insights for advanced students: debugging with DTrace,
+(Practical insights for advanced readers: debugging with DTrace,
 performance implications, race conditions, common pitfalls,
 connection to OS theory.)
 

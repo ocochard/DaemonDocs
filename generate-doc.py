@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FreeBSD Internals for Students — Documentation Generator
+FreeBSD Internals — Documentation Generator
 
 Uses smolagents to produce README.md files throughout the FreeBSD
 source tree. Each chapter is driven by chapters.yaml and the agent has
@@ -79,6 +79,39 @@ MODEL_CONFIG = {
 
 # Resolved at startup by resolve_model_provenance(); cached for the run.
 RESOLVED_PROVENANCE: Optional[Dict[str, str]] = None
+
+
+def _atomic_write(path: str, content: str, encoding: str = "utf-8") -> None:
+    """Write `content` to `path` atomically.
+
+    Strategy: write to a sibling tempfile in the same directory, then rename.
+    `os.replace()` is atomic on POSIX and on Windows when the target is on the
+    same filesystem — which is guaranteed here because the temp lives next to
+    the destination.
+
+    A Ctrl-C, crash, or full disk in the middle of a write therefore leaves
+    either the previous file intact or no file at all — never a half-written
+    one. This is critical for the corpus hash file, the TF-IDF index meta,
+    the chapter outputs, and the navigation post-pass: a corrupted file in
+    any of those would break the next run silently.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # Best-effort cleanup of the tempfile on failure.
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        raise
 
 
 def _http_get_json(url: str, timeout: float) -> Optional[dict]:
@@ -302,7 +335,9 @@ def build_book_corpus(books_dir: str, force: bool = False) -> str:
             f.write(f"\n\n### SOURCE: {book_name} ###\n\n")
             f.write(page_text)
 
-    hash_file.write_text(json.dumps(current_hashes, indent=2))
+    # Atomic write — a Ctrl-C mid-write would otherwise leave a truncated JSON
+    # that crashes the next run before it can rebuild.
+    _atomic_write(str(hash_file), json.dumps(current_hashes, indent=2))
     print(f"\n  corpus: {len(all_entries)} pages from {len(current_hashes)} books\n")
     return str(corpus_file)
 
@@ -1431,9 +1466,9 @@ def build_chapter_prompt(chapter: dict) -> str:
     steps.append(f"    - Diagram format hint:{diagram_hints.get(diagram, '')}")
 
     return textwrap.dedent(f"""\
-        You are writing a chapter for "FreeBSD Internals for Students" — a
-        textbook that helps students understand operating system concepts by
-        studying real FreeBSD source code.
+        You are writing a chapter for "FreeBSD Internals" — a
+        guide that helps anyone interested in operating systems understand
+        how they work by studying real FreeBSD source code.
 
         ## Chapter: {chapter['title']}
 
@@ -1455,7 +1490,7 @@ def build_chapter_prompt(chapter: dict) -> str:
 
         ## Quick Summary
         (3-4 paragraphs: what this subsystem does and why it matters.
-        No code — accessible to any CS student who knows C.)
+        No code — accessible to any reader who knows C.)
 
         ## Architecture
         (technical explanation with specific source file references)
@@ -1472,7 +1507,7 @@ def build_chapter_prompt(chapter: dict) -> str:
         (Mermaid {diagram} diagram — valid syntax, not a placeholder)
 
         ## Advanced Notes
-        (Practical insights for advanced students: debugging with DTrace,
+        (Practical insights for advanced readers: debugging with DTrace,
         performance implications, race conditions, common pitfalls,
         connection to OS theory from textbooks.)
 
@@ -1492,7 +1527,7 @@ def build_chapter_prompt(chapter: dict) -> str:
         - Always reference specific file paths (e.g., `sys/vm/vm_page.c`)
         - Include C code snippets where they illuminate the design
         - Connect textbook theory to actual FreeBSD implementation
-        - Make it accessible to a CS student who knows C but not kernel internals
+        - Make it accessible to any reader who knows C but not kernel internals
         - Output ONLY the Markdown content — no preamble, no explanation
         - EVERY section header above MUST appear in your output
         - If you cannot fill a section with real content, write "See related
@@ -1508,7 +1543,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
     question_text = "\n".join(f"- {q}" for q in questions)
 
     return textwrap.dedent(f"""\
-        You are reviewing a draft chapter for "FreeBSD Internals for Students."
+        You are reviewing a draft chapter for "FreeBSD Internals."
         Your job is to find problems — be strict but fair.
 
         ## Chapter: {chapter['title']}
@@ -1537,7 +1572,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            Check syntax: correct keywords, no missing brackets, proper arrows.
            Does it actually illustrate the subsystem (not a generic placeholder)?
 
-        5. **Student Accessibility** — Is the tone educational? Does it explain
+        5. **Accessibility** — Is the tone educational? Does it explain
            WHY things work, not just WHAT they do? Are there analogies or
            connections to OS theory?
 
@@ -1590,7 +1625,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
 def build_revision_prompt(chapter: dict, draft: str, review: str) -> str:
     """Build the revision prompt for the writer agent to fix issues."""
     return textwrap.dedent(f"""\
-        You are revising a chapter for "FreeBSD Internals for Students."
+        You are revising a chapter for "FreeBSD Internals."
         A reviewer found issues — fix them all.
 
         ## Chapter: {chapter['title']}
@@ -1623,6 +1658,44 @@ def build_revision_prompt(chapter: dict, draft: str, review: str) -> str:
 # ---------------------------------------------------------------------------
 # 5. Agent Factory
 # ---------------------------------------------------------------------------
+
+
+def _agent_step_count(agent) -> Optional[int]:
+    """Best-effort: return the number of steps the agent took on its last run.
+
+    smolagents has reshuffled this attribute across versions. We try the
+    known names in order and fall back to None silently — this is only used
+    for diagnostic logging, never for control flow.
+    """
+    # Newer smolagents: memory.steps is a list of step records
+    mem = getattr(agent, "memory", None)
+    steps = getattr(mem, "steps", None) if mem is not None else None
+    if isinstance(steps, list):
+        return len(steps)
+    # Older smolagents: a flat step_count counter
+    sc = getattr(agent, "step_count", None)
+    if isinstance(sc, int):
+        return sc
+    # Older still: logs/step_log
+    sl = getattr(agent, "step_log", None) or getattr(agent, "logs", None)
+    if isinstance(sl, list):
+        return len(sl)
+    return None
+
+
+def _run_agent(agent, label: str, prompt: str):
+    """Run an agent and warn if it hit its step cap.
+
+    Hitting the cap usually means the model ran out of room to produce
+    well-formed output (truncated JSON, missing sections). Surfacing it in
+    the run log is the cheapest way to diagnose silent quality regressions.
+    """
+    result = agent.run(prompt)
+    cap = getattr(agent, "max_steps", None)
+    used = _agent_step_count(agent)
+    if isinstance(cap, int) and isinstance(used, int) and used >= cap:
+        print(f"  ⚠ {label}: hit max_steps={cap} — output may be truncated")
+    return result
 
 
 def create_writer_agent(index: TfidfIndex):
@@ -1679,6 +1752,57 @@ def load_chapters() -> List[dict]:
     return data.get("chapters", [])
 
 
+def _review_passes(review_json: Optional[dict]) -> bool:
+    """Strict review gate: only return True if the reviewer truly approved.
+
+    The previous logic accepted a chapter if `grade == "PASS"` *or* the
+    `issues` list was empty — which silently approved drafts when the
+    reviewer graded FAIL but forgot to populate issues, or when the JSON
+    was malformed and `grade` defaulted to PASS.
+
+    The new gate requires:
+      - the reviewer returned parseable JSON,
+      - `grade` is exactly `"PASS"`,
+      - `criteria` is a dict and **every** value is a string that does not
+        start with `"FAIL"` (so a missing/typo'd criterion doesn't sneak
+        through),
+      - `issues` is empty.
+
+    Anything else means the chapter still needs work.
+    """
+    if not isinstance(review_json, dict):
+        return False
+    if review_json.get("grade") != "PASS":
+        return False
+    if review_json.get("issues"):
+        return False
+    criteria = review_json.get("criteria")
+    if not isinstance(criteria, dict) or not criteria:
+        return False
+    for v in criteria.values():
+        if not isinstance(v, str):
+            return False
+        if v.startswith("FAIL"):
+            return False
+    return True
+
+
+def _criteria_fail_count(criteria: object) -> int:
+    """Count FAIL criteria, tolerating non-string / missing values.
+
+    Originally this was a bare `v.startswith("FAIL")` which crashed on
+    null or list values. Treat anything non-string as a failure (safer
+    default for the summary line).
+    """
+    if not isinstance(criteria, dict):
+        return 6
+    fails = 0
+    for v in criteria.values():
+        if not isinstance(v, str) or v.startswith("FAIL"):
+            fails += 1
+    return fails
+
+
 def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 dry_run: bool = False) -> bool:
     """Run the multi-pass pipeline: write → review → revise → write.
@@ -1686,6 +1810,17 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
     writer      — the writer CodeAgent
     reviewer    — the reviewer CodeAgent
     max_revisions — how many revision rounds to allow (0 = single pass, no review)
+
+    Reliability guarantees:
+      - The previously-generated file (if any) is preserved on every failure
+        path. We rename it to a `.bak` sibling and only delete the backup once
+        a fresh, complete draft has been written successfully.
+      - The final write is atomic — a Ctrl-C or crash during disk write leaves
+        either the previous file (via the backup) or the new file, never a
+        truncated mix.
+      - If the chapter is approved but the fact-fix revision crashes, we mark
+        the output as `unverified` rather than silently writing a draft we know
+        contains hallucinated paths/structs.
     """
     title = chapter["title"]
     output_file = chapter.get("output_file", "README.md")
@@ -1702,112 +1837,167 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         print("  [dry-run] would generate README.md")
         return False
 
-    # Backup existing output
+    # Move any existing output aside. The backup is restored in `finally` if
+    # we never produce a successful new draft.
+    had_backup = False
     if os.path.exists(output_path):
         print(f"  backing up existing file → .freebsd-docs.bak")
         os.rename(output_path, backup_path)
+        had_backup = True
 
-    # ---- Pass 1: initial draft ----
-    prompt = build_chapter_prompt(chapter)
-    print("  [draft] writing initial chapter ...")
-
+    success = False
     try:
-        draft = writer.run(prompt)
-    except Exception as e:
-        print(f"  ✗ initial draft failed: {e}")
-        if os.path.exists(backup_path):
-            os.rename(backup_path, output_path)
-        return False
-
-    # ---- Review + revision loop ----
-    revision = 0
-    while max_revisions > 0 and revision < max_revisions:
-        revision += 1
-        print(f"  [review {revision}] evaluating draft ...")
+        # ---- Pass 1: initial draft ----
+        prompt = build_chapter_prompt(chapter)
+        print("  [draft] writing initial chapter ...")
 
         try:
-            review_prompt = build_review_prompt(chapter, draft)
-            review_raw = reviewer.run(review_prompt)
+            draft = _run_agent(writer, "draft", prompt)
         except Exception as e:
-            print(f"  ✗ review {revision} failed: {e}")
-            break
+            print(f"  ✗ initial draft failed: {e}")
+            return False
 
-        # Parse the JSON review
-        review_json = _extract_json(review_raw)
-        if review_json is None:
-            print(f"  ⚠ review {revision}: could not parse JSON, stopping review")
-            break
+        # ---- Review + revision loop ----
+        # Strict gate: only stop when the reviewer truly approves. JSON parse
+        # failures get one retry instead of being treated as approval.
+        revision = 0
+        approved = False
+        parse_retry_used = False
 
-        grade = review_json.get("grade", "PASS")
-        issues = review_json.get("issues", [])
-        praise = review_json.get("praise", [])
-        criteria = review_json.get("criteria", {})
+        while max_revisions > 0 and revision < max_revisions:
+            revision += 1
+            print(f"  [review {revision}] evaluating draft ...")
 
-        # Print review summary
-        fail_count = sum(1 for v in criteria.values() if v.startswith("FAIL"))
-        print(f"         grade={grade}  ({6 - fail_count}/6 criteria pass)")
-        if issues:
-            for iss in issues[:5]:
-                print(f"         - {iss}")
-        if praise:
-            for p in praise[:3]:
-                print(f"         ✓ {p}")
+            try:
+                review_prompt = build_review_prompt(chapter, draft)
+                review_raw = _run_agent(reviewer, f"review {revision}", review_prompt)
+            except Exception as e:
+                print(f"  ✗ review {revision} failed: {e}")
+                break
 
-        if grade == "PASS" or not issues:
-            print(f"  [review {revision}] chapter passes — no revision needed")
-            break
+            review_json = _extract_json(review_raw)
+            if review_json is None:
+                if not parse_retry_used:
+                    parse_retry_used = True
+                    print(f"  ⚠ review {revision}: could not parse JSON, retrying once")
+                    revision -= 1   # don't consume a revision slot for a parse retry
+                    continue
+                print(f"  ⚠ review {revision}: JSON unparseable twice — "
+                      "treating chapter as NOT approved")
+                break
 
-        # ---- Revision pass ----
-        print(f"  [revision {revision}] rewriting to address {len(issues)} issue(s) ...")
+            grade = review_json.get("grade", "UNKNOWN")
+            issues = review_json.get("issues", []) or []
+            praise = review_json.get("praise", []) or []
+            criteria = review_json.get("criteria", {}) or {}
 
-        try:
-            revision_prompt = build_revision_prompt(chapter, draft, review_raw)
-            draft = writer.run(revision_prompt)
-        except Exception as e:
-            print(f"  ✗ revision {revision} failed: {e}")
-            break
+            fail_count = _criteria_fail_count(criteria)
+            print(f"         grade={grade}  ({6 - fail_count}/6 criteria pass)")
+            if issues:
+                for iss in issues[:5]:
+                    print(f"         - {iss}")
+            if praise:
+                for p in praise[:3]:
+                    print(f"         ✓ {p}")
 
-    # ---- Fact-checking pass ----
-    print("  [fact-check] verifying file paths, structs, functions ...")
-    facts = fact_check_draft(draft, SRC_ROOT)
-    if facts['total_issues'] > 0:
-        print(f"         found {facts['total_issues']} issue(s):")
-        if facts['file_paths_not_found']:
-            print(f"         - missing paths: {', '.join(facts['file_paths_not_found'])}")
-        if facts['file_paths_corrected']:
-            for old, right in (x.split(' → ') for x in facts['file_paths_corrected']):
-                print(f"         - path correction: `{old}` → `{right}`")
-        if facts['structs_not_found']:
-            print(f"         - missing structs: {', '.join(facts['structs_not_found'])}")
-        if facts['funcs_not_found']:
-            print(f"         - missing functions: {', '.join(facts['funcs_not_found'])}")
+            if _review_passes(review_json):
+                print(f"  [review {revision}] chapter passes — no revision needed")
+                approved = True
+                break
 
-        # One revision round to fix fact-checking issues
-        print("  [fact-fix] rewriting to address fact-check issues ...")
-        try:
-            fact_prompt = _build_fact_check_prompt(chapter, draft, facts)
-            draft = writer.run(fact_prompt)
-        except Exception as e:
-            print(f"  ✗ fact-check revision failed: {e}")
-    else:
-        print("         all claims verified — no issues found")
+            # ---- Revision pass ----
+            print(f"  [revision {revision}] rewriting to address "
+                  f"{len(issues) or fail_count} issue(s) ...")
 
-    # ---- Final output ----
-    # Ensure result has the chapter header
-    if not draft.startswith(f"# {title}"):
-        draft = f"# {title}\n\n" + draft
+            try:
+                revision_prompt = build_revision_prompt(chapter, draft, review_raw)
+                draft = _run_agent(writer, f"revision {revision}", revision_prompt)
+            except Exception as e:
+                print(f"  ✗ revision {revision} failed: {e}")
+                break
 
-    # Append provenance footer (LLM model + timestamp) so the reader can
-    # see which model produced this doc.
-    draft = draft.rstrip() + _provenance_footer()
+        if max_revisions > 0 and not approved:
+            print("  ⚠ review loop exited without explicit approval — "
+                  "writing draft but flagging as unverified")
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(draft)
+        # ---- Fact-checking pass ----
+        print("  [fact-check] verifying file paths, structs, functions ...")
+        facts = fact_check_draft(draft, SRC_ROOT)
+        fact_check_clean = facts['total_issues'] == 0
+        fact_fix_failed = False
 
-    lines = draft.count("\n")
-    rev_label = f" after {revision} revision(s)" if revision > 0 else ""
-    print(f"  ✓ wrote {lines} lines to {output_path}{rev_label}")
-    return True
+        if not fact_check_clean:
+            print(f"         found {facts['total_issues']} issue(s):")
+            if facts['file_paths_not_found']:
+                print(f"         - missing paths: {', '.join(facts['file_paths_not_found'])}")
+            if facts['file_paths_corrected']:
+                for old, right in (x.split(' → ') for x in facts['file_paths_corrected']):
+                    print(f"         - path correction: `{old}` → `{right}`")
+            if facts['structs_not_found']:
+                print(f"         - missing structs: {', '.join(facts['structs_not_found'])}")
+            if facts['funcs_not_found']:
+                print(f"         - missing functions: {', '.join(facts['funcs_not_found'])}")
+
+            print("  [fact-fix] rewriting to address fact-check issues ...")
+            try:
+                fact_prompt = _build_fact_check_prompt(chapter, draft, facts)
+                draft = _run_agent(writer, "fact-fix", fact_prompt)
+            except Exception as e:
+                # The draft we have still contains the known hallucinations.
+                # Mark it so a reader knows not to trust path/struct claims.
+                print(f"  ✗ fact-check revision failed: {e}")
+                fact_fix_failed = True
+        else:
+            print("         all claims verified — no issues found")
+
+        # ---- Final output ----
+        if not draft.startswith(f"# {title}"):
+            draft = f"# {title}\n\n" + draft
+
+        # Annotate quality issues at the top so they're impossible to miss.
+        warnings = []
+        if max_revisions > 0 and not approved:
+            warnings.append("reviewer did not explicitly approve this draft")
+        if fact_fix_failed:
+            warnings.append("fact-check revision failed — paths/structs may be hallucinated")
+        if warnings:
+            warning_block = (
+                "> ⚠ **UNVERIFIED DRAFT** — "
+                + "; ".join(warnings)
+                + ". Treat claims as suspect until manually reviewed.\n\n"
+            )
+            # Insert after the H1 title
+            head, sep, tail = draft.partition("\n")
+            draft = head + sep + "\n" + warning_block + tail
+
+        # Provenance footer (LLM model + timestamp).
+        draft = draft.rstrip() + _provenance_footer()
+
+        # Atomic write — a crash here leaves either the backup or the new file.
+        _atomic_write(output_path, draft)
+        success = True
+
+        lines = draft.count("\n")
+        rev_label = f" after {revision} revision(s)" if revision > 0 else ""
+        print(f"  ✓ wrote {lines} lines to {output_path}{rev_label}")
+        return True
+
+    finally:
+        # Commit-or-rollback semantics for the previous output.
+        if had_backup:
+            if success:
+                # Fresh draft is on disk; drop the backup.
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
+            elif not os.path.exists(output_path):
+                # Nothing was written; restore the previous good file.
+                try:
+                    os.rename(backup_path, output_path)
+                    print(f"  restored previous {output_path} from backup")
+                except OSError as e:
+                    print(f"  ✗ could not restore backup: {e}")
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -2013,7 +2203,7 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
         )
 
     return textwrap.dedent(f"""\
-        You are revising a chapter for "FreeBSD Internals for Students."
+        You are revising a chapter for "FreeBSD Internals."
         A fact-checking pass found issues with your draft.
 
         ## Chapter: {chapter['title']}
@@ -2187,17 +2377,16 @@ def build_navigation(chapters: List[dict]) -> dict:
     written = 0
     for output_file, content in updated.items():
         output_path = os.path.join(SRC_ROOT, output_file)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        _atomic_write(output_path, content)
         written += 1
 
     # Write master README
     master_path = os.path.join(SRC_ROOT, "README.all-chapters.md")
     master_lines = [
-        "# FreeBSD Internals for Students — Chapter Index",
+        "# FreeBSD Internals — Chapter Index",
         "",
         "AI-generated documentation of FreeBSD internals. Each chapter is placed",
-        "in the relevant FreeBSD source directory so a student can find educational",
+        "in the relevant FreeBSD source directory so any reader can find educational",
         "material right next to the code.",
         "",
         "## Chapters",
@@ -2215,8 +2404,7 @@ def build_navigation(chapters: List[dict]) -> dict:
     master_lines.append("---")
     master_lines.append(f"*Generated by generate-doc.py — {len(chapters)} chapters*")
 
-    with open(master_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(master_lines))
+    _atomic_write(master_path, "\n".join(master_lines))
 
     print(f"  [navigation] updated {written} READMEs, wrote {master_path}")
     return updated
@@ -2373,10 +2561,10 @@ def build_chapter_index(chapters: List[dict], src_root: str,
 
     # Build the index document
     lines = [
-        "# FreeBSD Internals for Students — Chapter Index",
+        "# FreeBSD Internals — Chapter Index",
         "",
         "AI-generated documentation of FreeBSD internals. Each chapter is placed",
-        "in the relevant FreeBSD source directory so a student can find educational",
+        "in the relevant FreeBSD source directory so any reader can find educational",
         "material right next to the code.",
         "",
         "---",
@@ -2445,8 +2633,7 @@ def build_chapter_index(chapters: List[dict], src_root: str,
 
     # Write the index
     index_path = os.path.join(output_dir, "CHAPTER_INDEX.md")
-    with open(index_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    _atomic_write(index_path, "\n".join(lines))
 
     print(f"  [index] wrote {index_path} ({len(all_glossary_terms)} terms, "
           f"{len(chapter_data)} chapters)")
@@ -2455,7 +2642,7 @@ def build_chapter_index(chapters: List[dict], src_root: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="FreeBSD Internals for Students — Documentation Generator",
+        description="FreeBSD Internals — Documentation Generator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -2505,7 +2692,7 @@ def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("  FreeBSD Internals for Students — Doc Generator")
+    print("  FreeBSD Internals — Doc Generator")
     print("=" * 60)
     print(f"  Source:  {SRC_ROOT}")
     print(f"  Books:   {BOOKS_DIR}")
