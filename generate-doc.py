@@ -2241,9 +2241,16 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             print(f"  ✗ initial draft failed: {e}")
             return False
 
+        # Defensive: if the very first draft is a stub, fail fast — there's
+        # nothing to roll back to.
+        if _looks_like_stub(draft):
+            print("  ✗ initial draft looks truncated/stub — aborting chapter")
+            return False
+
         # ---- Review + revision loop ----
         # Strict gate: only stop when the reviewer truly approves. JSON parse
         # failures get one retry instead of being treated as approval.
+        warnings: List[str] = []
         revision = 0
         approved = False
         parse_retry_used = False
@@ -2349,7 +2356,16 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             print("  [fact-fix] rewriting to address fact-check issues ...")
             try:
                 fact_prompt = _build_fact_check_prompt(chapter, draft, facts)
-                draft = _run_agent(writer, "fact-fix", fact_prompt)
+                new_draft = _run_agent(writer, "fact-fix", fact_prompt)
+                if _looks_like_stub(new_draft):
+                    # Hit max_steps before producing prose. Keep the
+                    # pre-fact-fix draft (still contains hallucinations
+                    # but is at least readable) and mark fact-fix failed.
+                    print("  ⚠ fact-fix: output looks truncated/stub — "
+                          "keeping pre-fact-fix draft")
+                    fact_fix_failed = True
+                else:
+                    draft = new_draft
             except Exception as e:
                 # The draft we have still contains the known hallucinations.
                 # Mark it so a reader knows not to trust path/struct claims.
@@ -2363,7 +2379,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             draft = f"# {title}\n\n" + draft
 
         # Annotate quality issues at the top so they're impossible to miss.
-        warnings = []
+        # `warnings` was initialised earlier in this function so the
+        # revision/fact-fix stub-detection path can append to it.
         if max_revisions > 0 and not approved:
             warnings.append("reviewer did not explicitly approve this draft")
         if fact_fix_failed:
