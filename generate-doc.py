@@ -304,6 +304,15 @@ def build_book_corpus(books_dir: str, force: bool = False) -> str:
             all_entries.extend((os.path.basename(bp), p) for p in pages)
             print(f"         {len(pages)} pages")
 
+    # Detect books that were present in a previous run but are gone now.
+    # Without this, their text + hash entry would linger in the corpus and
+    # in book_hashes.json forever, polluting search results with content
+    # the user thought they had removed.
+    deleted_paths = set(prev_hashes.keys()) - set(current_hashes.keys())
+    deleted_basenames = {os.path.basename(p) for p in deleted_paths}
+    for d in sorted(deleted_basenames):
+        print(f"  prune {d} (no longer in {books_dir})")
+
     # Write corpus — preserve existing FreeBSD docs (appended by extract_freebsd_docs)
     # On incremental runs, all_entries only has changed books, so we need to keep
     # unchanged book content + FreeBSD docs from the previous corpus.
@@ -311,29 +320,35 @@ def build_book_corpus(books_dir: str, force: bool = False) -> str:
     if not force and corpus_file.exists():
         previous_corpus = corpus_file.read_text(encoding="utf-8", errors="ignore")
 
-    with open(corpus_file, "w", encoding="utf-8") as f:
-        # Write previous content (unchanged books + FreeBSD docs)
-        if previous_corpus:
-            # Strip entries that are being re-extracted (they'll be rewritten below)
-            if all_entries:
-                re_extracted = {os.path.basename(bp) for bp in book_files
-                                if prev_hashes.get(bp) != current_hashes.get(bp)
-                                or (force and bp in current_hashes)}
-                # Keep only segments whose source is NOT being re-extracted
-                segments = re.split(r"### SOURCE: (.+?) ###", previous_corpus)
-                # segments: [before, source1, text1, source2, text2, ...]
-                kept = segments[0:1]  # leading text before first source
-                for i in range(1, len(segments), 2):
-                    src = segments[i].strip()
-                    if src not in re_extracted:
-                        kept.append(segments[i])
-                        kept.append(segments[i + 1])
-                previous_corpus = "".join(kept) if kept else ""
-            f.write(previous_corpus)
-        # Write newly extracted book pages
-        for book_name, page_text in all_entries:
-            f.write(f"\n\n### SOURCE: {book_name} ###\n\n")
-            f.write(page_text)
+    # Sources we don't want carried over from the previous corpus:
+    #   - books being re-extracted (will be re-appended below with fresh text)
+    #   - books that have been deleted from books_dir (should disappear entirely)
+    re_extracted = {os.path.basename(bp) for bp in book_files
+                    if prev_hashes.get(bp) != current_hashes.get(bp)
+                    or (force and bp in current_hashes)}
+    drop_sources = re_extracted | deleted_basenames
+
+    # Build the new corpus text in memory so the on-disk write is atomic —
+    # a Ctrl-C during the write would otherwise leave a truncated corpus and
+    # the next run would silently search against partial content.
+    new_corpus_parts = []
+    if previous_corpus:
+        if drop_sources:
+            # Keep only segments whose source is NOT being dropped.
+            segments = re.split(r"### SOURCE: (.+?) ###", previous_corpus)
+            # segments: [before, source1, text1, source2, text2, ...]
+            kept = segments[0:1]  # leading text before first source
+            for i in range(1, len(segments), 2):
+                src = segments[i].strip()
+                if src not in drop_sources:
+                    kept.append(segments[i])
+                    kept.append(segments[i + 1])
+            previous_corpus = "".join(kept) if kept else ""
+        new_corpus_parts.append(previous_corpus)
+    for book_name, page_text in all_entries:
+        new_corpus_parts.append(f"\n\n### SOURCE: {book_name} ###\n\n")
+        new_corpus_parts.append(page_text)
+    _atomic_write(str(corpus_file), "".join(new_corpus_parts))
 
     # Atomic write — a Ctrl-C mid-write would otherwise leave a truncated JSON
     # that crashes the next run before it can rebuild.
@@ -2198,42 +2213,161 @@ def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
     return not_found
 
 
+# Per-process memo of fact-check results, keyed by (kind, src_root, symbol).
+# Survives across revision rounds within a single run, so a struct verified
+# during the first pass is not re-grepped during fact-fix or subsequent revisions.
+_FACT_CHECK_CACHE: Dict[Tuple[str, str, str], bool] = {}
+
+# Single-call timeout for the batched grep. The previous code spent up to
+# 5 s per symbol; one batched grep with -m1 short-circuiting per file is
+# fast even on the full sys/ tree, so a tighter timeout is safe and bounds
+# the total cost.
+_GREP_TIMEOUT_SEC = 8
+
+
+def _batched_grep_present(symbols: List[str], pattern_template: str,
+                          search_root: str, shape_grep: str) -> set:
+    """Run one grep over `search_root` looking for any of `symbols`.
+
+    Two-stage pipeline:
+      1. `grep -Fw` (fixed-strings, word-boundaried) for the candidate
+         symbols. BSD `grep -E` is pathologically slow with nested
+         alternations like `(void|int|...) (a|b|...)` (40 s+ on sys/);
+         `grep -F` with multiple `-e` patterns runs in well under a
+         second on the same tree.
+      2. A second `grep -E` filters those lines down to candidate
+         *definitions* (e.g. `struct ... {` or `... \\(`) so the 1 MB
+         output cap captures definitions rather than the dense forest
+         of pointer-typed uses (`struct vm_page **ma, ...`) that would
+         otherwise dominate.
+      3. Per-symbol Python regex (`pattern_template`) re-scans the
+         captured output to confirm the shape per symbol.
+
+    `pattern_template` is consumed by the Python re re-scan, not by
+    grep. `shape_grep` is the BSD-grep-friendly shape filter for stage 2
+    (no `\\s`, no nested alternations).
+
+    Returns the set of symbols that passed both stages. Symbols that did
+    not match — or all symbols, if grep itself fails or times out — are
+    absent from the returned set.
+    """
+    if not symbols:
+        return set()
+
+    # Stage 1: fast fixed-string grep for any of the symbols. `-w` keeps
+    # us from matching substrings (e.g. `proc` inside `procfs`).
+    # Stage 2: shape filter so the 1 MB cap holds candidate definitions.
+    fixed_args = " ".join(f"-e {shlex.quote(s)}" for s in symbols)
+    cmd = (
+        f"grep -rhwF --include='*.c' --include='*.h' {fixed_args} "
+        f"{shlex.quote(search_root)}/ 2>/dev/null | "
+        f"grep -E {shlex.quote(shape_grep)} | "
+        f"head -c 1048576"
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=_GREP_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        # Conservative behaviour: treat a timeout as "verification not
+        # available" — return empty set so callers report all symbols as
+        # not-found rather than silently approving them. The fact-check
+        # is itself best-effort, but a silent timeout would mask real
+        # hallucinations, which is the failure mode we care most about.
+        print(f"  ⚠ fact-check grep timed out after {_GREP_TIMEOUT_SEC}s — "
+              f"treating {len(symbols)} symbol(s) as unverified")
+        return set()
+
+    output = result.stdout
+    if not output:
+        return set()
+
+    # Stage 2: validate the shape per symbol with Python re.
+    matched = set()
+    for s in symbols:
+        py_pattern = pattern_template.format(alt=re.escape(s))
+        if re.search(py_pattern, output):
+            matched.add(s)
+    return matched
+
+
+def _verify_with_cache(kind: str, symbols: List[str], src_root: str,
+                       pattern_template: str, shape_grep: str) -> List[str]:
+    """Common path for struct/function verification.
+
+    Splits `symbols` into already-cached and uncached, runs one batched
+    grep over the uncached set, updates the cache, then returns the list
+    of symbols that are not present in the source tree.
+    """
+    search_root = os.path.join(src_root, "sys")
+    uncached = []
+    not_found = []
+    for s in symbols:
+        cached = _FACT_CHECK_CACHE.get((kind, src_root, s))
+        if cached is True:
+            continue
+        if cached is False:
+            not_found.append(s)
+            continue
+        uncached.append(s)
+
+    if uncached:
+        present = _batched_grep_present(
+            uncached, pattern_template, search_root, shape_grep,
+        )
+        for s in uncached:
+            present_now = s in present
+            _FACT_CHECK_CACHE[(kind, src_root, s)] = present_now
+            if not present_now:
+                not_found.append(s)
+
+    return not_found
+
+
 def _verify_structs(structs: List[str], src_root: str) -> List[str]:
     """Verify that claimed struct names exist in the source tree.
 
     Returns a list of struct names that could not be found.
+    Backed by `_FACT_CHECK_CACHE` so re-runs within a session are free.
     """
-    not_found = []
-    for s in structs:
-        # Search for "struct s {" or "struct s {" in .c and .h files
-        cmd = (
-            f"grep -r 'struct {s} \\{{' "
-            f"{shlex.quote(os.path.join(src_root, 'sys'))}/ 2>/dev/null | head -1"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                timeout=5)
-        if result.returncode != 0 or not result.stdout.strip():
-            not_found.append(s)
-    return not_found
+    # Match "struct NAME {" — the canonical struct definition shape.
+    # `pattern_template` is for Python re; `shape_grep` is the BSD-grep
+    # filter that keeps only candidate definition lines so the 1 MB cap
+    # holds them.
+    return _verify_with_cache(
+        "struct", structs, src_root,
+        pattern_template=r"struct\s+({alt})\s*\{{",
+        shape_grep=r"^struct [A-Za-z_][A-Za-z0-9_]* *\{",
+    )
 
 
 def _verify_functions(funcs: List[str], src_root: str) -> List[str]:
     """Verify that claimed function names exist in the source tree.
 
     Returns a list of function names that could not be found.
+    Backed by `_FACT_CHECK_CACHE` so re-runs within a session are free.
     """
-    not_found = []
-    for f in funcs:
-        # Search for "void f(" or "int f(" or "static ... f(" patterns
-        cmd = (
-            f"grep -rE '(void|int|static|struct|enum|uint|char|u_int|u_char|error_t)\\s+{re.escape(f)}\\s*\\(' "
-            f"{shlex.quote(os.path.join(src_root, 'sys'))}/ 2>/dev/null | head -1"
-        )
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                timeout=5)
-        if result.returncode != 0 or not result.stdout.strip():
-            not_found.append(f)
-    return not_found
+    # Match common return-type prefixes followed by NAME(. The pattern is
+    # used by the Python re re-scan (not by grep), so we use the
+    # non-capturing form for the type-token alternation — only the symbol
+    # name needs a capture (none of which the caller actually consumes).
+    # `\s+` and `\*?` widen coverage to pointer-returning functions like
+    # `void *malloc(` that the previous per-symbol regex missed.
+    type_tokens = (
+        r"(?:void|int|static|struct|enum|uint|char|u_int|u_char|error_t)"
+    )
+    pattern = type_tokens + r"\s+\*?\s*({alt})\s*\("
+    # `shape_grep` keeps lines that look like a function signature:
+    # an identifier followed (optionally through `*` and spaces) by `(`.
+    # That filters out includes/comments/string literals but accepts
+    # both `void malloc(` and `void *malloc(`. The Python re re-scan
+    # then tightens this to a type-token + name shape.
+    return _verify_with_cache(
+        "func", funcs, src_root,
+        pattern_template=pattern,
+        shape_grep=r"[A-Za-z_][A-Za-z0-9_]* *\*? *[A-Za-z_][A-Za-z0-9_]*\(",
+    )
 
 
 def fact_check_draft(draft: str, src_root: str) -> dict:
