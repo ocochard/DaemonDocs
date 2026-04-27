@@ -30,31 +30,60 @@ The goal is **not** to reproduce man pages. The goal is to help a CS student who
 
 ---
 
+## Prerequisites
+
+All four resources must live on (or be reachable from) the same host where you run `generate-doc.py`:
+
+1. This repo
+2. The FreeBSD source tree (`$FREEBSD_SRC`)
+3. The books corpus (`$BOOKS_DIR`)
+4. A running llama-server (see config below)
+
+Running with any of them missing or remote will silently degrade output quality.
+
+### LLM configuration
+
+The script talks to an OpenAI-compatible local server. Defaults are set in `MODEL_CONFIG` near the top of `generate-doc.py`:
+
+| Setting | Value |
+|---|---|
+| Endpoint | `http://localhost:8080/v1` |
+| Model id | `qwen36-coder` |
+| API key | `none` (llama-server ignores it) |
+
+The `model_id` must match exactly what `llama-server` advertises at `/v1/models`. A mismatch causes the request to fail or to silently route to whichever model is loaded — the output looks plausible but quality drops.
+
 ## Quick start
 
 ```sh
-# Set environment (if not already)
+# 1. Set environment (if not already)
 export FREEBSD_SRC=$HOME/freebsd-src
 export BOOKS_DIR=$HOME/books
 export FREEBSD_DOC=$HOME/freebsd-doc/documentation/content/en
 
-# Make sure llama-server is running on localhost:8080 with model qwen36-coder
-
-# Install dependencies
+# 2. Install dependencies
 python3 -m pip install --user -r requirements.txt
 
-# Build corpus index (books + FreeBSD docs + git logs)
+# 3. Verify the LLM endpoint
+curl -s http://localhost:8080/v1/models | grep qwen36-coder
+
+# 4. Build corpus index (books + FreeBSD docs + git logs)
 python3 generate-doc.py --index-only
 
-# Dry run
-python3 generate-doc.py --dry-run --force
+# 5. Dry run — confirms all chapters resolve without calling the LLM
+python3 generate-doc.py --dry-run
 
-# Generate all chapters
-python3 generate-doc.py
+# 6. Smoke-test a single chapter end-to-end
+python3 generate-doc.py --chapter 1
 
-# Generate a single chapter
-python3 generate-doc.py --chapter 3
+# 7. Full run (use --max-revisions 3 for production-quality output)
+python3 generate-doc.py --max-revisions 3
+
+# 8. Refresh cross-README navigation links
+python3 generate-doc.py --nav-only
 ```
+
+For lowest error rate, follow steps 4–8 in order on a fresh run. Skipping the smoke test is the most common cause of wasting a long full-corpus run.
 
 ---
 
@@ -70,6 +99,24 @@ python3 generate-doc.py --chapter 3
 | `--reindex` | Rebuild corpus from scratch (drops existing docs) |
 | `--chapter N` | Run only chapter N (1-based) |
 | `--max-revisions N` | Max review+revise rounds (default 2, 0 = skip review) |
+
+> **`--force` safety:** output files are written under `$FREEBSD_SRC`. `--force` will overwrite any
+> previously generated `README.md` / `README_*.md` listed in `chapters.yaml`. Run
+> `git -C $FREEBSD_SRC status` before and after a forced run to review the diff. The generator only
+> writes paths declared in `chapters.yaml` — it does not touch other files in the source tree.
+
+---
+
+## Known error modes
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Reviewer JSON parse fails | model output truncated mid-object | lower temperature, raise context, or rerun the chapter |
+| Draft references nonexistent paths | `$FREEBSD_SRC` is stale | `git -C $FREEBSD_SRC pull` then `--reindex` |
+| Empty `search_books` results | corpus index not built or stale | run `--index-only` (or `--reindex` after adding books) |
+| Same chapter regenerates each run | `--force` left in the command line | drop the flag once a chapter passes review |
+| HTTP 404 on `/v1/chat/completions` | wrong model loaded in llama-server | reload llama-server with `qwen36-coder` (must match `MODEL_CONFIG`) |
+| Connection refused on port 8080 | llama-server not running | start it before launching `generate-doc.py` |
 
 ---
 
@@ -228,6 +275,8 @@ Rules:
 - Include C code snippets where they illuminate the design
 - Quick Summary has no code; Deep Dive has code snippets; Advanced Notes covers debugging, performance, and pitfalls
 
+Every generated file ends with a **provenance footer** recording the LLM model id, endpoint, and UTC timestamp used for that run — so a reader can trace which model wrote which document.
+
 ---
 
 ## File layout
@@ -235,7 +284,7 @@ Rules:
 ```
 DaemonDocs/
 ├── README.md              ← you are here
-├── generate-doc.py        ← single self-contained script (~2500 lines)
+├── generate-doc.py        ← single self-contained script
 ├── chapters.yaml          ← 13 chapter definitions
 ├── requirements.txt       ← Python dependencies
 └── .index/                ← cached corpus + TF-IDF index (gitignored)
@@ -257,33 +306,20 @@ DaemonDocs/
 
 ---
 
-## What works today
+<details>
+<summary><strong>Implemented features</strong></summary>
 
-- [x] PDF extraction from 5 books (1,338 pages, CHM needs hhextract)
-- [x] TF-IDF semantic search index (2,764 chunks, 10,080 terms)
-- [x] Four agent tools: read source, search books, explore tree, resolve C definitions
-- [x] 13 chapter definitions in YAML
-- [x] Multi-pass review pipeline (writer → reviewer → revise)
-- [x] Incremental runs (skip unchanged books, skip existing output)
-- [x] Corpus: books, man9, Handbook, git logs, papers, kerneldoc
-- [x] Semantic RAG chunking (paragraph/section boundaries)
-- [x] Source tree awareness (read existing docs before writing)
-- [x] Structured fact-checking (verify claimed structs/functions/paths)
-- [x] Cross-README navigation links
-- [x] Cross-chapter reference index (TOC, glossary, cross-refs)
-- [x] Progressive difficulty (Quick Summary / Deep Dive / Advanced Notes)
-- [x] OS comparisons (Linux/macOS/NetBSD)
-- [x] `--dry-run`, `--force`, `--reindex`, `--chapter N`, `--max-revisions N`, `--nav-only`, `--index`
+- PDF extraction from books (CHM requires `hhextract`)
+- TF-IDF semantic search index with paragraph/section-aware chunking
+- Four agent tools: read source, search books, explore tree, resolve C definitions
+- Multi-pass writer → reviewer → revise pipeline
+- Incremental runs (skip unchanged books, skip existing output)
+- Corpus: books, man9, Handbook, git logs, papers, kerneldoc
+- Source tree awareness (reads existing docs before writing)
+- Structured fact-checking (verifies claimed structs / functions / paths)
+- Cross-README navigation links and cross-chapter reference index
+- Progressive difficulty (Quick Summary / Deep Dive / Advanced Notes)
+- OS comparisons (Linux / macOS / NetBSD)
+- Flags: `--dry-run`, `--force`, `--reindex`, `--chapter N`, `--max-revisions N`, `--nav-only`, `--index`
 
----
-
-## All quality improvements — complete ✅
-
-All 11 items from the original IMPROVEMENTS.md backlog have been implemented:
-
-| Phase | Items | Status |
-|---|---|---|
-| Phase 1 | 1 (multi-pass review), 3 (FreeBSD docs corpus), 4 (Markdown template) | ✅ Done |
-| Phase 2 | 8 (fact-checking), 7 (source awareness), 11 (nav links), 6 (RAG chunking) | ✅ Done |
-| Phase 3 | 5 (chapter index), 9 (progressive difficulty), 10 (OS comparisons) | ✅ Done |
-| Phase 4 | 2 (follow-imports tool) | ✅ Done |
+</details>
