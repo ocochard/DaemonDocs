@@ -1949,6 +1949,40 @@ def _agent_step_count(agent) -> Optional[int]:
     return None
 
 
+def _looks_like_stub(text: str) -> bool:
+    """Detect a degenerate writer output captured at max_steps exhaustion.
+
+    When the writer agent runs out of steps mid-revision, smolagents
+    surfaces the *last* step output instead of a `final_answer()` payload.
+    For a CodeAgent that's typically a tool-call snippet (`<code>...</code>`,
+    `Calling tools:`, `'function':`, `'arguments':`) or a few lines of
+    Python — never a full chapter. Writing that on top of a previously-good
+    draft destroys the chapter (we've seen 15- and 26-line stubs replace
+    1000+ line drafts).
+
+    Treat as a stub when the text is short AND lacks any of the expected
+    chapter H2 headers. Either condition alone is too aggressive: a short
+    chapter is plausible, and an agent reading source code can produce a
+    long log without writing prose.
+    """
+    if not text:
+        return True
+    body = text.strip()
+    if len(body) < 600:
+        return True
+    has_h2 = bool(re.search(r'^[ ]{0,3}##\s+\S', body, re.MULTILINE))
+    has_call_artifact = bool(
+        re.search(r'(?:^|\n)Calling tools:\b', body)
+        or re.search(r"'function'\s*:\s*\{", body)
+        or re.search(r'(?:^|\n)<code>\s*\n', body)
+    )
+    if not has_h2 and has_call_artifact:
+        return True
+    if not has_h2 and len(body.splitlines()) < 50:
+        return True
+    return False
+
+
 def _run_agent(agent, label: str, prompt: str) -> str:
     """Run an agent and warn if it hit its step cap.
 
@@ -2264,10 +2298,24 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
 
             try:
                 revision_prompt = build_revision_prompt(chapter, draft, review_raw)
-                draft = _run_agent(writer, f"revision {revision}", revision_prompt)
+                new_draft = _run_agent(writer, f"revision {revision}", revision_prompt)
             except Exception as e:
                 print(f"  ✗ revision {revision} failed: {e}")
                 break
+
+            # If the revision came back as a tool-call stub (writer hit
+            # max_steps before emitting a `final_answer()`), keep the
+            # previous draft instead of writing a 15-line shred over a
+            # 200-line chapter. The reviewer's complaints persist, but
+            # the reader gets readable prose.
+            if _looks_like_stub(new_draft):
+                print(f"  ⚠ revision {revision}: output looks truncated/stub — "
+                      f"keeping prior draft")
+                warnings.append(
+                    f"revision {revision} truncated — kept prior draft")
+                # Don't continue revising on top of broken state.
+                break
+            draft = new_draft
 
         if max_revisions > 0 and not approved:
             print("  ⚠ review loop exited without explicit approval — "
