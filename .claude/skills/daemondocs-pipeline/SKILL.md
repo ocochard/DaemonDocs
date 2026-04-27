@@ -157,6 +157,75 @@ The criteria count is now 7, not 6 — `_criteria_fail_count()` and the
 log-line in `run_chapter()` both reflect that. If you add another rubric
 criterion, update both.
 
+### 13. Strict reviewer rubric (no exceptions)
+
+`build_review_prompt` enforces: `grade=PASS` only when *every* criterion is
+PASS AND `issues` is empty. Any FAIL criterion or any non-empty `issues` →
+`grade` MUST be `NEEDS_REVISION`. Don't loosen this back to "3 or fewer
+FAILs → PASS" — the model previously returned `PASS` while listing 4
+issues, and the strict gate (`_review_passes`) silently rejected those
+drafts but the writer never saw the rubric had been violated.
+
+### 14. Fact-checker noise filter (`_FACT_CHECK_IGNORE`, `_MACRO_PREFIX_RE`)
+
+`_extract_struct_names` and `_extract_function_names` call
+`_filter_known_noise` to drop:
+
+- `_FACT_CHECK_IGNORE` frozenset — make targets (buildworld, universe…),
+  config knobs (GENERIC, OBJTOP…), filenames (Makefile, UPDATING),
+  parameter names from common signatures (init, func, order, udata, sid),
+  globals frequently mentioned but not callable (thread0, proc0, btext),
+  and Linux/macOS structs/funcs that legitimately appear in `## Comparison`
+  sections (vm_area_struct, start_kernel, kernel_bootstrap…).
+- `_MACRO_PREFIX_RE` — well-known C macro families: `SI_SUB_*`,
+  `SI_ORDER_*`, `SDT_PROBE_*`, `TAILQ_*`, `LIST_*`, `KASSERT*`, `VOP_*`,
+  etc. These are `#define`d, not callable, and grepping for them as
+  function-shape misses every time.
+- `WITH_*`, `WITHOUT_*`, `MK_*`, `NO_*` ALL_CAPS make/kernel knobs.
+
+Also: `_extract_function_names` requires *call evidence* — it only
+matches backticks-with-parens (\`foo()\` or \`foo(args)\`) and prose
+patterns ("the foo() function", "calls foo()"). Bare backticked
+identifiers (\`foo\`) are NOT treated as function candidates because the
+population is dominated by struct fields, type names, sysctls, and
+parameter names — every one of which generates a fact-fix step.
+
+`_strip_comparison_section` removes `## Comparison` H2 sections from the
+fact-check input so cross-OS symbols are never grepped against the
+FreeBSD tree. The reviewer still sees the full draft; only the
+fact-checker's input is filtered.
+
+### 15. Hallucination check for kernel options + DTrace probes
+
+`fact_check_draft` extracts and verifies two more categories:
+
+- **Kernel options** — `_extract_kernel_options` picks up `option FOO`
+  prose and backticked patterns matching VERBOSE_*/DEBUG_*/INVARIANT*/
+  WITNESS*/KTR*. `_verify_kernel_options` greps `sys/conf/options*` and
+  `sys/conf/NOTES` for each name. Catches fabricated knobs like
+  `VERBOSE_SYSINIT`.
+- **DTrace probes** — `_extract_dtrace_probes` parses the
+  ``provider:module:function:name`` form and `_verify_dtrace_probes`
+  greps `SDT_PROBE_DEFINE\d?\b` macros under `sys/`. Catches fabricated
+  probes like `sysinit:::entry`/`sysinit:::return`.
+
+Both feed into `total_issues` and surface in `_build_fact_check_prompt`
+as `kernel_options_not_found` / `dtrace_probes_not_found` blocks.
+`run_chapter`'s log lines mirror the categories.
+
+### 16. Agent step caps
+
+- Writer (`create_writer_agent`) — `max_steps=40`. Used for draft,
+  every revision, and fact-fix. Long subsystem chapters routinely use
+  35+ steps because the writer explores `sys/<subdir>/` before writing.
+- Reviewer (`create_reviewer_agent`) — `max_steps=15`. Was 10 but
+  hit the cap on review 2 with a long rubric.
+
+If you see `hit max_steps` consistently on the writer, first check
+whether the fact-check pass is feeding it 30+ "missing" symbols — that
+usually means a regression in the noise filter, not that the cap is
+too low.
+
 ## Atomic writes
 
 All file writes in the pipeline use `_atomic_write()` (tempfile + fsync +
@@ -180,7 +249,7 @@ success means it worked.
 
 ## Files to know
 
-- `generate-doc.py` — the whole pipeline (~2700 lines).
+- `generate-doc.py` — the whole pipeline (~3600 lines).
 - `chapters.yaml` — chapter definitions; `output_file` is relative to
   FreeBSD src root.
 - `IMPROVEMENTS.md` — audit checklist; mostly closed out, but worth re-reading
