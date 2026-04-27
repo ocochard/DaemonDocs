@@ -166,18 +166,92 @@ Finds the definition of a C struct, function, macro, or type alias. Follows `#in
 
 ## Multi-pass review pipeline
 
+```mermaid
+flowchart TD
+    Start([chapter from chapters.yaml]) --> Draft
+
+    Draft["**Step 1 — Draft** (writer agent, 25 steps)<br/>build_chapter_prompt → full markdown draft<br/>tools: read_freebsd_source, search_books,<br/>explore_tree, resolve_c_definition"]
+    Draft --> Review
+
+    Review{"**Step 2 — Review** (reviewer agent, 10 steps)<br/>build_review_prompt → JSON verdict<br/>tools: search_books only<br/>does NOT edit the draft"}
+    Review -- "grade=PASS AND<br/>no issues AND<br/>no FAIL criteria" --> FactCheck
+    Review -- "any FAIL<br/>(and revisions left)" --> Revise
+    Review -- "max_revisions reached<br/>or JSON unparseable twice" --> Unapproved[mark UNVERIFIED]
+    Unapproved --> FactCheck
+
+    Revise["**Step 3 — Revise** (writer agent)<br/>build_revision_prompt(chapter, draft, review_raw)<br/>can ADD or REMOVE content<br/>→ new full draft"]
+    Revise --> Review
+
+    FactCheck{"**Step 4 — Fact-check** (deterministic)<br/>fact_check_draft: paths + structs + functions<br/>verified against FreeBSD source tree<br/>does NOT edit the draft"}
+    FactCheck -- "all claims verified" --> Write
+    FactCheck -- "missing paths /<br/>structs / funcs" --> FactFix
+
+    FactFix["**Step 5 — Fact-fix** (writer agent)<br/>_build_fact_check_prompt(chapter, draft, facts)<br/>corrects bad paths, replaces missing symbols,<br/>removes unfixable claims"]
+    FactFix --> Write
+
+    Write["**Step 6 — Atomic write**<br/>rename existing output → .bak<br/>_atomic_write (tempfile + fsync + os.replace)<br/>delete .bak on success / restore on failure"]
+    Write --> End([chapter file in FreeBSD src tree])
+
+    classDef writer fill:#dbeafe,stroke:#1e40af,color:#1e3a8a;
+    classDef reviewer fill:#fef3c7,stroke:#92400e,color:#78350f;
+    classDef deterministic fill:#dcfce7,stroke:#166534,color:#14532d;
+    classDef io fill:#f3f4f6,stroke:#374151,color:#111827;
+    class Draft,Revise,FactFix writer;
+    class Review reviewer;
+    class FactCheck,Write deterministic;
+    class Start,End,Unapproved io;
 ```
-writer agent (25 steps, full tools)
-    ↓ draft markdown
-reviewer agent (10 steps, book search only)
-    ↓ JSON: { grade, criteria, issues, praise }
-    ├─ PASS → write file
-    └─ NEEDS_REVISION → writer agent revises
-                            ↓ revised draft
-                        reviewer agent re-evaluates
-                            ↓
-                    loop until PASS or max_revisions reached
-```
+
+Blue = writer agent (produces text). Yellow = reviewer agent (verdict only,
+never edits). Green = deterministic logic (no LLM). Grey = I/O boundaries.
+
+### Step-by-step roles
+
+Two agents, two distinct roles. **The reviewer never edits the draft text** —
+it only emits a JSON verdict. Every textual change (including additions) is
+produced by the writer in a follow-up call. This separation is why each step's
+prompt can stay small and focused.
+
+1. **Draft (writer).** Reads `build_chapter_prompt(chapter)` — focus,
+   `scope_guard`, sections, key questions, mandatory output template, and the
+   existing target file as read-only context. Has full tool access:
+   `read_freebsd_source`, `search_books`, `explore_tree`,
+   `resolve_c_definition`. Produces a complete markdown draft, free to add
+   anything within the template.
+
+2. **Review (reviewer, looped).** Reads `build_review_prompt(chapter, draft)`.
+   Tools: `search_books` only — the rubric is evaluated against the draft, not
+   against the tree. Emits JSON: `grade`, `issues[]`, `praise[]`, and
+   per-criterion stamps (`PASS` / `FAIL: <reason>`). **Does not modify the
+   draft.** JSON parse failures get one retry before the chapter is marked
+   unapproved.
+
+3. **Revise (writer).** Only runs when the review gate fails. Reads
+   `build_revision_prompt(chapter, draft, review_raw)` — original chapter
+   prompt + the rejected draft + the reviewer's raw JSON. The writer can both
+   **remove** content (trim out-of-scope material the reviewer flagged) AND
+   **add** content (fill a section the reviewer marked thin, answer a missed
+   key question). Loop returns to Step 2 with the new draft.
+
+4. **Fact-check (deterministic, no agent).** `fact_check_draft` extracts every
+   file path, struct name, and function name claimed in the draft and verifies
+   each against the FreeBSD source tree (3-stage grep pipeline in
+   `_batched_grep_present`, plus `_resolve_path_in_tree`). Returns a dict of
+   missing/corrected items. **Does not modify the draft.**
+
+5. **Fact-fix (writer).** Only runs when fact-check finds issues. Reads
+   `_build_fact_check_prompt(chapter, draft, facts)` — original chapter
+   context + current draft + the specific bad claims. The writer corrects bad
+   paths, replaces missing structs with verified ones, and removes unfixable
+   claims. Same writer agent as Step 1 — has full source access via tools.
+
+6. **Atomic write.** Existing output is renamed to `.bak`, the new draft is
+   atomically replaced into place via `_atomic_write` (tempfile + fsync +
+   `os.replace`), and the backup is deleted on success / restored on failure.
+   If review didn't approve or fact-fix crashed, an `UNVERIFIED DRAFT` banner
+   is inserted under the H1.
+
+### Reviewer rubric
 
 The reviewer grades on 7 criteria:
 1. **Completeness** — all key questions answered

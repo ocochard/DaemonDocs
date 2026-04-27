@@ -2082,13 +2082,80 @@ def _criteria_fail_count(criteria: object) -> int:
 
 def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 dry_run: bool = False) -> bool:
-    """Run the multi-pass pipeline: write → review → revise → write.
+    """Run the multi-pass pipeline: draft → review/revise loop → fact-check → write.
 
     writer      — the writer CodeAgent
     reviewer    — the reviewer CodeAgent
     max_revisions — how many revision rounds to allow (0 = single pass, no review)
 
-    Reliability guarantees:
+    --- Pipeline steps and the role of each agent ----------------------------
+
+    Two agents, distinct roles. The reviewer NEVER edits the draft text — it
+    only emits a JSON verdict. Every textual change (including additions) is
+    produced by the writer in a follow-up call. This separation is why each
+    step's prompt can be small and focused: the reviewer's prompt does not
+    need to teach it how to write, and the writer's revise/fact-fix prompts
+    do not need to re-derive the rubric.
+
+    Step 1 — DRAFT (writer)
+        Input:  build_chapter_prompt(chapter) — focus, scope_guard, sections,
+                key questions, mandatory output template, no-marketing rule,
+                and the existing target file (if any) as read-only context.
+        Tools:  read_freebsd_source, search_books, explore_tree,
+                resolve_c_definition.
+        Output: a full markdown draft. Free to add anything within the
+                template; bound by scope_guard and forbidden-words list.
+
+    Step 2 — REVIEW (reviewer, looped)  [skipped when max_revisions == 0]
+        Input:  build_review_prompt(chapter, draft) — chapter scope/rubric +
+                the current draft.
+        Tools:  search_books only (no source-tree access — the rubric is
+                evaluated against the draft itself, not against the tree).
+        Output: a JSON verdict with grade, issues[], praise[], and per-
+                criterion stamps (PASS / FAIL: <reason>). Does NOT modify
+                the draft. JSON parse failures get one retry before the
+                chapter is marked unapproved.
+        Gate:   _review_passes — strict (grade == PASS AND empty issues
+                AND no FAIL criteria). Loosening this is a known anti-fix:
+                the reviewer often returns grade=PASS while individual
+                criteria say FAIL, and silently approving those degrades
+                output quality.
+
+    Step 3 — REVISE (writer)  [only when review fails]
+        Input:  build_revision_prompt(chapter, draft, review_raw) — original
+                chapter prompt + previous draft + reviewer's raw JSON.
+        Output: a new full draft. The writer can both REMOVE content (e.g.
+                trim out-of-scope sections the reviewer flagged) AND ADD
+                content (e.g. fill a section the reviewer marked thin, or
+                answer a key question the draft missed). Loop returns to
+                Step 2 with the new draft until approved or max_revisions
+                exhausted.
+
+    Step 4 — FACT-CHECK (deterministic, no agent)
+        Input:  the approved/unapproved draft.
+        Logic:  fact_check_draft — extracts every claimed file path, struct
+                name, and function name from the markdown; verifies each
+                against the FreeBSD source tree (the 3-stage grep pipeline
+                in _batched_grep_present, plus _resolve_path_in_tree).
+        Output: dict of {missing_paths, corrected_paths, missing_structs,
+                missing_funcs}. Does NOT modify the draft.
+
+    Step 5 — FACT-FIX (writer)  [only when fact-check finds issues]
+        Input:  _build_fact_check_prompt(chapter, draft, facts) — original
+                chapter context + current draft + the specific bad claims.
+        Output: a new draft with bad paths corrected, missing structs
+                replaced with verified ones, and any unfixable claims
+                removed. Same writer agent as Step 1 — has full source
+                access via tools, so it can find correct replacements.
+
+    Step 6 — ATOMIC WRITE
+        Input:  the final draft (post fact-fix), with an UNVERIFIED DRAFT
+                banner inserted under the H1 if the reviewer didn't approve
+                or if fact-fix crashed.
+        Logic:  rename existing output to .bak, _atomic_write the new
+                draft, delete .bak on success / restore .bak on failure.
+
+    --- Reliability guarantees ----------------------------------------------
       - The previously-generated file (if any) is preserved on every failure
         path. We rename it to a `.bak` sibling and only delete the backup once
         a fresh, complete draft has been written successfully.
