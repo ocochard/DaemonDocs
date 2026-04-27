@@ -1500,6 +1500,103 @@ def gather_source_context(chapter: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Section catalog. Each entry maps the H2 header name to:
+#   - template_body: prose shown inside the writer's output template, telling
+#     the model what content goes there.
+#   - rubric_body: the one-line description used in the reviewer's structure
+#     rubric checklist.
+# Adding a section here makes it available to chapters.yaml — chapters opt in
+# via a `sections:` list. The default list (below) is what existing chapters
+# get when they don't specify one, preserving prior behaviour.
+_SECTION_CATALOG = {
+    "Quick Summary": {
+        "template_body": (
+            "(3-4 paragraphs: what this subsystem does and why it matters.\n"
+            "No code — accessible to any reader who knows C.)"
+        ),
+        "rubric_body": "3-4 paragraphs, no code (beginners)",
+    },
+    "Architecture": {
+        "template_body": "(technical explanation with specific source file references)",
+        "rubric_body": "technical explanation with source references",
+    },
+    "Key Data Structures": {
+        "template_body": "(C structs with field explanations, quoting from actual header files)",
+        "rubric_body": "C structs with field explanations",
+    },
+    "Deep Dive": {
+        "template_body": (
+            "(Source code walkthrough: trace through key functions step-by-step,\n"
+            "referencing specific files with code snippets. This is the intermediate\n"
+            "reading level.)"
+        ),
+        "rubric_body": "source code walkthrough with code snippets",
+    },
+    "Flow / Diagram": {
+        # `{diagram}` is filled in at format-time by the caller.
+        "template_body": "(Mermaid {diagram} diagram — valid syntax, not a placeholder)",
+        "rubric_body": "valid Mermaid diagram (not placeholder)",
+    },
+    "Advanced Notes": {
+        "template_body": (
+            "(Practical insights for advanced readers: debugging with DTrace,\n"
+            "performance implications, race conditions, common pitfalls,\n"
+            "connection to OS theory from textbooks.)"
+        ),
+        "rubric_body": "DTrace, performance, pitfalls (advanced)",
+    },
+    "Comparison": {
+        "template_body": (
+            "(How other OSes implement the same concept. Focus on Linux: note\n"
+            "key structural differences — e.g., FreeBSD's vm_map vs Linux's\n"
+            "vm_area_struct, UMA vs SLUB, sx locks vs rw_semaphore. Also mention\n"
+            "macOS/XNU, NetBSD, or OpenBSD where relevant. Keep it brief — 2-4\n"
+            "paragraphs. Do not fabricate Linux file paths or line numbers.)"
+        ),
+        "rubric_body": "Linux/macOS/NetBSD structural differences",
+    },
+    "See Also": {
+        "template_body": "(related chapters and source directories to explore next)",
+        "rubric_body": "related chapters/directories",
+    },
+}
+
+# Default section order, matching the original 8 H2 sections (plus the H1
+# title that's added separately by the prompt). Chapters that don't declare
+# a `sections:` list get this set, preserving backward-compatible behaviour
+# for chapters defined before the per-chapter override existed.
+_DEFAULT_SECTIONS = [
+    "Quick Summary", "Architecture", "Key Data Structures", "Deep Dive",
+    "Flow / Diagram", "Advanced Notes", "Comparison", "See Also",
+]
+
+
+def _chapter_sections(chapter: dict) -> list:
+    """Resolve a chapter's section list, validating against the catalog.
+
+    A chapter may opt out of irrelevant sections (e.g. a tree-overview
+    chapter has no specific structs to feature) by declaring
+    `sections: [Quick Summary, Architecture, ...]` in chapters.yaml.
+    Unknown names are dropped with a warning rather than crashing the run —
+    a typo in YAML shouldn't kill an otherwise-good chapter.
+    """
+    raw = chapter.get("sections")
+    if not raw:
+        return list(_DEFAULT_SECTIONS)
+    resolved = []
+    for name in raw:
+        if name in _SECTION_CATALOG:
+            resolved.append(name)
+        else:
+            print(f"  ⚠ chapter {chapter.get('title')!r}: unknown section "
+                  f"{name!r} — dropping (valid: {list(_SECTION_CATALOG)})")
+    if not resolved:
+        # An entirely-bogus list shouldn't leave the writer with nothing to
+        # produce. Fall back to the default set.
+        return list(_DEFAULT_SECTIONS)
+    return resolved
+
+
 def build_chapter_prompt(chapter: dict) -> str:
     """Build the instruction prompt for the writer agent."""
     src_files = chapter.get("source_files", [])
@@ -1591,6 +1688,26 @@ def build_chapter_prompt(chapter: dict) -> str:
 
     steps.append(f"    - Diagram format hint:{diagram_hints.get(diagram, '')}")
 
+    # Build the section template from the chapter's section list. Each
+    # chapter may opt out of irrelevant sections via `sections:` in
+    # chapters.yaml — see _chapter_sections().
+    #
+    # Indentation gymnastics: the f-string below sits inside a
+    # textwrap.dedent block whose common leading whitespace is 8 spaces.
+    # The placeholder `{template_body}` is itself preceded by 8 spaces of
+    # f-string scaffolding, which become the first line's indent. Every
+    # *other* body line therefore needs 8 leading spaces of its own to
+    # land at the same column after dedent. Pre-indenting only the lines
+    # *after* the first achieves that.
+    sections = _chapter_sections(chapter)
+    template_blocks = []
+    for name in sections:
+        body = _SECTION_CATALOG[name]["template_body"].format(diagram=diagram)
+        template_blocks.append(f"## {name}\n{body}")
+    raw_body = "\n\n".join(template_blocks)
+    first, sep, rest = raw_body.partition("\n")
+    template_body = first + (sep + textwrap.indent(rest, "        ") if sep else "")
+
     return textwrap.dedent(f"""\
         You are writing a chapter for "FreeBSD Internals" — a
         guide that helps anyone interested in operating systems understand
@@ -1614,38 +1731,7 @@ def build_chapter_prompt(chapter: dict) -> str:
 
         # {chapter['title']}
 
-        ## Quick Summary
-        (3-4 paragraphs: what this subsystem does and why it matters.
-        No code — accessible to any reader who knows C.)
-
-        ## Architecture
-        (technical explanation with specific source file references)
-
-        ## Key Data Structures
-        (C structs with field explanations, quoting from actual header files)
-
-        ## Deep Dive
-        (Source code walkthrough: trace through key functions step-by-step,
-        referencing specific files with code snippets. This is the intermediate
-        reading level.)
-
-        ## Flow / Diagram
-        (Mermaid {diagram} diagram — valid syntax, not a placeholder)
-
-        ## Advanced Notes
-        (Practical insights for advanced readers: debugging with DTrace,
-        performance implications, race conditions, common pitfalls,
-        connection to OS theory from textbooks.)
-
-        ## Comparison
-        (How other OSes implement the same concept. Focus on Linux: note
-        key structural differences — e.g., FreeBSD's vm_map vs Linux's
-        vm_area_struct, UMA vs SLUB, sx locks vs rw_semaphore. Also mention
-        macOS/XNU, NetBSD, or OpenBSD where relevant. Keep it brief — 2-4
-        paragraphs. Do not fabricate Linux file paths or line numbers.)
-
-        ## See Also
-        (related chapters and source directories to explore next)
+        {template_body}
 
         ---END TEMPLATE---
 
@@ -1658,6 +1744,18 @@ def build_chapter_prompt(chapter: dict) -> str:
         - EVERY section header above MUST appear in your output
         - If you cannot fill a section with real content, write "See related
           chapters for coverage of this topic" rather than skipping it
+
+        **No marketing language.** This is a technical reference, not a
+        product brochure. Forbidden words and phrases — do NOT use any of
+        them, even rephrased: comprehensive, robust, seamless, seamlessly,
+        leverage, leveraging, cutting-edge, state-of-the-art, elegant,
+        powerful, simply, easily, effortlessly, blazing-fast, world-class,
+        best-in-class, industry-leading, rich set of, wide range of,
+        wide variety of, tight integration, deep integration, first-class,
+        rock-solid, battle-tested, modern, sophisticated, advanced
+        (as a generic adjective; the section title is fine). If a sentence
+        relies on one of these words to be impressive, the sentence is
+        empty — replace it with a concrete fact or delete it.
     """).lstrip()
 
 
@@ -1667,6 +1765,18 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
     src_files = chapter.get("source_files", [])
     diagram = chapter.get("mermaid", "flowchart")
     question_text = "\n".join(f"- {q}" for q in questions)
+
+    # Build the structure-rubric checklist from the chapter's section list.
+    # If the chapter opted out of (e.g.) `Key Data Structures`, the reviewer
+    # must NOT flag it as missing — that would always FAIL the structure
+    # criterion for chapters that legitimately don't need every section.
+    sections = _chapter_sections(chapter)
+    section_count = len(sections) + 1  # +1 for the H1 title line
+    structure_lines = [
+        f"           - `## {name}` — {_SECTION_CATALOG[name]['rubric_body']}"
+        for name in sections
+    ]
+    structure_checklist = "\n".join(structure_lines)
 
     return textwrap.dedent(f"""\
         You are reviewing a draft chapter for "FreeBSD Internals."
@@ -1702,17 +1812,22 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            WHY things work, not just WHAT they do? Are there analogies or
            connections to OS theory?
 
-        6. **Structure** — Does the draft have ALL 9 required sections with
-           substantive content? Check for each:
-           - `## Quick Summary` — 3-4 paragraphs, no code (beginners)
-           - `## Architecture` — technical explanation with source references
-           - `## Key Data Structures` — C structs with field explanations
-           - `## Deep Dive` — source code walkthrough with code snippets
-           - `## Flow / Diagram` — valid Mermaid diagram (not placeholder)
-           - `## Advanced Notes` — DTrace, performance, pitfalls (advanced)
-           - `## Comparison` — Linux/macOS/NetBSD structural differences
-           - `## See Also` — related chapters/directories
+        6. **Structure** — Does the draft have ALL {section_count} required
+           sections with substantive content? Check for each:
+{structure_checklist}
            FAIL if ANY section is missing, empty, or a single sentence.
+           Sections OUTSIDE this list are not required (and not forbidden) —
+           do not flag missing sections that are not on this list.
+
+        7. **No marketing language** — FAIL if the draft contains any of
+           these words or phrases (or close paraphrases): comprehensive,
+           robust, seamless(ly), leverage/leveraging, cutting-edge,
+           state-of-the-art, elegant, powerful, simply/easily/effortlessly,
+           blazing-fast, world-class, best-in-class, industry-leading,
+           rich set of, wide range of, wide variety of, tight/deep
+           integration, first-class, rock-solid, battle-tested, modern,
+           sophisticated. Quote the offending sentence(s) in the issue
+           text so the writer can find and remove them.
 
         ## Draft to Review
 
@@ -1730,7 +1845,8 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
             "source_coverage": "PASS/FAIL: reason",
             "mermaid_diagram": "PASS/FAIL: reason",
             "accessibility": "PASS/FAIL: reason",
-            "structure": "PASS/FAIL: reason"
+            "structure": "PASS/FAIL: reason",
+            "no_marketing": "PASS/FAIL: reason (quote any offending sentences)"
           }},
           "issues": [
             "Specific issue 1 with actionable fix",
@@ -1743,6 +1859,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
 
         If 4 or more criteria FAIL → grade is NEEDS_REVISION.
         If 3 or fewer FAIL → grade is PASS (issues are minor polish).
+        Note: there are now 7 criteria (added `no_marketing`).
         Be specific in issues: "The struct vm_page is described with fields that
         don't match sys/vm/vm_page.h" not "the data structures section is weak."
     """).lstrip()
@@ -1935,8 +2052,10 @@ def _criteria_fail_count(criteria: object) -> int:
     null or list values. Treat anything non-string as a failure (safer
     default for the summary line).
     """
+    # 7 criteria total: completeness, accuracy, source_coverage,
+    # mermaid_diagram, accessibility, structure, no_marketing.
     if not isinstance(criteria, dict):
-        return 6
+        return 7
     fails = 0
     for v in criteria.values():
         if not isinstance(v, str) or v.startswith("FAIL"):
@@ -2033,7 +2152,7 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             criteria = review_json.get("criteria", {}) or {}
 
             fail_count = _criteria_fail_count(criteria)
-            print(f"         grade={grade}  ({6 - fail_count}/6 criteria pass)")
+            print(f"         grade={grade}  ({7 - fail_count}/7 criteria pass)")
             if issues:
                 for iss in issues[:5]:
                     print(f"         - {iss}")
@@ -2760,10 +2879,11 @@ _OVERVIEW_HEADERS = ("Quick Summary", "Overview")
 
 ## Headers that mark the *end* of the overview section. Anything between
 ## the start header and the first of these is the summary. Same case
-## tolerance as above.
-_OVERVIEW_END_HEADERS = (
-    "Architecture", "Key Data Structures", "Deep Dive",
-    "Flow / Diagram", "Advanced Notes", "Comparison", "See Also",
+## tolerance as above. Derived from _SECTION_CATALOG so adding a new
+## section there automatically extends this set — except `Quick Summary`,
+## which is the *start* header, not an end.
+_OVERVIEW_END_HEADERS = tuple(
+    name for name in _SECTION_CATALOG if name != "Quick Summary"
 )
 
 

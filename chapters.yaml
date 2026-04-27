@@ -17,6 +17,18 @@ chapters:
     # file below). Writing there would clobber upstream and cause a
     # read-vs-write collision in run_chapter().
     output_file: "README_internals.md"
+    # This chapter is a tree-level overview — there's no specific subsystem
+    # to feature with structs or a code walkthrough, so we drop those two
+    # sections. Per-chapter section selection lets each chapter declare
+    # what's actually appropriate; see _SECTION_CATALOG in generate-doc.py
+    # for the full set.
+    sections:
+      - "Quick Summary"
+      - "Architecture"
+      - "Flow / Diagram"
+      - "Advanced Notes"
+      - "Comparison"
+      - "See Also"
     source_dirs: []
     source_files:
       - "README.md"
