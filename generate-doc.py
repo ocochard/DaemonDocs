@@ -1027,19 +1027,36 @@ class TfidfIndex:
 def get_or_build_index(corpus_path: str, force: bool = False) -> TfidfIndex:
     """Load saved index or build from corpus.
 
-    If the saved index fails any validation check (corrupt .npy, malformed
-    meta, shape mismatch), we transparently fall back to a rebuild rather
-    than crash or proceed with a broken index.
+    Rebuilds when:
+      - `force` is True (caller asked for a clean rebuild), or
+      - the matrix .npy is missing, or
+      - the corpus on disk is newer than the saved matrix (incremental
+        runs that added/removed books would otherwise reuse a stale
+        index that doesn't reflect the new corpus), or
+      - the saved index fails any validation check (corrupt .npy,
+        malformed meta, shape mismatch).
     """
     index_path = INDEX_DIR / "tfidf_index"
+    matrix_file = Path(f"{index_path}_matrix.npy")
 
-    if not force and Path(f"{index_path}_matrix.npy").exists():
-        print("  loading saved TF-IDF index ...")
-        idx = TfidfIndex()
-        if idx.load(str(index_path)):
-            print(f"  index: {len(idx.chunks)} chunks, {len(idx.vocab)} terms")
-            return idx
-        print("  saved index could not be validated — rebuilding from corpus")
+    if not force and matrix_file.exists():
+        # If the corpus is newer than the saved index, the index is
+        # stale relative to disk state. Force a rebuild rather than
+        # silently search against the old chunks.
+        try:
+            corpus_mtime = os.path.getmtime(corpus_path)
+            index_mtime = matrix_file.stat().st_mtime
+        except OSError:
+            corpus_mtime = index_mtime = 0
+        if corpus_mtime > index_mtime:
+            print("  corpus is newer than saved index — rebuilding")
+        else:
+            print("  loading saved TF-IDF index ...")
+            idx = TfidfIndex()
+            if idx.load(str(index_path)):
+                print(f"  index: {len(idx.chunks)} chunks, {len(idx.vocab)} terms")
+                return idx
+            print("  saved index could not be validated — rebuilding from corpus")
 
     print("  building TF-IDF index ...")
     idx = TfidfIndex()
