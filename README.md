@@ -2,11 +2,11 @@
 
 [![GitHub](https://img.shields.io/badge/GitHub-DaemonDocs-181717?logo=github)](https://github.com/ocochard/DaemonDocs)
 
-AI-generated documentation of FreeBSD internals. Each chapter produces a `README.md` placed directly in the relevant FreeBSD source directory — so anyone can `git clone` the tree and find educational material right next to the code.
+AI-generated documentation of FreeBSD internals. Each chapter produces a markdown file placed directly in the relevant FreeBSD source directory — so anyone can `git clone` the tree and find educational material right next to the code. Outputs use a `README_*.md` naming convention (e.g. `README_internals.md`, `README_process.md`) so they never clobber FreeBSD's upstream `README.md` files.
 
 ## Vision
 
-Build documentation of FreeBSD internals by having AI agents study the FreeBSD source code and cross-reference it with FreeBSD books. The output is a set of `README.md` files placed throughout the FreeBSD source tree — so any reader can `git clone` the tree and find educational material right next to the code.
+Build documentation of FreeBSD internals by having AI agents study the FreeBSD source code and cross-reference it with FreeBSD books. The output is a set of `README_*.md` files placed throughout the FreeBSD source tree — so any reader can `git clone` the tree and find educational material right next to the code.
 
 The reference works are:
 - *The Design and Implementation of FreeBSD* (McKusick et al.)
@@ -26,7 +26,7 @@ The goal is **not** to reproduce man pages. The goal is to help anyone who knows
    - A writer agent studies the source code and searches the corpus
    - A reviewer agent grades the draft on 6 criteria
    - If needed, the writer revises — up to `--max-revisions` rounds
-5. **Writes** the final `README.md` into the relevant source directory
+5. **Writes** the final markdown file into the relevant source directory (e.g. `README_internals.md`, `sys/vm/README_vm.md`)
 
 ---
 
@@ -221,11 +221,11 @@ Current chapters (13):
 
 ## Output
 
-Each chapter produces a `README.md` in the FreeBSD source tree:
+Each chapter produces a markdown file in the FreeBSD source tree:
 
 | Directory | File |
 |---|---|
-| root | `README.md` |
+| root | `README_internals.md` |
 | `sys/` | `README.md` |
 | `sys/vm/` | `README.md`, `README_bcache.md` |
 | `sys/kern/` | `README_process.md`, `README_driver.md`, `README_intr.md`, `README_jail.md` |
@@ -234,6 +234,8 @@ Each chapter produces a `README.md` in the FreeBSD source tree:
 | `sys/net/` | `README.md` |
 | `stand/efi/loader/` | `README.md` |
 | `share/mk/` | `README.md` |
+
+The root file is `README_internals.md` (not `README.md`) to avoid overwriting the upstream FreeBSD `README.md`, which is itself a source for that chapter.
 
 Each file follows a strict 9-section template:
 
