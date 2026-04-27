@@ -1874,9 +1874,15 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
           ]
         }}
 
-        If 4 or more criteria FAIL → grade is NEEDS_REVISION.
-        If 3 or fewer FAIL → grade is PASS (issues are minor polish).
-        Note: there are now 7 criteria (added `no_marketing`).
+        Grading rule (NO exceptions):
+          - If ANY criterion is FAIL → `grade` MUST be "NEEDS_REVISION".
+          - If `issues` is non-empty → `grade` MUST be "NEEDS_REVISION".
+          - `grade` is "PASS" only when every criterion is PASS AND `issues`
+            is an empty list.
+        Do NOT mark a draft PASS while still listing FAIL criteria or issues —
+        the downstream gate will reject that as inconsistent and waste a
+        revision slot.
+
         Be specific in issues: "The struct vm_page is described with fields that
         don't match sys/vm/vm_page.h" not "the data structures section is weak."
     """).lstrip()
@@ -2237,11 +2243,14 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
 
             fail_count = _criteria_fail_count(criteria)
             print(f"         grade={grade}  ({7 - fail_count}/7 criteria pass)")
+            # Print every issue and every praise — truncating these hides
+            # the diagnostic information needed to figure out why the
+            # reviewer didn't approve. The log is verbose by design.
             if issues:
-                for iss in issues[:5]:
+                for iss in issues:
                     print(f"         - {iss}")
             if praise:
-                for p in praise[:3]:
+                for p in praise:
                     print(f"         ✓ {p}")
 
             if _review_passes(review_json):
@@ -2265,7 +2274,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                   "writing draft but flagging as unverified")
 
         # ---- Fact-checking pass ----
-        print("  [fact-check] verifying file paths, structs, functions ...")
+        print("  [fact-check] verifying paths, structs, funcs, options, "
+              "dtrace probes ...")
         facts = fact_check_draft(draft, SRC_ROOT)
         fact_check_clean = facts['total_issues'] == 0
         fact_fix_failed = False
@@ -2281,6 +2291,12 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 print(f"         - missing structs: {', '.join(facts['structs_not_found'])}")
             if facts['funcs_not_found']:
                 print(f"         - missing functions: {', '.join(facts['funcs_not_found'])}")
+            if facts.get('kernel_options_not_found'):
+                print(f"         - missing kernel options: "
+                      f"{', '.join(facts['kernel_options_not_found'])}")
+            if facts.get('dtrace_probes_not_found'):
+                print(f"         - missing dtrace probes: "
+                      f"{', '.join(facts['dtrace_probes_not_found'])}")
 
             print("  [fact-fix] rewriting to address fact-check issues ...")
             try:
@@ -2425,6 +2441,70 @@ def _extract_file_paths(text: str) -> List[str]:
     return list(set(paths))
 
 
+# Non-FreeBSD or non-C-symbol tokens that look like function/struct names
+# when extracted from backticks but aren't. Keeping the fact-checker honest
+# matters because every false positive in this list eats one or more steps
+# of the writer's fact-fix budget — and bad fact-fixes have introduced
+# regressions in the past (e.g. "fixing" `GENERIC` by removing a sentence
+# that wasn't wrong).
+_FACT_CHECK_IGNORE = frozenset({
+    # Make targets / build-system phases
+    "buildworld", "installworld", "buildkernel", "installkernel",
+    "kernel-toolchain", "make", "world", "universe", "tinderbox",
+    "doxygen", "checkworld", "delete-old", "check-old", "xdev",
+    "native-xtools", "kernels", "worlds", "toolchains",
+    # Make / kernel-config knobs (mostly all-caps with underscores)
+    "GENERIC", "MINIMAL", "LINT", "NOTES",
+    "TARGET", "TARGET_ARCH", "MACHINE", "MACHINE_ARCH",
+    "OBJTOP", "OBJROOT", "DESTDIR", "SRCROOT", "MAKEOBJDIRPREFIX",
+    "CROSS_TOOLCHAIN", "WORLDTMP",
+    "SUBDIR", "SUBDIRS", "SRCS", "INCS", "MAN",
+    # Filenames the writer references as identifiers
+    "Makefile", "UPDATING", "COPYRIGHT", "README",
+    # Linux structs / funcs that legitimately appear in Comparison sections
+    # (they don't exist in the FreeBSD tree, but flagging them as
+    # "missing" wastes a fact-fix step).
+    "vm_area_struct", "task_struct", "rw_semaphore", "rwsem",
+    "start_kernel", "device_initcall", "core_initcall",
+    "postcore_initcall", "module_init", "subsys_initcall",
+    # macOS/XNU
+    "kernel_bootstrap", "IOKit",
+})
+
+
+# Match the `## Comparison` H2 section (and "Comparison with X" variants)
+# through to the next H2 or end-of-string. Tokens inside this region
+# describe other OSes (Linux, macOS, NetBSD, OpenBSD) and must NOT be
+# verified against the FreeBSD source tree — every Linux struct flagged
+# as "missing" is a false positive that wastes a fact-fix step.
+_COMPARISON_SECTION_RE = re.compile(
+    r'^[ ]{0,3}##\s+Comparison\b.*?(?=^[ ]{0,3}##\s+|\Z)',
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _strip_comparison_section(text: str) -> str:
+    """Return `text` with all `## Comparison` H2 sections removed.
+
+    Used by the fact-checker so cross-OS struct/function names are not
+    grepped against the FreeBSD source tree and flagged as missing.
+    """
+    return _COMPARISON_SECTION_RE.sub('', text)
+
+
+def _filter_known_noise(names: List[str]) -> List[str]:
+    """Drop names that match well-known make/config/non-C-symbol patterns."""
+    out = []
+    for n in names:
+        if n in _FACT_CHECK_IGNORE:
+            continue
+        # All-caps WITH_*, WITHOUT_*, MK_*, NO_* — kernel/make config knobs
+        if re.match(r'^(?:WITH|WITHOUT|MK|NO)_[A-Z0-9_]+$', n):
+            continue
+        out.append(n)
+    return out
+
+
 def _extract_struct_names(text: str) -> List[str]:
     """Extract claimed struct names from markdown text."""
     structs = []
@@ -2434,7 +2514,7 @@ def _extract_struct_names(text: str) -> List[str]:
         # Skip common non-struct words
         if name not in ('struct', 'structs', 'structname'):
             structs.append(name)
-    return list(set(structs))
+    return _filter_known_noise(list(set(structs)))
 
 
 def _extract_function_names(text: str) -> List[str]:
@@ -2455,7 +2535,7 @@ def _extract_function_names(text: str) -> List[str]:
         name = m.group(1)
         if name not in funcs:
             funcs.append(name)
-    return list(set(funcs))
+    return _filter_known_noise(list(set(funcs)))
 
 
 def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
@@ -2646,6 +2726,134 @@ def _verify_functions(funcs: List[str], src_root: str) -> List[str]:
     )
 
 
+# --- Kernel-config options -------------------------------------------------
+#
+# Writers occasionally invent kernel-config options like `VERBOSE_SYSINIT`
+# that look plausible but don't exist. Real options live in `sys/conf/options`
+# and per-arch `sys/conf/options.<arch>` files, plus `sys/conf/NOTES` (which
+# documents `option FOO`). We extract candidate names from the draft and
+# grep those files; anything not found is reported back to the writer.
+
+# Match `option FOO` mentions (with optional backticks) and bare ALL_CAPS
+# tokens introduced as kernel options. Restricted to identifiers of length
+# ≥ 5 to avoid matching incidental ALL-CAPS words like `BSD` or `API`.
+_KERNEL_OPTION_RE = re.compile(
+    r'\b(?:option|options)\s+`?([A-Z][A-Z0-9_]{4,})`?\b'
+    r'|`(VERBOSE_[A-Z0-9_]+|DEBUG_[A-Z0-9_]+|INVARIANT[A-Z0-9_]*|'
+    r'WITNESS[A-Z0-9_]*|KTR[A-Z0-9_]*|BOOTVERBOSE)`'
+)
+
+# Tokens that look like kernel-config options but are universally known
+# kernel knobs and not worth fact-checking (false positives if missing
+# from this particular tree, e.g. arch-specific options).
+_KERNEL_OPTION_IGNORE = frozenset({
+    "BOOTVERBOSE",  # actually a sysctl/loader var, not an `option`
+})
+
+
+def _extract_kernel_options(text: str) -> List[str]:
+    """Extract claimed kernel-config option names from the draft."""
+    found = set()
+    for m in _KERNEL_OPTION_RE.finditer(text):
+        name = m.group(1) or m.group(2)
+        if name and name not in _KERNEL_OPTION_IGNORE:
+            found.add(name)
+    return sorted(found)
+
+
+def _verify_kernel_options(options: List[str], src_root: str) -> List[str]:
+    """Grep `sys/conf/options*` and `sys/conf/NOTES` for each option name.
+
+    Returns the list of options that were not found.
+    """
+    if not options:
+        return []
+    sys_conf = os.path.join(src_root, "sys", "conf")
+    if not os.path.isdir(sys_conf):
+        return []  # can't verify — don't flag
+    fixed_args = " ".join(f"-e {shlex.quote(s)}" for s in options)
+    cmd = (
+        f"grep -rhwF "
+        f"--include='options' --include='options.*' --include='NOTES' "
+        f"{fixed_args} {shlex.quote(sys_conf)}/ 2>/dev/null | "
+        f"head -c 524288"
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=_GREP_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return []  # treat as unverified rather than all-missing
+    output = result.stdout
+    not_found = []
+    for opt in options:
+        # Word-boundary check; `re.search` is fine since the corpus is small.
+        if not re.search(rf'\b{re.escape(opt)}\b', output):
+            not_found.append(opt)
+    return not_found
+
+
+# --- DTrace SDT probes -----------------------------------------------------
+#
+# Writers also invent SDT probes like `sysinit:::entry` or
+# `vm:::page-fault`. Real probes are registered with `SDT_PROBE_DEFINE*`
+# macros in `sys/`. We extract `provider:module:function:name` tuples from
+# the draft and verify each by matching `SDT_PROBE_DEFINE…(provider, …,
+# name)` patterns. The middle two fields (module/function) are usually
+# empty in writer-output (`sysinit:::entry`), so we only verify provider+name.
+
+_DTRACE_PROBE_RE = re.compile(
+    r'`([a-z][a-z0-9_-]*):[a-z0-9_-]*:[a-z0-9_-]*:([a-z0-9_-]+)`'
+)
+
+
+def _extract_dtrace_probes(text: str) -> List[Tuple[str, str]]:
+    """Extract claimed DTrace SDT probes as (provider, name) tuples."""
+    return list({
+        (m.group(1), m.group(2)) for m in _DTRACE_PROBE_RE.finditer(text)
+    })
+
+
+def _verify_dtrace_probes(probes: List[Tuple[str, str]],
+                          src_root: str) -> List[str]:
+    """Grep for SDT_PROBE_DEFINE* macros matching each (provider, name) tuple.
+
+    Returns a list of "provider:::name" strings that were not found.
+    """
+    if not probes:
+        return []
+    sys_root = os.path.join(src_root, "sys")
+    if not os.path.isdir(sys_root):
+        return []
+    # Pull all SDT_PROBE_DEFINE* lines from sys/. The grep is cheap because
+    # the macro is rare. The 1 MB cap is generous; the FreeBSD tree has a
+    # few hundred SDT probes total.
+    cmd = (
+        f"grep -rhE --include='*.c' --include='*.h' "
+        f"'SDT_PROBE_DEFINE[0-9]?\\b' {shlex.quote(sys_root)}/ 2>/dev/null | "
+        f"head -c 1048576"
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=_GREP_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return []
+    output = result.stdout
+    not_found = []
+    for provider, name in probes:
+        # Match `SDT_PROBE_DEFINE…(provider, anything, anything, name`
+        pat = (
+            rf'SDT_PROBE_DEFINE\d?\s*\(\s*{re.escape(provider)}\s*,'
+            rf'[^)]*?\b{re.escape(name)}\b'
+        )
+        if not re.search(pat, output):
+            not_found.append(f"{provider}:::{name}")
+    return not_found
+
+
 def fact_check_draft(draft: str, src_root: str) -> dict:
     """Run structured fact-checking on a draft chapter.
 
@@ -2654,11 +2862,20 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
         - 'file_paths_corrected': list of "wrong → right" pairs
         - 'structs_not_found': list of missing struct names
         - 'funcs_not_found': list of missing function names
+        - 'kernel_options_not_found': list of unverifiable kernel-config options
+        - 'dtrace_probes_not_found': list of unverifiable DTrace SDT probes
         - 'total_issues': count of all issues
+
+    The `## Comparison` section is stripped before extraction. That section
+    legitimately discusses Linux/macOS/NetBSD symbols which would otherwise
+    be flagged as "not found in FreeBSD source," wasting fact-fix steps.
     """
-    file_paths = _extract_file_paths(draft)
-    structs = _extract_struct_names(draft)
-    funcs = _extract_function_names(draft)
+    fact_text = _strip_comparison_section(draft)
+    file_paths = _extract_file_paths(fact_text)
+    structs = _extract_struct_names(fact_text)
+    funcs = _extract_function_names(fact_text)
+    kernel_options = _extract_kernel_options(fact_text)
+    dtrace_probes = _extract_dtrace_probes(fact_text)
 
     paths_missing = _verify_file_paths(file_paths, src_root)
     paths_corrected = [x for x in paths_missing if ' → ' in x]
@@ -2666,14 +2883,20 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
 
     structs_missing = _verify_structs(structs, src_root)
     funcs_missing = _verify_functions(funcs, src_root)
+    kernel_options_missing = _verify_kernel_options(kernel_options, src_root)
+    dtrace_probes_missing = _verify_dtrace_probes(dtrace_probes, src_root)
 
     return {
         'file_paths_not_found': paths_missing,
         'file_paths_corrected': paths_corrected,
         'structs_not_found': structs_missing,
         'funcs_not_found': funcs_missing,
+        'kernel_options_not_found': kernel_options_missing,
+        'dtrace_probes_not_found': dtrace_probes_missing,
         'total_issues': (len(paths_missing) + len(paths_corrected) +
-                         len(structs_missing) + len(funcs_missing)),
+                         len(structs_missing) + len(funcs_missing) +
+                         len(kernel_options_missing) +
+                         len(dtrace_probes_missing)),
     }
 
 
@@ -2703,6 +2926,21 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
             f"Functions not found in source tree: "
             f"{', '.join(facts['funcs_not_found'])}. "
             f"Remove or correct these with real function signatures."
+        )
+    if facts.get('kernel_options_not_found'):
+        issues.append(
+            f"Kernel-config options not found in sys/conf/options* or "
+            f"sys/conf/NOTES: "
+            f"{', '.join(facts['kernel_options_not_found'])}. "
+            f"These appear hallucinated — remove the claim or verify "
+            f"the option name against `sys/conf/NOTES`."
+        )
+    if facts.get('dtrace_probes_not_found'):
+        issues.append(
+            f"DTrace SDT probes not found in any SDT_PROBE_DEFINE* macro: "
+            f"{', '.join(facts['dtrace_probes_not_found'])}. "
+            f"These appear hallucinated — remove the claim or replace "
+            f"with a real probe (grep for `SDT_PROBE_DEFINE` in sys/)."
         )
 
     return textwrap.dedent(f"""\
