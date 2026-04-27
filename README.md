@@ -24,7 +24,7 @@ The goal is **not** to reproduce man pages. The goal is to help anyone who knows
 3. **Builds a TF-IDF search index** over the combined corpus (numpy only)
 4. **For each chapter** in `chapters.yaml`:
    - A writer agent studies the source code and searches the corpus
-   - A reviewer agent grades the draft on 6 criteria
+   - A reviewer agent grades the draft on 7 criteria (including a check that no marketing language slipped in)
    - If needed, the writer revises — up to `--max-revisions` rounds
 5. **Writes** the final markdown file into the relevant source directory (e.g. `README_internals.md`, `sys/vm/README_vm.md`)
 
@@ -179,13 +179,16 @@ reviewer agent (10 steps, book search only)
                     loop until PASS or max_revisions reached
 ```
 
-The reviewer grades on 6 criteria:
+The reviewer grades on 7 criteria:
 1. **Completeness** — all key questions answered
 2. **Accuracy** — no hallucinated structs/functions/paths
 3. **Source Coverage** — expected files actually discussed (not just listed)
 4. **Mermaid Diagram** — valid syntax, meaningful content
 5. **Accessibility** — explains WHY, not just WHAT
-6. **Structure** — all 9 required sections present
+6. **Structure** — every section the chapter declared in `sections:` is present and substantive
+7. **No marketing language** — no "comprehensive", "robust", "seamless", "leverage", "elegant", etc. The reviewer quotes the offending sentence.
+
+The strict gate (in `_review_passes`) only approves a chapter when `grade == "PASS"` AND `issues[]` is empty AND every criterion passes. This prevents the failure mode where the model returns `grade=PASS` while individual criteria still say `FAIL`.
 
 Default: `--max-revisions 2` (one draft + up to two revision rounds).
 
@@ -201,6 +204,7 @@ Each chapter has:
 - `focus` — what aspect to emphasize
 - `key_questions` — questions the chapter must answer
 - `mermaid` — diagram type: `sequence`, `flowchart`, `class`, or `state`
+- `sections` — *(optional)* which template sections this chapter should produce. Defaults to the full set: `Quick Summary`, `Architecture`, `Key Data Structures`, `Deep Dive`, `Flow / Diagram`, `Advanced Notes`, `Comparison`, `See Also`. A tree-overview chapter, for example, can drop `Key Data Structures` and `Deep Dive` because there's no specific subsystem to feature. The catalog of valid section names lives in `_SECTION_CATALOG` in `generate-doc.py`.
 
 Current chapters (13):
 1. FreeBSD Source Tree Overview
@@ -237,7 +241,7 @@ Each chapter produces a markdown file in the FreeBSD source tree:
 
 The root file is `README_internals.md` (not `README.md`) to avoid overwriting the upstream FreeBSD `README.md`, which is itself a source for that chapter.
 
-Each file follows a strict 9-section template:
+Each chapter follows a section template. The full template — which a chapter gets by default — is:
 
 ```markdown
 # {Chapter Title}
@@ -272,10 +276,13 @@ differences, not code details. 2-4 paragraphs.)
 (related chapters and source directories)
 ```
 
+A chapter can opt out of sections that don't fit by declaring `sections:` in `chapters.yaml`. Chapter 1 (the tree overview) drops `Key Data Structures` and `Deep Dive` for that reason — there are no single structs or functions worth featuring at the tree-level view, and forcing those sections led the writer to invent thin, out-of-context examples.
+
 Rules:
 - Always reference specific file paths (e.g., `sys/vm/vm_page.c`)
 - Include C code snippets where they illuminate the design
 - Quick Summary has no code; Deep Dive has code snippets; Advanced Notes covers debugging, performance, and pitfalls
+- **No marketing language** — words like *comprehensive*, *robust*, *seamless*, *leverage*, *elegant*, *powerful*, *modern* are forbidden in the writer prompt and flagged by the reviewer.
 
 Every generated file ends with a **provenance footer** recording the LLM model id, endpoint, and UTC timestamp used for that run — so a reader can trace which model wrote which document.
 
@@ -314,14 +321,17 @@ DaemonDocs/
 - PDF extraction from books (CHM requires `hhextract`)
 - TF-IDF semantic search index with paragraph/section-aware chunking
 - Four agent tools: read source, search books, explore tree, resolve C definitions
-- Multi-pass writer → reviewer → revise pipeline
+- Multi-pass writer → reviewer → revise pipeline with strict approval gate
 - Incremental runs (skip unchanged books, skip existing output)
 - Corpus: books, man9, Handbook, git logs, papers, kerneldoc
 - Source tree awareness (reads existing docs before writing)
-- Structured fact-checking (verifies claimed structs / functions / paths)
+- Structured fact-checking with batched grep (verifies claimed structs / functions / paths against the source tree)
+- Atomic file writes for every output (corpus hash, TF-IDF index, chapter READMEs, navigation post-pass)
 - Cross-README navigation links and cross-chapter reference index
 - Progressive difficulty (Quick Summary / Deep Dive / Advanced Notes)
 - OS comparisons (Linux / macOS / NetBSD)
+- Per-chapter section selection (`sections:` in `chapters.yaml`)
+- Anti-marketing-language rule in writer prompt + reviewer rubric
 - Flags: `--dry-run`, `--force`, `--reindex`, `--chapter N`, `--max-revisions N`, `--nav-only`, `--index`
 
 </details>
