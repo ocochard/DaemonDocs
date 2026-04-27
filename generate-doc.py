@@ -1274,6 +1274,7 @@ class ResolveCDefinition(Tool):
         "start_file": {
             "type": "string",
             "description": "Optional: start tracing #includes from this file (e.g., 'sys/vm/vm_map.c'). If omitted, searches entire tree.",
+            "nullable": True,
         }
     }
     output_type = "string"
