@@ -1809,19 +1809,34 @@ def _agent_step_count(agent) -> Optional[int]:
     return None
 
 
-def _run_agent(agent, label: str, prompt: str):
+def _run_agent(agent, label: str, prompt: str) -> str:
     """Run an agent and warn if it hit its step cap.
 
     Hitting the cap usually means the model ran out of room to produce
     well-formed output (truncated JSON, missing sections). Surfacing it in
     the run log is the cheapest way to diagnose silent quality regressions.
+
+    smolagents' `final_answer()` returns the raw object the agent passed
+    in — which can be a dict, list, or other non-string. Every caller here
+    expects a string (they call `.strip()`, write to disk, or feed into
+    JSON-extraction). Coerce at this boundary so callers never have to.
     """
     result = agent.run(prompt)
     cap = getattr(agent, "max_steps", None)
     used = _agent_step_count(agent)
     if isinstance(cap, int) and isinstance(used, int) and used >= cap:
         print(f"  ⚠ {label}: hit max_steps={cap} — output may be truncated")
-    return result
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    # Dict/list → serialise as JSON so _extract_json can still parse it.
+    if isinstance(result, (dict, list)):
+        try:
+            return json.dumps(result, indent=2)
+        except (TypeError, ValueError):
+            return str(result)
+    return str(result)
 
 
 def create_writer_agent(index: TfidfIndex):
@@ -1963,13 +1978,13 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         print("  [dry-run] would generate README.md")
         return False
 
-    # Move any existing output aside. The backup is restored in `finally` if
-    # we never produce a successful new draft.
+    # NOTE: We deliberately do NOT move the existing output aside up-front.
+    # When `output_file` is something like `README.md` and the chapter's
+    # `source_files` *also* lists `README.md`, renaming it before the writer
+    # runs would prevent the writer from reading its own source. Instead we
+    # back up just before the atomic write below, so the rename window is
+    # narrow and never overlaps tool reads.
     had_backup = False
-    if os.path.exists(output_path):
-        print(f"  backing up existing file → .freebsd-docs.bak")
-        os.rename(output_path, backup_path)
-        had_backup = True
 
     success = False
     try:
@@ -2098,6 +2113,15 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
 
         # Provenance footer (LLM model + timestamp).
         draft = draft.rstrip() + _provenance_footer()
+
+        # Back up the previous file (if any) just before we overwrite it.
+        # Done late on purpose — see the note at the top of run_chapter().
+        if os.path.exists(output_path):
+            try:
+                os.rename(output_path, backup_path)
+                had_backup = True
+            except OSError as e:
+                print(f"  ⚠ could not back up existing {output_path}: {e}")
 
         # Atomic write — a crash here leaves either the backup or the new file.
         _atomic_write(output_path, draft)
