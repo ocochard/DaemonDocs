@@ -64,8 +64,9 @@ chapters:
     source_files:
       - "sys/kern/init_main.c"
       - "sys/amd64/amd64/locore.S"
+      - "sys/amd64/amd64/machdep.c"
       - "sys/arm64/arm64/locore.S"
-      - "sys/kern/sys_init.c"
+      - "sys/sys/kernel.h"
     focus: >
       Trace kernel startup from _start through cpu_startup to init_main.
       Explain SI_SUB ordering, how subsystems are initialized, and the
@@ -84,7 +85,8 @@ chapters:
       - "stand/efi/loader/arch/arm64"
     source_files:
       - "stand/efi/loader/arch/amd64/elf64_freebsd.c"
-      - "stand/efi/loader/arch/arm64/elf64_freebsd.c"
+      - "stand/efi/loader/arch/arm64/exec.c"
+      - "stand/efi/loader/bootinfo.c"
     focus: >
       Document how loader.efi loads the kernel, passes the EFI memory map,
       and hands off control. Compare x86_64 and ARM64 boot metadata mechanisms.
@@ -103,6 +105,7 @@ chapters:
       - "sys/vm/vm_page.c"
       - "sys/vm/vm_map.c"
       - "sys/vm/vm_object.c"
+      - "sys/vm/vm_fault.c"
       - "sys/vm/pmap.h"
       - "sys/amd64/amd64/pmap.c"
     focus: >
@@ -122,8 +125,9 @@ chapters:
     source_files:
       - "sys/kern/kern_fork.c"
       - "sys/kern/kern_exit.c"
+      - "sys/kern/kern_thread.c"
       - "sys/kern/sched_4bsd.c"
-      - "sys/kern/sys_process.c"
+      - "sys/kern/sched_ule.c"
     focus: >
       Cover process creation (fork/exec), the process struct (struct proc),
       thread representation (struct thread), and the 4BSD scheduler.
@@ -137,11 +141,11 @@ chapters:
   - title: "The Buffer Cache and I/O Subsystem"
     output_file: "sys/vm/README_bcache.md"
     source_dirs:
-      - "sys/vm"
+      - "sys/kern"
       - "sys/sys"
     source_files:
-      - "sys/vm/buf2.c"
-      - "sys/vm/pageable.c"
+      - "sys/kern/vfs_bio.c"
+      - "sys/kern/vfs_cluster.c"
       - "sys/sys/buf.h"
     focus: >
       Explain the buffer cache (buf), its relationship to the VM system,
@@ -162,6 +166,7 @@ chapters:
       - "sys/kern/vfs_mount.c"
       - "sys/kern/vfs_lookup.c"
       - "sys/kern/vfs_syscalls.c"
+      - "sys/kern/vfs_cache.c"
       - "sys/sys/mount.h"
       - "sys/sys/vnode.h"
     focus: >
@@ -180,7 +185,7 @@ chapters:
       - "sys/ufs"
     source_files:
       - "sys/ufs/ufs/ufsmount.h"
-      - "sys/ufs/ufs/ufs_extern.h"
+      - "sys/ufs/ffs/fs.h"
       - "sys/ufs/ffs/ffs_alloc.c"
       - "sys/ufs/ffs/ffs_softdep.c"
     focus: >
@@ -199,7 +204,9 @@ chapters:
       - "sys/net"
       - "sys/netinet"
     source_files:
-      - "sys/net/socket.c"
+      - "sys/kern/uipc_socket.c"
+      - "sys/kern/uipc_sockbuf.c"
+      - "sys/kern/uipc_mbuf.c"
       - "sys/net/netisr.c"
       - "sys/net/if.c"
       - "sys/netinet/ip_input.c"
@@ -222,8 +229,7 @@ chapters:
       - "sys/dev"
     source_files:
       - "sys/kern/subr_bus.c"
-      - "sys/kern/bus.h"
-      - "sys/dev/cd9660/cd9660_node.c"
+      - "sys/sys/bus.h"
     focus: >
       Document the FreeBSD bus/device/driver framework: how devices are
       enumerated, how drivers attach, and the resource management system.
@@ -242,7 +248,8 @@ chapters:
       - "sys/arm64/arm64"
     source_files:
       - "sys/kern/kern_intr.c"
-      - "sys/amd64/amd64/machintr.c"
+      - "sys/x86/x86/intr_machdep.c"
+      - "sys/arm64/arm64/gic_v3.c"
     focus: >
       Explain how FreeBSD handles hardware interrupts: from the hardware
       interrupt through the IDT/GIC to the ithread framework. Cover
@@ -278,7 +285,7 @@ chapters:
     source_files:
       - "Makefile.inc1"
       - "share/mk/bsd.sys.mk"
-      - "share/mk/bsd.kern.mk"
+      - "share/mk/bsd.kmod.mk"
       - "share/mk/bsd.prog.mk"
     focus: >
       Explain how FreeBSD builds: the Makefile hierarchy, .conf files,
