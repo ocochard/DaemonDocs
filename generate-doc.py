@@ -2171,7 +2171,14 @@ def create_writer_agent(index: TfidfIndex):
             ResolveCDefinition(),
         ],
         model=model,
-        additional_authorized_imports=["re", "os", "pathlib", "json"],
+        # Deliberately exclude `os` and `pathlib`: the writer has no
+        # legitimate need for filesystem access (its tools cover all
+        # source reads), and authorizing them lets the model bypass the
+        # "no file I/O" prompt rule by writing chapter content to
+        # /tmp/corrected_chapter.md and returning a status string —
+        # exactly the drift mode the prompt warns against. Keeping the
+        # sandbox honest is more reliable than relying on the prompt.
+        additional_authorized_imports=["re", "json"],
         max_steps=40,
     )
 
