@@ -18,8 +18,13 @@ Usage:
   python3 FreeBSD/generate-doc.py --reindex       # rebuild book index from scratch
 
 Environment:
-  FREEBSD_SRC  — root of FreeBSD git tree (default: $HOME/freebsd-src)
-  BOOKS_DIR    — directory with PDF/CHM/EPUB books (default: $HOME/books)
+  FREEBSD_SRC      — root of FreeBSD git tree (default: $HOME/freebsd-src)
+  BOOKS_DIR        — directory with PDF/CHM/EPUB books (default: $HOME/books)
+  OPENAI_BASE_URL  — LLM endpoint (default: http://localhost:8080/v1)
+  OPENAI_API_KEY   — API key (default: "none", suitable for local llama-server)
+  OPENAI_MODEL     — model id / alias (default: qwen36-coder)
+                     Each of the three OPENAI_* vars overrides one field
+                     of MODEL_CONFIG independently.
 
 Requirements:
   python3 -m pip install --user -r FreeBSD/requirements.txt
@@ -71,10 +76,15 @@ FREEBSD_DOC = os.path.expandvars(
 # (used for chat-completion routing). The real underlying model name —
 # e.g. the GGUF filename — is fetched from /v1/models at runtime via
 # resolve_real_model_name() and used in the provenance footer.
+#
+# Each field can be overridden independently via the standard OpenAI
+# client env vars (OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL), so the
+# same script can target a local llama-server (default) or any
+# OpenAI-compatible endpoint without code edits.
 MODEL_CONFIG = {
-    "model_id": "qwen36-coder",
-    "api_base": "http://localhost:8080/v1",
-    "api_key": "none",
+    "model_id": os.environ.get("OPENAI_MODEL", "qwen36-coder"),
+    "api_base": os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1"),
+    "api_key": os.environ.get("OPENAI_API_KEY", "none"),
 }
 
 # Resolved at startup by resolve_model_provenance(); cached for the run.
