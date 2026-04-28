@@ -1780,8 +1780,45 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
     """Build the review prompt for the reviewer agent."""
     questions = chapter.get("key_questions", [])
     src_files = chapter.get("source_files", [])
+    src_dirs = chapter.get("source_dirs", []) or []
     diagram = chapter.get("mermaid", "flowchart")
     question_text = "\n".join(f"- {q}" for q in questions)
+
+    # Pre-validate every source path so we can inject ground truth and
+    # block the reviewer from hallucinating "this file does not exist."
+    # The reviewer agent has no source-tree access (its only tool is
+    # search_books). When the writer correctly cites a file, the
+    # reviewer otherwise has no way to verify presence — and we've
+    # observed it confidently asserting non-existence of real files
+    # (e.g., sys/kern/kern_thread.c), which then poisons the revision
+    # loop because the writer is told to "fix" a non-issue.
+    verified_paths: List[str] = []
+    missing_paths: List[str] = []
+    for path in list(src_files) + list(src_dirs):
+        full = os.path.join(SRC_ROOT, path)
+        if os.path.exists(full):
+            verified_paths.append(path)
+        else:
+            missing_paths.append(path)
+    if verified_paths:
+        verified_block = (
+            "## Verified Source Paths (DO NOT claim these don't exist)\n\n"
+            "The following paths have been confirmed to exist in the\n"
+            "FreeBSD source tree. If the draft cites any of them, treat\n"
+            "the citation as path-correct. You may still flag *misuse*\n"
+            "(e.g., wrong subsystem, wrong content) but NOT non-existence.\n\n"
+            + "\n".join(f"- `{p}` (exists)" for p in verified_paths)
+            + "\n"
+        )
+    else:
+        verified_block = ""
+    if missing_paths:
+        verified_block += (
+            "\nNote: the following expected paths are missing from the\n"
+            "tree and SHOULD be flagged if the draft cites them as if real:\n\n"
+            + "\n".join(f"- `{p}` (NOT FOUND)" for p in missing_paths)
+            + "\n"
+        )
 
     # Build the structure-rubric checklist from the chapter's section list.
     # If the chapter opted out of (e.g.) `Key Data Structures`, the reviewer
@@ -1807,6 +1844,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         ## Expected Source Files Referenced
         {chr(10).join(f"- {f}" for f in src_files)}
 
+        {verified_block}
         ## Review Rubric
 
         Grade each criterion PASS / FAIL with a brief explanation:
@@ -1817,6 +1855,14 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         2. **Accuracy** — Does the draft reference real FreeBSD concepts correctly?
            No invented structs, no made-up function names, no wrong file paths.
            Flag anything that looks like a hallucination.
+           IMPORTANT: you do NOT have direct access to the source tree.
+           You CANNOT verify whether an arbitrary file path exists. Do not
+           claim that a path "does not exist in the FreeBSD source tree"
+           unless the path appears in the "missing paths" list above —
+           paths in the "Verified Source Paths" list are confirmed to
+           exist. For paths in neither list, focus on whether their *use*
+           in the draft is consistent (right subsystem, right content),
+           not on whether they exist.
 
         3. **Source Coverage** — Are the expected source files examined and
            discussed? Not just listed — actually explained with code snippets.
@@ -2279,10 +2325,24 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         # ---- Review + revision loop ----
         # Strict gate: only stop when the reviewer truly approves. JSON parse
         # failures get one retry instead of being treated as approval.
+        #
+        # Best-draft tracking: revisions can regress. We've seen rounds go
+        # 3/7 → 6/7 → 5/7, with the writer introducing new hallucinations
+        # while patching old ones. Without this tracker we'd write the
+        # last (worse) draft. Instead we keep the draft from the round
+        # with the fewest FAIL criteria; ties go to the *later* round
+        # (later drafts have had more issues addressed even if criteria
+        # count is unchanged). best_fails starts at 8 — strictly worse
+        # than any real review (max possible is 7) — so the very first
+        # graded draft always wins on first comparison.
         warnings: List[str] = []
         revision = 0
         approved = False
         parse_retry_used = False
+        best_draft = draft
+        best_fails = 8
+        best_round = 0
+        last_fails: Optional[int] = None  # fail_count of the most recent graded round
 
         while max_revisions > 0 and revision < max_revisions:
             revision += 1
@@ -2323,6 +2383,16 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 for p in praise:
                     print(f"         ✓ {p}")
 
+            # Track the best draft we've seen so far (fewest FAIL criteria).
+            # `<=` not `<`: ties go to the more recent round because later
+            # drafts have had earlier issues addressed even when the FAIL
+            # count is unchanged.
+            last_fails = fail_count
+            if fail_count <= best_fails:
+                best_draft = draft
+                best_fails = fail_count
+                best_round = revision
+
             if _review_passes(review_json):
                 print(f"  [review {revision}] chapter passes — no revision needed")
                 approved = True
@@ -2356,6 +2426,27 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         if max_revisions > 0 and not approved:
             print("  ⚠ review loop exited without explicit approval — "
                   "writing draft but flagging as unverified")
+            # Roll back to the best draft we saw if revisions regressed.
+            # We've observed rounds going 3/7 → 6/7 → 5/7 where the final
+            # draft has more hallucinations than an earlier round.
+            # Only roll back when the current draft is *strictly* worse
+            # than the best one seen — equal-quality later rounds keep
+            # the more recent draft (later prose tends to be cleaner).
+            if (
+                best_round > 0
+                and best_round != revision
+                and last_fails is not None
+                and last_fails > best_fails
+            ):
+                print(f"  [rollback] revision {revision} regressed "
+                      f"({7 - last_fails}/7) — using revision {best_round} "
+                      f"({7 - best_fails}/7) instead")
+                draft = best_draft
+                warnings.append(
+                    f"revisions regressed; kept revision {best_round} "
+                    f"({7 - best_fails}/7 criteria) over revision {revision} "
+                    f"({7 - last_fails}/7)"
+                )
 
         # ---- Fact-checking pass ----
         print("  [fact-check] verifying paths, structs, funcs, options, "
