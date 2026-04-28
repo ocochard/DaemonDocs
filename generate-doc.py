@@ -1804,6 +1804,18 @@ def build_chapter_prompt(chapter: dict) -> str:
           files and call `final_answer(content)` directly with the content
           string you already built.
 
+        **Code blocks must be Python — NOT shell.** Your code blocks are
+        executed by a Python interpreter, not a shell. Lines like
+        `grep -n "FOO" file | head -50`, `cat file`, `ls dir/`, or any
+        bare command-line invocation will fail with
+        `SyntaxError: invalid syntax` and waste a step. To search source,
+        use the provided tools: `read_freebsd_source(path=...)` to read a
+        whole file, `search_books(query=...)` for theory, and
+        `resolve_c_definition(symbol=...)` for struct/function lookups.
+        If you need to filter the text of a file you've already read,
+        do it in Python (e.g., `[l for l in text.splitlines() if "SUBDIR" in l]`),
+        not via shell pipes.
+
         **No marketing language.** This is a technical reference, not a
         product brochure. Forbidden words and phrases — do NOT use any of
         them, even rephrased: comprehensive, robust, seamless, seamlessly,
