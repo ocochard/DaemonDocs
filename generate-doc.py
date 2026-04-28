@@ -1891,8 +1891,9 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
 def build_revision_prompt(chapter: dict, draft: str, review: str) -> str:
     """Build the revision prompt for the writer agent to fix issues."""
     return textwrap.dedent(f"""\
-        You are revising a chapter for "FreeBSD Internals."
-        A reviewer found issues — fix them all.
+        You are revising an existing chapter for "FreeBSD Internals."
+        A reviewer found specific issues — fix ONLY those, leave the
+        rest of the draft untouched.
 
         ## Chapter: {chapter['title']}
 
@@ -1904,20 +1905,43 @@ def build_revision_prompt(chapter: dict, draft: str, review: str) -> str:
 
         {draft}
 
-        ## Your Task
+        ## Your Task — PATCH MODE, NOT REWRITE MODE
 
-        1. Address EVERY issue in the reviewer's list.
-        2. For each fix, use read_freebsd_source to verify the correct
-           struct definitions, function signatures, and file paths.
-        3. Keep everything the reviewer praised — don't rewrite good sections.
-        4. If the reviewer flagged a hallucinated struct/function, look up
-           the REAL definition in the source code and correct it.
-        5. If the Mermaid diagram was flagged, fix the syntax and make sure
-           it accurately represents the subsystem.
+        Treat this like a code-review patch: minimal, targeted edits.
 
-        Output ONLY the complete corrected Markdown — no preamble, no
-        explanation of changes. The reader should not see the review process,
-        only the final polished chapter.
+        1. Address EVERY issue the reviewer listed — but ONLY those issues.
+           Do NOT rewrite paragraphs the reviewer didn't flag, even if you
+           think you can phrase them better.
+        2. Do NOT re-explore the source tree. The draft below is already
+           grounded in source. Only call `read_freebsd_source` /
+           `resolve_c_definition` when the reviewer flagged a SPECIFIC
+           hallucinated struct field, function signature, macro name, or
+           file path that you must verify. One-or-two targeted lookups,
+           not a fresh exploration.
+        3. Keep everything the reviewer praised — copy those sentences
+           through verbatim.
+        4. If the reviewer flagged a hallucinated symbol, replace it with
+           the verified real one in-place. Do not delete the surrounding
+           paragraph unless the whole point was wrong.
+        5. If the Mermaid diagram was flagged, fix only the broken edge
+           or label. Do not redraw the whole diagram.
+
+        ## Step Budget
+
+        You have a hard step limit. Each tool call costs a step, and if
+        you run out before emitting the corrected chapter via
+        `final_answer(...)`, your work is discarded and the unrevised
+        draft is kept. A typical revision should need 0–3 source-tree
+        lookups. Spend your steps on writing, not on browsing.
+
+        ## Output
+
+        Output ONLY the complete corrected Markdown via `final_answer(...)`.
+        No preamble, no explanation of changes, no diff. The reader should
+        not see the review process, only the final polished chapter.
+        IMPORTANT: emit the FULL chapter text — every section, including
+        the parts you didn't change. Truncating the chapter is worse than
+        leaving the original issues in.
     """).lstrip()
 
 
@@ -3045,8 +3069,9 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
         )
 
     return textwrap.dedent(f"""\
-        You are revising a chapter for "FreeBSD Internals."
-        A fact-checking pass found issues with your draft.
+        You are revising an existing chapter for "FreeBSD Internals."
+        A fact-checking pass found specific symbol/path issues — fix
+        ONLY those, leave the rest of the draft untouched.
 
         ## Chapter: {chapter['title']}
 
@@ -3058,17 +3083,35 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
 
         {draft}
 
-        ## Your Task
+        ## Your Task — PATCH MODE, NOT REWRITE MODE
 
-        1. Fix EVERY fact-checking issue listed above.
-        2. For corrected paths, use the correct path.
-        3. For missing structs/functions, look them up in the actual source
-           code using read_freebsd_source. If they truly don't exist, remove
-           the reference.
-        4. Keep everything else unchanged.
+        Treat this like a code-review patch: minimal, targeted edits.
 
-        Output ONLY the complete corrected Markdown — no preamble, no
-        explanation of changes.
+        1. Fix EVERY issue listed above — but ONLY those issues. Do not
+           rewrite paragraphs that weren't flagged.
+        2. For corrected paths, just substitute the correct path in place.
+        3. For a missing struct/function, replace it with a verified real
+           one OR remove just that reference. Prefer replacement.
+        4. Do NOT re-explore the source tree broadly. Only call
+           `read_freebsd_source` / `resolve_c_definition` for the SPECIFIC
+           symbols flagged above — one targeted lookup per symbol, not a
+           tree walk.
+        5. Keep everything else unchanged. Copy unflagged paragraphs
+           through verbatim.
+
+        ## Step Budget
+
+        You have a hard step limit. Each tool call costs a step, and if
+        you run out before emitting the corrected chapter via
+        `final_answer(...)`, your work is discarded and the unfixed draft
+        is kept (with hallucinations still in it). Keep lookups
+        surgical.
+
+        ## Output
+
+        Output ONLY the complete corrected Markdown via `final_answer(...)`.
+        No preamble, no explanation of changes, no diff. Emit the FULL
+        chapter — every section, including parts you didn't change.
     """).lstrip()
 
 
@@ -3540,8 +3583,8 @@ def main():
         help="Show what would happen without running agents.",
     )
     parser.add_argument(
-        "--max-revisions", type=int, default=2,
-        help="Max review+revise rounds per chapter (0 = no review, default=2).",
+        "--max-revisions", type=int, default=3,
+        help="Max review+revise rounds per chapter (0 = no review, default=3).",
     )
     parser.add_argument(
         "--nav-only", action="store_true",
