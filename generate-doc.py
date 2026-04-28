@@ -676,14 +676,14 @@ def extract_freebsd_docs(src_root: str, corpus_file: str) -> int:
         "sys/kern/kern_jail.c",
         "sys/kern/vfs_mount.c",
         "sys/kern/vfs_lookup.c",
-        "sys/net/socket.c",
+        "sys/kern/uipc_socket.c",
         "sys/net/netisr.c",
         "sys/net/if.c",
         "sys/netinet/ip_input.c",
         "sys/ufs/ffs/ffs_softdep.c",
         "sys/kern/subr_bus.c",
         "sys/kern/kern_intr.c",
-        "sys/vm/buf2.c",
+        "sys/kern/vfs_bio.c",
     ]
     for kp in key_paths_for_log:
         full = os.path.join(src_root, kp)
