@@ -1875,13 +1875,17 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         }}
 
         Grading rule (NO exceptions):
-          - If ANY criterion is FAIL → `grade` MUST be "NEEDS_REVISION".
-          - If `issues` is non-empty → `grade` MUST be "NEEDS_REVISION".
-          - `grade` is "PASS" only when every criterion is PASS AND `issues`
-            is an empty list.
-        Do NOT mark a draft PASS while still listing FAIL criteria or issues —
-        the downstream gate will reject that as inconsistent and waste a
-        revision slot.
+          - If ANY criterion is FAIL → `grade` MUST be "NEEDS_REVISION",
+            and the FAILing criterion MUST have a corresponding entry in
+            `issues` describing what to fix.
+          - If every criterion is PASS, `grade` is "PASS". You MAY still
+            list nice-to-have refinements in `issues`, but they are
+            informational only and will not trigger another revision —
+            so reserve them for genuinely worthwhile polish, not nitpicks.
+          - Never mark a criterion PASS while describing a hallucination,
+            wrong fact, or missing required content — that is what FAIL
+            is for. Honest FAIL grades are far more useful than padded
+            PASS grades.
 
         Be specific in issues: "The struct vm_page is described with fields that
         don't match sys/vm/vm_page.h" not "the data structures section is weak."
@@ -2092,28 +2096,27 @@ def load_chapters() -> List[dict]:
 
 
 def _review_passes(review_json: Optional[dict]) -> bool:
-    """Strict review gate: only return True if the reviewer truly approved.
+    """Review gate: criteria are the canonical assessment, not `grade`/`issues`.
 
-    The previous logic accepted a chapter if `grade == "PASS"` *or* the
-    `issues` list was empty — which silently approved drafts when the
-    reviewer graded FAIL but forgot to populate issues, or when the JSON
-    was malformed and `grade` defaulted to PASS.
+    History: an earlier version accepted on grade==PASS *or* empty issues,
+    which silently approved drafts where individual criteria said FAIL.
+    The over-correction was to also require empty issues — but that ran
+    into a second failure mode where the reviewer marks all 7 criteria
+    PASS and still pads `issues` with stylistic nits, forcing another
+    revision round (and risking regressions where the writer reintroduces
+    bugs we already fixed).
 
-    The new gate requires:
+    The current gate trusts the **criteria** dict as ground truth:
       - the reviewer returned parseable JSON,
-      - `grade` is exactly `"PASS"`,
       - `criteria` is a dict and **every** value is a string that does not
         start with `"FAIL"` (so a missing/typo'd criterion doesn't sneak
-        through),
-      - `issues` is empty.
+        through and a real FAIL always blocks).
 
-    Anything else means the chapter still needs work.
+    `grade` and `issues` are intentionally NOT consulted here. The reviewer
+    prompt now treats `issues` as informational when all criteria pass; if
+    a real defect exists, it must surface as a FAIL criterion.
     """
     if not isinstance(review_json, dict):
-        return False
-    if review_json.get("grade") != "PASS":
-        return False
-    if review_json.get("issues"):
         return False
     criteria = review_json.get("criteria")
     if not isinstance(criteria, dict) or not criteria:
@@ -2179,11 +2182,13 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 criterion stamps (PASS / FAIL: <reason>). Does NOT modify
                 the draft. JSON parse failures get one retry before the
                 chapter is marked unapproved.
-        Gate:   _review_passes — strict (grade == PASS AND empty issues
-                AND no FAIL criteria). Loosening this is a known anti-fix:
-                the reviewer often returns grade=PASS while individual
-                criteria say FAIL, and silently approving those degrades
-                output quality.
+        Gate:   _review_passes — criteria-driven. Approves when every
+                criterion in `criteria` starts with "PASS" (and the dict
+                is well-formed). `grade` and `issues` are intentionally
+                ignored: real defects must surface as FAIL criteria, and
+                non-FAIL `issues` are informational (otherwise we waste
+                revision rounds chasing stylistic nits and risk the writer
+                regressing earlier fact fixes during the revision pass).
 
     Step 3 — REVISE (writer)  [only when review fails]
         Input:  build_revision_prompt(chapter, draft, review_raw) — original
