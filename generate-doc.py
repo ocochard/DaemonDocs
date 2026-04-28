@@ -1661,43 +1661,58 @@ def build_chapter_prompt(chapter: dict) -> str:
     )
     step_n += 1
 
+    # Diagram is only required if the chapter actually includes the
+    # "Flow / Diagram" section. Chapters that opt out via `sections:` in
+    # chapters.yaml should not be told to produce a diagram, otherwise
+    # the writer creates one anyway and the reviewer flags it on every
+    # revision round.
+    sections_for_writer = _chapter_sections(chapter)
+    wants_diagram = "Flow / Diagram" in sections_for_writer
+
     question_text = "\n".join(f"    - {q}" for q in questions)
+    requirements = [
+        "    - **Quick Summary** — 3-4 paragraphs, no code (beginners)",
+        "    - **Deep Dive** — source code walkthrough, struct analysis (intermediate)",
+        "    - **Advanced Notes** — debugging with DTrace, performance, pitfalls (advanced)",
+        f"    - Addresses these key questions:\n{question_text}",
+    ]
+    if wants_diagram:
+        requirements.append(f"    - Includes a Mermaid {diagram} diagram (see below)")
+    requirements.extend([
+        "    - References specific source files with line-level details",
+        "    - Connects theory (from books) to implementation (from source)",
+    ])
     steps.append(
         f"STEP {step_n}: Write a README.md with three reading levels:\n"
-        f"    - **Quick Summary** — 3-4 paragraphs, no code (beginners)\n"
-        f"    - **Deep Dive** — source code walkthrough, struct analysis (intermediate)\n"
-        f"    - **Advanced Notes** — debugging with DTrace, performance, pitfalls (advanced)\n"
-        f"    - Addresses these key questions:\n{question_text}\n"
-        f"    - Includes a Mermaid {diagram} diagram (see below)\n"
-        f"    - References specific source files with line-level details\n"
-        f"    - Connects theory (from books) to implementation (from source)"
+        + "\n".join(requirements)
     )
 
-    diagram_hints = {
-        "sequence": (
-            "    - Mermaid sequence diagram: show the flow of control/data\n"
-            "      between components (e.g., [UEFI] → [loader] → [kernel])\n"
-            "      Use: ```mermaid\\nsequenceDiagram\\n  Participant A\\n  A->>B: action\n"
-            "      ```"
-        ),
-        "flowchart": (
-            "    - Mermaid flowchart: show the data flow or component hierarchy\n"
-            "      Use: ```mermaid\\nflowchart TD\\n  A[Component] --> B[Subcomponent]\n"
-            "      ```"
-        ),
-        "class": (
-            "    - Mermaid class diagram: show key structs and their relationships\n"
-            "      Use: ```mermaid\\nclassDiagram\\n  class StructName {\\n    +field type\\n  }\n"
-            "      ```"
-        ),
-        "state": (
-            "    - Mermaid state diagram: show state transitions\n"
-            "      Use: ```mermaid\\nstateDiagram-v2\\n  [*] --> Idle\\n  Idle --> Active: event\n"
-            "      ```"
-        ),
-    }
+    if wants_diagram:
+        diagram_hints = {
+            "sequence": (
+                "    - Mermaid sequence diagram: show the flow of control/data\n"
+                "      between components (e.g., [UEFI] → [loader] → [kernel])\n"
+                "      Use: ```mermaid\\nsequenceDiagram\\n  Participant A\\n  A->>B: action\n"
+                "      ```"
+            ),
+            "flowchart": (
+                "    - Mermaid flowchart: show the data flow or component hierarchy\n"
+                "      Use: ```mermaid\\nflowchart TD\\n  A[Component] --> B[Subcomponent]\n"
+                "      ```"
+            ),
+            "class": (
+                "    - Mermaid class diagram: show key structs and their relationships\n"
+                "      Use: ```mermaid\\nclassDiagram\\n  class StructName {\\n    +field type\\n  }\n"
+                "      ```"
+            ),
+            "state": (
+                "    - Mermaid state diagram: show state transitions\n"
+                "      Use: ```mermaid\\nstateDiagram-v2\\n  [*] --> Idle\\n  Idle --> Active: event\n"
+                "      ```"
+            ),
+        }
 
-    steps.append(f"    - Diagram format hint:{diagram_hints.get(diagram, '')}")
+        steps.append(f"    - Diagram format hint:{diagram_hints.get(diagram, '')}")
 
     # Build the section template from the chapter's section list. Each
     # chapter may opt out of irrelevant sections via `sections:` in
@@ -1710,7 +1725,7 @@ def build_chapter_prompt(chapter: dict) -> str:
     # *other* body line therefore needs 8 leading spaces of its own to
     # land at the same column after dedent. Pre-indenting only the lines
     # *after* the first achieves that.
-    sections = _chapter_sections(chapter)
+    sections = sections_for_writer
     template_blocks = []
     for name in sections:
         body = _SECTION_CATALOG[name]["template_body"].format(diagram=diagram)
@@ -1859,6 +1874,24 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
     ]
     structure_checklist = "\n".join(structure_lines)
 
+    # Mermaid criterion is conditional: chapters that omit "Flow / Diagram"
+    # from their section list don't need a diagram, and grading them on one
+    # would fail every revision round.
+    wants_diagram = "Flow / Diagram" in sections
+    if wants_diagram:
+        mermaid_criterion = (
+            f"        4. **Mermaid Diagram** — Is there a valid Mermaid {diagram} diagram?\n"
+            f"           Check syntax: correct keywords, no missing brackets, proper arrows.\n"
+            f"           Does it actually illustrate the subsystem (not a generic placeholder)?\n"
+        )
+        mermaid_json_line = '            "mermaid_diagram": "PASS/FAIL: reason",\n'
+    else:
+        mermaid_criterion = (
+            "        4. **Mermaid Diagram** — N/A for this chapter (no Flow / Diagram\n"
+            "           section). Always grade `mermaid_diagram` as `PASS: not required`.\n"
+        )
+        mermaid_json_line = '            "mermaid_diagram": "PASS: not required",\n'
+
     return textwrap.dedent(f"""\
         You are reviewing a draft chapter for "FreeBSD Internals."
         Your job is to find problems — be strict but fair.
@@ -1894,10 +1927,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         3. **Source Coverage** — Are the expected source files examined and
            discussed? Not just listed — actually explained with code snippets.
 
-        4. **Mermaid Diagram** — Is there a valid Mermaid {diagram} diagram?
-           Check syntax: correct keywords, no missing brackets, proper arrows.
-           Does it actually illustrate the subsystem (not a generic placeholder)?
-
+{mermaid_criterion}
         5. **Accessibility** — Is the tone educational? Does it explain
            WHY things work, not just WHAT they do? Are there analogies or
            connections to OS theory?
@@ -1933,8 +1963,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
             "completeness": "PASS/FAIL: reason",
             "accuracy": "PASS/FAIL: reason",
             "source_coverage": "PASS/FAIL: reason",
-            "mermaid_diagram": "PASS/FAIL: reason",
-            "accessibility": "PASS/FAIL: reason",
+{mermaid_json_line}            "accessibility": "PASS/FAIL: reason",
             "structure": "PASS/FAIL: reason",
             "no_marketing": "PASS/FAIL: reason (quote any offending sentences)"
           }},
