@@ -1772,6 +1772,23 @@ def build_chapter_prompt(chapter: dict) -> str:
         - If you cannot fill a section with real content, write "See related
           chapters for coverage of this topic" rather than skipping it
 
+        **How to return your work — READ THIS CAREFULLY:**
+        - You MUST return the complete Markdown chapter as the single argument
+          to `final_answer(...)`. Example: `final_answer(content)` where
+          `content` is the full chapter string.
+        - There is NO file-write tool available to you. `open()`, `Path.write_text`,
+          `os.write`, and any other file I/O are FORBIDDEN and will raise
+          `InterpreterError`. Do NOT try to write `/tmp/chapter.md`,
+          `output.md`, or any other file — the pipeline writes the file for
+          you AFTER you return.
+        - Do NOT return a status string like "README.md successfully written".
+          That is not the chapter — that is a summary. Return the actual
+          Markdown body, headers and all, starting with `# {chapter['title']}`.
+        - If your code execution hits a `Forbidden function evaluation` error
+          for `open` or similar, that is a signal to stop trying to write
+          files and call `final_answer(content)` directly with the content
+          string you already built.
+
         **No marketing language.** This is a technical reference, not a
         product brochure. Forbidden words and phrases — do NOT use any of
         them, even rephrased: comprehensive, robust, seamless, seamlessly,
@@ -2326,11 +2343,44 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             print(f"  ✗ initial draft failed: {e}")
             return False
 
-        # Defensive: if the very first draft is a stub, fail fast — there's
-        # nothing to roll back to.
+        # Defensive: if the very first draft is a stub, retry once with a
+        # pointed reminder. We've observed the writer drift into
+        # "I'm a coding agent that writes files" mode — it builds the
+        # content, hits the open() ban, and eventually returns a status
+        # string ("README.md successfully written...") via final_answer
+        # instead of the chapter. _looks_like_stub catches that. A single
+        # retry with an even more explicit prompt tends to recover.
         if _looks_like_stub(draft):
-            print("  ✗ initial draft looks truncated/stub — aborting chapter")
-            return False
+            print("  ⚠ initial draft looks truncated/stub — retrying once "
+                  "with explicit final_answer instructions ...")
+            retry_prompt = (
+                prompt
+                + "\n\n---\n\n"
+                + "**RETRY — your previous attempt was rejected as a stub.**\n\n"
+                + "You likely returned a short status string (e.g.\n"
+                + "'README.md successfully written...') or tried to write\n"
+                + "the chapter to a file. NEITHER works.\n\n"
+                + "Do this instead, exactly:\n"
+                + "1. Build the complete Markdown content as a Python string\n"
+                + "   variable (call it `content`).\n"
+                + "2. Call `final_answer(content)`. The return value of\n"
+                + "   final_answer IS the chapter — it must be the full\n"
+                + "   Markdown body starting with `# " + chapter['title'] + "`.\n"
+                + "3. Do NOT call open(), Path.write_text, or any file I/O.\n"
+                + "   They are forbidden and will raise InterpreterError.\n"
+                + "4. The pipeline writes the file once you return. Your job\n"
+                + "   is to return the content string — nothing else.\n"
+            )
+            try:
+                draft = _run_agent(writer, "draft-retry", retry_prompt)
+            except Exception as e:
+                print(f"  ✗ initial draft retry failed: {e}")
+                return False
+            if _looks_like_stub(draft):
+                print("  ✗ initial draft retry still produced a stub — "
+                      "aborting chapter")
+                return False
+            print("  ✓ retry produced a real draft, continuing")
 
         # ---- Review + revision loop ----
         # Strict gate: only stop when the reviewer truly approves. JSON parse
