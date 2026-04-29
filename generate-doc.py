@@ -8,6 +8,7 @@ access to:
   - The FreeBSD source code  (read_freebsd_source)
   - A semantic search index of FreeBSD books (search_books)
   - The source tree structure (explore_tree)
+  - Per-directory structured summaries (directory_map)
 
 Usage:
   python3 FreeBSD/generate-doc.py                 # run all chapters
@@ -1194,6 +1195,276 @@ class ExploreTree(Tool):
 
 
 # ---------------------------------------------------------------------------
+# 3c2. Directory Map Tool (structured one-level summary of a directory)
+# ---------------------------------------------------------------------------
+
+# Per-tool budget. The writer agent has a max_steps budget and a context
+# window; a single directory_map call must fit comfortably in both.
+_DIRMAP_OUTPUT_CAP = 6000
+_DIRMAP_FILE_LIMIT = 60     # max .c/.h files summarised per call
+_DIRMAP_FILE_SIZE_CAP = 256 * 1024   # skip giant generated files
+_DIRMAP_NAMES_PER_FILE = 6  # max symbols listed per file
+_DIRMAP_HEADER_COMMENT_CAP = 240
+
+
+def _file_header_comment(text: str) -> str:
+    """Extract the first /* ... */ comment near the top of a C file.
+
+    Many FreeBSD source files have a one-paragraph "what this file does"
+    comment right after the BSD license block. We:
+      1. Cut the search window at the first non-comment, non-include
+         token (`#define`, `struct`, `typedef`, function decl, etc.)
+         so trailing comments like `/* !_FOO_H_ */` after a
+         `#endif` don't get treated as the file purpose.
+      2. Skip the license block (comments that contain 'Copyright' or
+         'Redistribution and use').
+      3. Skip header-guard echo comments (`/* _FOO_H_ */`,
+         `/* !_FOO_H_ */`) that some header authors place on the
+         closing `#endif`.
+
+    Returns "" when no usable comment is found.
+    """
+    # Bound the window: stop at the first line that looks like the
+    # start of code (a #define, a struct/typedef/enum, or a likely
+    # function declaration). Until that line, we are still in the
+    # header preamble where a purpose comment would live.
+    code_start = re.search(
+        r'(?m)^\s*(?:#define\s|struct\s+\w+\s*\{|typedef\s|enum\s+\w*\s*\{'
+        r'|extern\s|static\s|void\s|int\s|char\s|uint\w*\s|u_int\w*\s)',
+        text,
+    )
+    end = code_start.start() if code_start else 4000
+    # Also cap at 6 KB regardless of where code starts, in case the
+    # file has no obvious code marker in the first 6 KB.
+    end = min(end, 6000)
+    head = text[:end]
+
+    matches = list(re.finditer(r'/\*(.*?)\*/', head, re.DOTALL))
+    for m in matches:
+        body = m.group(1)
+        if 'Copyright' in body or 'Redistribution and use' in body:
+            continue
+        # Strip leading-asterisk noise that pretty-prints multi-line
+        # block comments.
+        cleaned = re.sub(r'(?m)^\s*\*\s?', '', body).strip()
+        if not cleaned:
+            continue
+        # Skip header-guard echo comments: a single token like
+        # `_FOO_H_`, `!_FOO_H_`, or `__FOO_H__`. These are conventional
+        # closing markers and never describe what a file does.
+        if re.fullmatch(r'!?_+\w+_+', cleaned):
+            continue
+        if len(cleaned) > _DIRMAP_HEADER_COMMENT_CAP:
+            cleaned = cleaned[:_DIRMAP_HEADER_COMMENT_CAP].rstrip() + '…'
+        # Collapse internal whitespace so the line is compact in the
+        # tool output.
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        return cleaned
+    return ""
+
+
+def _dirmap_extract_names(content: str) -> Tuple[List[str], List[str]]:
+    """Return (struct_names, func_names) extracted from one C/H file.
+
+    Reuses the same regex strategy as _extract_struct_defs and
+    _extract_func_sigs, but returns just names (no field lists or file
+    annotations) so the directory map stays terse.
+    """
+    structs = []
+    seen_structs = set()
+    for m in re.finditer(
+        r'^\s*struct\s+(\w+)\s*\{', content, re.MULTILINE
+    ):
+        name = m.group(1)
+        if name not in seen_structs:
+            seen_structs.add(name)
+            structs.append(name)
+
+    funcs = []
+    seen_funcs = set()
+    skip = {'if', 'else', 'while', 'for', 'switch', 'return',
+            'struct', 'union', 'enum', 'typedef', 'define',
+            'sizeof', 'do'}
+    for m in re.finditer(
+        r'^\s*(?:static\s+|inline\s+|extern\s+|__inline\s+)*'
+        r'[\w\s\*]+?\s+\*?(\w+)\s*\([^)]*\)\s*\{',
+        content,
+        re.MULTILINE,
+    ):
+        name = m.group(1)
+        if name in skip or name in seen_funcs:
+            continue
+        seen_funcs.add(name)
+        funcs.append(name)
+    return structs, funcs
+
+
+def _dirmap_makefile_srcs(makefile_text: str) -> List[str]:
+    """Extract SRCS-style file lists from a BSD Makefile.
+
+    BSD Makefiles list compilation inputs via SRCS=, KMOD=, and similar
+    assignments, possibly continued across lines with a trailing '\\'.
+    The output is informational ("here is what upstream actually
+    builds"), so a best-effort regex is enough — we don't try to handle
+    every conditional-include edge case.
+    """
+    srcs = []
+    for m in re.finditer(
+        r'^(SRCS|KMOD|PROG|PROGS|SUBDIR)\s*[+:]?=\s*((?:.|\\\n)*?)(?<!\\)$',
+        makefile_text, re.MULTILINE,
+    ):
+        kind = m.group(1)
+        body = m.group(2).replace('\\\n', ' ')
+        items = [t for t in body.split() if t and not t.startswith('#')]
+        if items:
+            srcs.append(f"{kind}= {' '.join(items[:20])}")
+    return srcs
+
+
+class DirectoryMap(Tool):
+    """Structured one-level summary of a FreeBSD source directory.
+
+    Cheaper than reading every file. Returns subdirectories,
+    Makefile build inputs, and per-file symbol summaries (struct
+    names, function names, top-of-file comment) for .c and .h
+    files. No recursion — call again on a subdir to drill in.
+
+    Designed to give the writer agent the orientation a human gets
+    from `ls` + `head` + `grep struct`, without burning multiple
+    read_freebsd_source steps on files that turn out to be
+    irrelevant.
+    """
+
+    name = "directory_map"
+    description = (
+        "Get a structured summary of one directory in the FreeBSD source "
+        "tree. Returns: subdirectories, Makefile SRCS/KMOD lines, and for "
+        "each .c/.h file the top-of-file comment plus struct and "
+        "function names defined in it. One level only — no recursion. "
+        "Use this BEFORE read_freebsd_source to find which file in a "
+        "directory is worth reading. Examples: 'sys/vm', 'sys/kern', "
+        "'sys/dev/usb'."
+    )
+    inputs = {
+        "path": {
+            "type": "string",
+            "description": "Directory path relative to FreeBSD src root",
+        }
+    }
+    output_type = "string"
+
+    def forward(self, path: str) -> str:
+        full = os.path.join(SRC_ROOT, path)
+        if not os.path.isdir(full):
+            return f"Not a directory: '{path}'"
+
+        try:
+            entries = sorted(os.listdir(full))
+        except Exception as e:
+            return f"Error listing {path}: {e}"
+
+        subdirs = []
+        c_h_files = []
+        makefile = None
+        for name in entries:
+            fp = os.path.join(full, name)
+            if os.path.isdir(fp):
+                subdirs.append(name)
+            elif name == 'Makefile' or name.startswith('Makefile.'):
+                # Only one Makefile per dir is the common case; if
+                # multiple exist (Makefile, Makefile.depend, etc.)
+                # prefer the plain one.
+                if makefile is None or name == 'Makefile':
+                    makefile = name
+            elif name.endswith('.c') or name.endswith('.h'):
+                c_h_files.append(name)
+
+        out_lines = [f"--- directory_map: {path} ---"]
+
+        if subdirs:
+            shown = subdirs[:40]
+            extra = (
+                f" (+{len(subdirs) - len(shown)} more)"
+                if len(subdirs) > len(shown) else ""
+            )
+            out_lines.append(
+                f"Subdirectories ({len(subdirs)}): "
+                + ", ".join(shown) + extra
+            )
+
+        if makefile:
+            try:
+                mk_text = Path(os.path.join(full, makefile)).read_text(
+                    errors="ignore"
+                )
+                srcs = _dirmap_makefile_srcs(mk_text)
+                if srcs:
+                    out_lines.append(f"\nMakefile build inputs ({makefile}):")
+                    for line in srcs[:6]:
+                        out_lines.append(f"  {line}")
+            except Exception:
+                pass  # Makefile read failure is non-fatal
+
+        files_listed = 0
+        files_skipped_size = 0
+        if c_h_files:
+            out_lines.append(
+                f"\nSource files ({len(c_h_files)} .c/.h, "
+                f"showing up to {_DIRMAP_FILE_LIMIT}):"
+            )
+            for name in c_h_files[:_DIRMAP_FILE_LIMIT]:
+                fp = os.path.join(full, name)
+                try:
+                    size = os.path.getsize(fp)
+                except OSError:
+                    continue
+                if size > _DIRMAP_FILE_SIZE_CAP:
+                    files_skipped_size += 1
+                    continue
+                try:
+                    text = Path(fp).read_text(errors="ignore")
+                except Exception:
+                    continue
+                header = _file_header_comment(text)
+                structs, funcs = _dirmap_extract_names(text)
+                line = f"\n  {name} ({size} bytes)"
+                if header:
+                    line += f"\n    purpose: {header}"
+                if structs:
+                    s_show = structs[:_DIRMAP_NAMES_PER_FILE]
+                    s_extra = (
+                        f" (+{len(structs) - len(s_show)} more)"
+                        if len(structs) > len(s_show) else ""
+                    )
+                    line += "\n    structs: " + ", ".join(s_show) + s_extra
+                if funcs:
+                    f_show = funcs[:_DIRMAP_NAMES_PER_FILE]
+                    f_extra = (
+                        f" (+{len(funcs) - len(f_show)} more)"
+                        if len(funcs) > len(f_show) else ""
+                    )
+                    line += "\n    functions: " + ", ".join(f_show) + f_extra
+                out_lines.append(line)
+                files_listed += 1
+
+            if files_skipped_size:
+                out_lines.append(
+                    f"\n({files_skipped_size} file(s) skipped: too large — "
+                    f"call read_freebsd_source explicitly if needed)"
+                )
+            if len(c_h_files) > _DIRMAP_FILE_LIMIT:
+                out_lines.append(
+                    f"\n(+{len(c_h_files) - _DIRMAP_FILE_LIMIT} more "
+                    f"file(s) not shown — refine to a subdirectory)"
+                )
+
+        result = "\n".join(out_lines)
+        if len(result) > _DIRMAP_OUTPUT_CAP:
+            result = result[:_DIRMAP_OUTPUT_CAP] + "\n… (truncated)"
+        return result
+
+
+# ---------------------------------------------------------------------------
 # 3d. Follow-Imports Tool (trace #include to resolve struct defs)
 # ---------------------------------------------------------------------------
 
@@ -1639,6 +1910,18 @@ def build_chapter_prompt(chapter: dict) -> str:
         steps.append(f"STEP {step_n}: Understand the context from the files below.")
         step_n += 1
 
+    if src_dirs:
+        steps.append(
+            f"STEP {step_n}: For each directory, call directory_map(path=...) "
+            "BEFORE reading files. directory_map returns one structured\n"
+            "        block listing subdirs, Makefile build inputs, and per-file\n"
+            "        struct/function names. Use it to pick which files are\n"
+            "        worth a full read_freebsd_source — this avoids burning\n"
+            "        steps on files that turn out to be irrelevant. Examples:\n"
+            + "\n".join(f"        - directory_map(path='{d}')" for d in src_dirs[:3])
+        )
+        step_n += 1
+
     if src_files:
         steps.append(
             f"STEP {step_n}: Use read_freebsd_source to examine key files:\n"
@@ -1833,8 +2116,10 @@ def build_chapter_prompt(chapter: dict) -> str:
         `grep -n "FOO" file | head -50`, `cat file`, `ls dir/`, or any
         bare command-line invocation will fail with
         `SyntaxError: invalid syntax` and waste a step. To search source,
-        use the provided tools: `read_freebsd_source(path=...)` to read a
-        whole file, `search_books(query=...)` for theory, and
+        use the provided tools: `directory_map(path=...)` for a
+        structured summary of one directory (subdirs, file purposes,
+        struct/function names), `read_freebsd_source(path=...)` to read
+        a whole file, `search_books(query=...)` for theory, and
         `resolve_c_definition(symbol=...)` for struct/function lookups.
         If you need to filter the text of a file you've already read,
         do it in Python (e.g., `[l for l in text.splitlines() if "SUBDIR" in l]`),
@@ -2307,6 +2592,7 @@ def create_writer_agent(index: TfidfIndex):
             ReadFreeBSDSource(),
             SearchBooks(index),
             ExploreTree(),
+            DirectoryMap(),
             ResolveCDefinition(),
         ],
         model=model,
@@ -2432,7 +2718,7 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 key questions, mandatory output template, no-marketing rule,
                 and the existing target file (if any) as read-only context.
         Tools:  read_freebsd_source, search_books, explore_tree,
-                resolve_c_definition.
+                directory_map, resolve_c_definition.
         Output: a full markdown draft. Free to add anything within the
                 template; bound by scope_guard and forbidden-words list.
 

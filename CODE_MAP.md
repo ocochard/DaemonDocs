@@ -27,8 +27,11 @@ The file is divided by `# ---` banner comments. In source order:
 3. **TF-IDF index** — `class TfidfIndex`, `get_or_build_index`.
    Persistent on-disk index used by the `search_books` tool.
 4. **Smolagents tools** — `ReadFreeBSDSource`, `SearchBooks`,
-   `ExploreTree`, `ResolveCDefinition`. The fixed tool set the
-   writer agent runs against.
+   `ExploreTree`, `DirectoryMap`, `ResolveCDefinition`. The fixed
+   tool set the writer agent runs against. `DirectoryMap` returns
+   a structured one-level summary (subdirs + Makefile SRCS + per-
+   file struct/function names + top-of-file comments) so the
+   writer can orient before reading individual files.
 5. **Prompt builders** — `build_chapter_prompt` (writer),
    `build_review_prompt` (reviewer), `build_revision_prompt`
    (writer revising). Plus `_SECTION_CATALOG`, `_chapter_sections`,
