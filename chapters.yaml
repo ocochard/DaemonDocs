@@ -492,12 +492,14 @@ chapters:
       - "How does FreeBSD handle interrupts in an SMP environment?"
     mermaid: sequence
 
-  - title: "NIC Drivers — from if_em to iflib to if_cxgbe"
+  - title: "NIC Drivers — from if_vr to iflib to if_cxgbe"
     output_file: "sys/dev/README_nic_drivers.md"
     source_dirs:
+      - "sys/dev/vr"
       - "sys/dev/e1000"
       - "sys/dev/cxgbe"
     source_files:
+      - "sys/dev/vr/if_vr.c"
       - "sys/net/iflib.h"
       - "sys/net/iflib.c"
       - "sys/dev/e1000/if_em.c"
@@ -505,27 +507,35 @@ chapters:
       - "sys/dev/cxgbe/t4_main.c"
       - "sys/dev/cxgbe/adapter.h"
     focus: >
-      Compare three points on the FreeBSD NIC-driver complexity
-      spectrum, using each as a lens onto a different design choice.
-      Start with **if_em** (Intel 1 Gbps) as a present-day iflib
-      consumer — show how iflib reduces the driver to a small set of
-      device-specific methods (txd_encap, rxd_pkt_get, etc.) and
-      iflib_softc state, with the framework owning the queues, polling
-      loop, and netmap integration. Then dive into **iflib itself**
-      (sys/net/iflib.c, ~6000 lines): the abstractions it imposes —
-      tx/rx queues, descriptor rings, multi-queue mapping, NUMA-aware
-      buffer pools — and why FreeBSD pushed common code up out of
-      individual drivers. Finally use **if_cxgbe** (Chelsio T4/T5/T6
-      10/25/40/100 Gbps) as the case where iflib is *not* enough: it's
-      a non-iflib driver because its hardware exposes far more
-      capabilities (TOE, RDMA, crypto offload, NVMe-over-fabrics) than
-      iflib's model accommodates. Show what a "complex" NIC driver
-      looks like and why it earned its complexity.
+      Compare four points on the FreeBSD NIC-driver complexity
+      spectrum, deliberately isolating the iflib variable. Start with
+      **if_vr** (VIA Rhine, 100 Mbps, ~2600 lines, pre-iflib): a
+      complete non-iflib driver — newbus attach/detach, mii PHY
+      attach, tx/rx descriptor rings managed by hand with bus_dma,
+      interrupt handler, watchdog timer, ifnet up/down. This is what
+      "everything a NIC driver must do" looks like with no framework
+      hiding it. Next, **if_em** (Intel 1 Gbps): same hardware
+      generation as if_vr's contemporaries, but rewritten as an iflib
+      consumer — show what iflib subtracts. The driver now provides a
+      small set of device-specific methods (txd_encap, rxd_pkt_get,
+      ift_softc state) and iflib owns queues, polling, NUMA buffer
+      pools, multi-queue dispatch, and netmap integration. Then dive
+      into **iflib itself** (sys/net/iflib.c, ~6000 lines): why
+      FreeBSD pushed all of that common code up out of individual
+      drivers, what abstractions it imposes (tx/rx queues, descriptor
+      rings, IFLIB_INTR_RX semantics, dma tag management). Finally
+      **if_cxgbe** (Chelsio T4/T5/T6, 10/25/40/100 Gbps): a non-iflib
+      driver by *necessity* — the chip exposes TOE, RDMA, crypto
+      offload, and NVMe-over-fabrics in addition to plain NIC mode,
+      and iflib's queue/ring model can't express the hardware's
+      partitioned multi-role design. Use this contrast (vr non-iflib
+      because iflib didn't exist yet; cxgbe non-iflib because iflib
+      isn't enough) to make the iflib trade-off concrete.
     key_questions:
-      - "What concrete callbacks does an iflib-based driver like if_em provide, and what does iflib do for it that the driver no longer has to?"
+      - "What does if_vr have to do that if_em no longer does — exactly which mechanics (descriptor ring management, DMA tag setup, interrupt handler structure, ifnet wiring) did iflib absorb?"
+      - "What concrete callbacks does an iflib-based driver like if_em provide, and how does the iflib core invoke them on each tx and rx path?"
       - "How do tx and rx descriptor rings flow through iflib — from a driver mbuf-encap call down to a hardware ring write, and from interrupt back up to ether_input?"
-      - "Why is if_cxgbe NOT an iflib driver? Which features of the Chelsio hardware (TOE, multi-queue with NIC/TOE/RDMA partitioning, hardware filters) make iflib's abstractions unsuitable?"
-      - "What does t4_main.c attach actually do — how is the chip brought up, firmware loaded, and queues partitioned across NIC/offload roles?"
+      - "Why is if_cxgbe NOT an iflib driver? Which features of the Chelsio hardware (TOE, multi-queue with NIC/TOE/RDMA partitioning, hardware filters) make iflib's abstractions unsuitable, in contrast to if_vr (which is pre-iflib) vs if_em (which is iflib-fitted)?"
     mermaid: class
 
   - title: "Jails and System Isolation"

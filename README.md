@@ -314,7 +314,7 @@ Current chapters (24), grouped by subsystem family:
 **Devices & interrupts**
 18. Device Driver Framework
 19. Interrupt Handling
-20. NIC Drivers — from if_em to iflib to if_cxgbe
+20. NIC Drivers — from if_vr to iflib to if_cxgbe
 
 **Security & isolation**
 21. Jails and System Isolation
