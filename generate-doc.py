@@ -3752,64 +3752,51 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Chapter relationship map — which chapters reference each other
-CHAPTER_RELS = {
-    "FreeBSD Source Tree Overview": ["The FreeBSD Kernel — Structure and Entry Point"],
-    "The FreeBSD Kernel — Structure and Entry Point": [
-        "FreeBSD Source Tree Overview",
-        "UEFI Bootloader-to-Kernel Handoff",
-        "Process Management and Scheduling",
-    ],
-    "UEFI Bootloader-to-Kernel Handoff": [
-        "The FreeBSD Kernel — Structure and Entry Point",
-        "The FreeBSD Build System",
-    ],
-    "Virtual Memory Subsystem": [
-        "The FreeBSD Kernel — Structure and Entry Point",
-        "The Buffer Cache and I/O Subsystem",
-        "Virtual File System (VFS) Layer",
-    ],
-    "Process Management and Scheduling": [
-        "The FreeBSD Kernel — Structure and Entry Point",
-        "Interrupt Handling",
-        "Jails and System Isolation",
-    ],
-    "The Buffer Cache and I/O Subsystem": [
-        "Virtual Memory Subsystem",
-        "Virtual File System (VFS) Layer",
-        "UFS Filesystem Implementation",
-    ],
-    "Virtual File System (VFS) Layer": [
-        "Virtual Memory Subsystem",
-        "The Buffer Cache and I/O Subsystem",
-        "UFS Filesystem Implementation",
-        "Network Stack Architecture",
-    ],
-    "UFS Filesystem Implementation": [
-        "Virtual File System (VFS) Layer",
-        "The Buffer Cache and I/O Subsystem",
-    ],
-    "Network Stack Architecture": [
-        "Virtual File System (VFS) Layer",
-        "Device Driver Framework",
-    ],
-    "Device Driver Framework": [
-        "Network Stack Architecture",
-        "Interrupt Handling",
-    ],
-    "Interrupt Handling": [
-        "Device Driver Framework",
-        "Process Management and Scheduling",
-    ],
-    "Jails and System Isolation": [
-        "Process Management and Scheduling",
-        "The FreeBSD Kernel — Structure and Entry Point",
-    ],
-    "The FreeBSD Build System": [
-        "UEFI Bootloader-to-Kernel Handoff",
-        "FreeBSD Source Tree Overview",
-    ],
-}
+def _build_chapter_rels(chapters: List[dict]) -> dict:
+    """Build the title -> [related-titles] map used for sidebars and See-Also.
+
+    Source of truth is `chapters.yaml`:
+      - `related:` (per chapter) is taken verbatim if set;
+      - otherwise we fall back to "all other chapters with the same `family:`"
+        (a chapter never lists itself).
+
+    This replaced a hand-maintained `CHAPTER_RELS` dict that duplicated every
+    chapter title from chapters.yaml. The duplication is the bug to avoid: a
+    rename in chapters.yaml leaves the dict pointing at stale strings, and the
+    failure mode is silent — `dict.get(title, [])` returns [], the sidebar
+    renders empty, and the See-Also injection becomes a no-op.
+
+    Titles in `related:` MUST match a `title:` in chapters.yaml exactly.
+    Unknown titles are filtered out (warned to stderr) so a typo doesn't
+    crash navigation but is visible in the run log.
+    """
+    titles = {ch["title"] for ch in chapters}
+    by_family: dict = {}
+    for ch in chapters:
+        fam = ch.get("family")
+        if fam:
+            by_family.setdefault(fam, []).append(ch["title"])
+
+    rels: dict = {}
+    for ch in chapters:
+        title = ch["title"]
+        explicit = ch.get("related")
+        if explicit is not None:
+            cleaned = []
+            for r in explicit:
+                if r in titles and r != title:
+                    cleaned.append(r)
+                else:
+                    print(
+                        f"  [warn] chapter '{title}' has unknown related "
+                        f"title '{r}' — ignored",
+                        file=sys.stderr,
+                    )
+            rels[title] = cleaned
+        else:
+            fam = ch.get("family")
+            rels[title] = [t for t in by_family.get(fam, []) if t != title]
+    return rels
 
 
 _AUTO_GEN_BANNER = (
@@ -3885,6 +3872,11 @@ def build_navigation(chapters: List[dict]) -> dict:
         title_map[title] = output_file
         rel_map[output_file] = ch
 
+    # Derive the title -> related-titles map from chapters.yaml
+    # (`related:` per chapter, or family-mates as fallback). Single
+    # source of truth — see _build_chapter_rels.
+    chapter_rels = _build_chapter_rels(chapters)
+
     updated = {}
 
     for ch in chapters:
@@ -3901,7 +3893,7 @@ def build_navigation(chapters: List[dict]) -> dict:
         # Build navigation sidebar
         nav_links = []
         all_chapters = []
-        related = CHAPTER_RELS.get(title, [])
+        related = chapter_rels.get(title, [])
 
         for other in chapters:
             other_title = other["title"]
@@ -3955,7 +3947,9 @@ def build_navigation(chapters: List[dict]) -> dict:
         content = "\n".join(lines)
 
         # Update "See Also" section with cross-links
-        content = _add_see_also_links(content, title, title_map, output_file)
+        content = _add_see_also_links(
+            content, title, title_map, output_file, chapter_rels
+        )
 
         updated[output_file] = content
 
@@ -3997,9 +3991,9 @@ def build_navigation(chapters: List[dict]) -> dict:
 
 
 def _add_see_also_links(content: str, title: str, title_map: dict,
-                        current_file: str) -> str:
+                        current_file: str, chapter_rels: dict) -> str:
     """Add cross-links to the See Also section of a README."""
-    related = CHAPTER_RELS.get(title, [])
+    related = chapter_rels.get(title, [])
     if not related:
         return content
 
@@ -4207,8 +4201,9 @@ def build_chapter_index(chapters: List[dict], src_root: str,
     lines.append("## Cross-References")
     lines.append("")
 
-    # Group chapters by relationship
-    for title, related in CHAPTER_RELS.items():
+    # Group chapters by relationship (derived from chapters.yaml)
+    chapter_rels = _build_chapter_rels(chapters)
+    for title, related in chapter_rels.items():
         if not related:
             continue
         rel_links = []

@@ -3,6 +3,17 @@
 #
 # Fields:
 #   title        — chapter heading
+#   family       — group tag used as the fallback for the "Related" sidebar
+#                  when `related:` is not set. Chapters with the same family
+#                  are considered related by default. Current values:
+#                    boot-kernel-core, memory-process, storage-io,
+#                    networking, devices-interrupts, security-isolation,
+#                    virt-observability
+#   related      — optional list of titles to use for the "Related" sidebar
+#                  and "See Also" cross-links instead of the family default.
+#                  Use this when family-mates aren't enough or include too
+#                  much (cross-family edges, narrowing a 6-chapter family).
+#                  Titles must match the `title:` field exactly.
 #   output_file  — where to write (relative to FreeBSD src root)
 #   source_dirs  — directories the agent should explore
 #   source_files — specific files the agent should examine
@@ -12,6 +23,10 @@
 
 chapters:
   - title: "Source Tree — Layout and Conventions"
+    family: "boot-kernel-core"
+    related:
+      - "Kernel Core — Structure and Entry Point"
+      - "Build System — buildworld and buildkernel"
     # NOTE: output is README_internals.md, not README.md — upstream FreeBSD
     # already ships a README.md at the tree root (and we read it as a source
     # file below). Writing there would clobber upstream and cause a
@@ -56,6 +71,10 @@ chapters:
     mermaid: flowchart
 
   - title: "Boot Process — UEFI Bootloader to Kernel Handoff"
+    family: "boot-kernel-core"
+    related:
+      - "Kernel Core — Structure and Entry Point"
+      - "Build System — buildworld and buildkernel"
     output_file: "stand/efi/loader/README.md"
     source_dirs:
       - "stand/efi/loader"
@@ -75,6 +94,11 @@ chapters:
     mermaid: sequence
 
   - title: "Kernel Core — Structure and Entry Point"
+    family: "boot-kernel-core"
+    related:
+      - "Source Tree — Layout and Conventions"
+      - "Boot Process — UEFI Bootloader to Kernel Handoff"
+      - "Process Management — Scheduling and Lifecycle"
     output_file: "sys/README.md"
     source_dirs:
       - "sys/kern"
@@ -97,6 +121,10 @@ chapters:
     mermaid: sequence
 
   - title: "Build System — buildworld and buildkernel"
+    family: "boot-kernel-core"
+    related:
+      - "Boot Process — UEFI Bootloader to Kernel Handoff"
+      - "Source Tree — Layout and Conventions"
     output_file: "share/mk/README.md"
     source_dirs:
       - "share/mk"
@@ -117,6 +145,11 @@ chapters:
     mermaid: flowchart
 
   - title: "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
+    family: "memory-process"
+    related:
+      - "Kernel Core — Structure and Entry Point"
+      - "Buffer Cache — Block I/O Subsystem"
+      - "VFS — Virtual File System Layer"
     output_file: "sys/vm/README.md"
     source_dirs:
       - "sys/vm"
@@ -139,6 +172,12 @@ chapters:
     mermaid: class
 
   - title: "Process Management — Scheduling and Lifecycle"
+    family: "memory-process"
+    related:
+      - "Kernel Core — Structure and Entry Point"
+      - "Interrupt Handling — Threads, Filters, and Dispatch"
+      - "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
+      - "Jails — OS-level Isolation"
     output_file: "sys/kern/README_process.md"
     source_dirs:
       - "sys/kern"
@@ -159,6 +198,11 @@ chapters:
     mermaid: sequence
 
   - title: "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
+    family: "memory-process"
+    related:
+      - "Process Management — Scheduling and Lifecycle"
+      - "Interrupt Handling — Threads, Filters, and Dispatch"
+      - "Kernel Core — Structure and Entry Point"
     output_file: "sys/kern/README_locking.md"
     source_dirs:
       - "sys/kern"
@@ -193,6 +237,12 @@ chapters:
     mermaid: class
 
   - title: "Buffer Cache — Block I/O Subsystem"
+    family: "storage-io"
+    related:
+      - "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
+      - "VFS — Virtual File System Layer"
+      - "GEOM — Storage Framework"
+      - "UFS — FreeBSD's Native Filesystem"
     output_file: "sys/vm/README_bcache.md"
     source_dirs:
       - "sys/kern"
@@ -212,6 +262,11 @@ chapters:
     mermaid: flowchart
 
   - title: "GEOM — Storage Framework"
+    family: "storage-io"
+    related:
+      - "Buffer Cache — Block I/O Subsystem"
+      - "CAM — Common Access Method Storage Stack"
+      - "ZFS — Pooled Storage and Copy-on-Write Filesystem"
     output_file: "sys/geom/README.md"
     source_dirs:
       - "sys/geom"
@@ -239,6 +294,11 @@ chapters:
     mermaid: flowchart
 
   - title: "CAM — Common Access Method Storage Stack"
+    family: "storage-io"
+    related:
+      - "GEOM — Storage Framework"
+      - "Device Driver Framework — newbus and devclass"
+      - "Interrupt Handling — Threads, Filters, and Dispatch"
     output_file: "sys/cam/README.md"
     source_dirs:
       - "sys/cam"
@@ -279,6 +339,13 @@ chapters:
     mermaid: class
 
   - title: "VFS — Virtual File System Layer"
+    family: "storage-io"
+    related:
+      - "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
+      - "Buffer Cache — Block I/O Subsystem"
+      - "UFS — FreeBSD's Native Filesystem"
+      - "ZFS — Pooled Storage and Copy-on-Write Filesystem"
+      - "Network Stack — Architecture and Packet Flow"
     output_file: "sys/fs/README.md"
     source_dirs:
       - "sys/fs"
@@ -301,6 +368,11 @@ chapters:
     mermaid: class
 
   - title: "UFS — FreeBSD's Native Filesystem"
+    family: "storage-io"
+    related:
+      - "VFS — Virtual File System Layer"
+      - "Buffer Cache — Block I/O Subsystem"
+      - "GEOM — Storage Framework"
     output_file: "sys/ufs/README.md"
     source_dirs:
       - "sys/ufs"
@@ -320,6 +392,11 @@ chapters:
     mermaid: flowchart
 
   - title: "ZFS — Pooled Storage and Copy-on-Write Filesystem"
+    family: "storage-io"
+    related:
+      - "VFS — Virtual File System Layer"
+      - "GEOM — Storage Framework"
+      - "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
     # Upstream OpenZFS ships its own README.md at sys/contrib/openzfs/ —
     # use a sibling name to avoid the read-vs-write collision.
     output_file: "sys/contrib/openzfs/README_freebsd.md"
@@ -351,6 +428,13 @@ chapters:
     mermaid: class
 
   - title: "Network Stack — Architecture and Packet Flow"
+    family: "networking"
+    related:
+      - "VFS — Virtual File System Layer"
+      - "Device Driver Framework — newbus and devclass"
+      - "VNET — Virtual Network Stacks"
+      - "pf — OpenBSD-derived Packet Filter"
+      - "NIC Drivers — from if_vr to iflib to if_cxgbe"
     output_file: "sys/net/README.md"
     source_dirs:
       - "sys/net"
@@ -375,6 +459,11 @@ chapters:
     mermaid: sequence
 
   - title: "VNET — Virtual Network Stacks"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "Jails — OS-level Isolation"
+      - "pf — OpenBSD-derived Packet Filter"
     output_file: "sys/net/README_vnet.md"
     source_dirs:
       - "sys/net"
@@ -400,6 +489,11 @@ chapters:
     mermaid: class
 
   - title: "pf — OpenBSD-derived Packet Filter"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "ipfw and dummynet — Native Firewall and Traffic Shaper"
+      - "VNET — Virtual Network Stacks"
     output_file: "sys/netpfil/pf/README.md"
     source_dirs:
       - "sys/netpfil/pf"
@@ -427,6 +521,11 @@ chapters:
     mermaid: flowchart
 
   - title: "ipfw and dummynet — Native Firewall and Traffic Shaper"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "pf — OpenBSD-derived Packet Filter"
+      - "VNET — Virtual Network Stacks"
     output_file: "sys/netpfil/ipfw/README.md"
     source_dirs:
       - "sys/netpfil/ipfw"
@@ -455,6 +554,11 @@ chapters:
     mermaid: flowchart
 
   - title: "Device Driver Framework — newbus and devclass"
+    family: "devices-interrupts"
+    related:
+      - "Interrupt Handling — Threads, Filters, and Dispatch"
+      - "NIC Drivers — from if_vr to iflib to if_cxgbe"
+      - "CAM — Common Access Method Storage Stack"
     output_file: "sys/kern/README_driver.md"
     source_dirs:
       - "sys/kern"
@@ -473,6 +577,11 @@ chapters:
     mermaid: sequence
 
   - title: "Interrupt Handling — Threads, Filters, and Dispatch"
+    family: "devices-interrupts"
+    related:
+      - "Device Driver Framework — newbus and devclass"
+      - "Process Management — Scheduling and Lifecycle"
+      - "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
     output_file: "sys/kern/README_intr.md"
     source_dirs:
       - "sys/kern"
@@ -493,6 +602,11 @@ chapters:
     mermaid: sequence
 
   - title: "NIC Drivers — from if_vr to iflib to if_cxgbe"
+    family: "devices-interrupts"
+    related:
+      - "Device Driver Framework — newbus and devclass"
+      - "Network Stack — Architecture and Packet Flow"
+      - "Interrupt Handling — Threads, Filters, and Dispatch"
     output_file: "sys/dev/README_nic_drivers.md"
     source_dirs:
       - "sys/dev/vr"
@@ -539,6 +653,12 @@ chapters:
     mermaid: class
 
   - title: "Jails — OS-level Isolation"
+    family: "security-isolation"
+    related:
+      - "Process Management — Scheduling and Lifecycle"
+      - "VNET — Virtual Network Stacks"
+      - "Capsicum — Capability Mode and Sandboxing"
+      - "Kernel Core — Structure and Entry Point"
     output_file: "sys/kern/README_jail.md"
     source_dirs:
       - "sys/kern"
@@ -556,6 +676,11 @@ chapters:
     mermaid: flowchart
 
   - title: "Capsicum — Capability Mode and Sandboxing"
+    family: "security-isolation"
+    related:
+      - "Jails — OS-level Isolation"
+      - "Process Management — Scheduling and Lifecycle"
+      - "VFS — Virtual File System Layer"
     output_file: "sys/kern/README_capsicum.md"
     source_dirs:
       - "sys/kern"
@@ -581,6 +706,12 @@ chapters:
     mermaid: flowchart
 
   - title: "bhyve — VMM Kernel Module and Hypervisor"
+    family: "virt-observability"
+    related:
+      - "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
+      - "Process Management — Scheduling and Lifecycle"
+      - "Device Driver Framework — newbus and devclass"
+      - "VNET — Virtual Network Stacks"
     output_file: "sys/amd64/vmm/README.md"
     source_dirs:
       - "sys/amd64/vmm"
@@ -613,6 +744,11 @@ chapters:
     mermaid: sequence
 
   - title: "DTrace — Dynamic Tracing Framework"
+    family: "virt-observability"
+    related:
+      - "Kernel Core — Structure and Entry Point"
+      - "Process Management — Scheduling and Lifecycle"
+      - "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
     output_file: "sys/cddl/dev/dtrace/README.md"
     source_dirs:
       - "sys/cddl/dev/dtrace"
