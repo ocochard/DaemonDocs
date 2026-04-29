@@ -76,8 +76,8 @@ python3 generate-doc.py --dry-run
 # 6. Smoke-test a single chapter end-to-end
 python3 generate-doc.py --chapter 1
 
-# 7. Full run (use --max-revisions 3 for production-quality output)
-python3 generate-doc.py --max-revisions 3
+# 7. Full run (default --max-revisions 3 is the production setting)
+python3 generate-doc.py
 
 # 8. Refresh cross-README navigation links
 python3 generate-doc.py --nav-only
@@ -98,7 +98,7 @@ For lowest error rate, follow steps 4–8 in order on a fresh run. Skipping the 
 | `--force` | Regenerate even if README already exists |
 | `--reindex` | Rebuild corpus from scratch (drops existing docs) |
 | `--chapter N` | Run only chapter N (1-based) |
-| `--max-revisions N` | Max review+revise rounds (default 2, 0 = skip review) |
+| `--max-revisions N` | Max review+revise rounds (default 3, 0 = skip review) |
 
 > **`--force` safety:** output files are written under `$FREEBSD_SRC`. `--force` will overwrite any
 > previously generated `README.md` / `README_*.md` listed in `chapters.yaml`. Run
@@ -141,14 +141,14 @@ The script is **one self-contained file** — no separate modules. Sections:
 | Config | `SRC_ROOT`, `BOOKS_DIR`, `MODEL_CONFIG` |
 | Book extraction | Pull text from PDFs (PyPDF2), CHMs (hhextract), EPUBs (zipfile). Incremental by file hash. |
 | TF-IDF index | Chunks text, builds vocabulary, computes TF-IDF matrix with numpy, cosine similarity search. Save/load to disk. |
-| smolagent tools | `ReadFreeBSDSource`, `SearchBooks`, `ExploreTree`, `ResolveCDefinition` |
+| smolagent tools | `ReadFreeBSDSource`, `SearchBooks`, `ExploreTree`, `DirectoryMap`, `ResolveCDefinition` |
 | Prompt builders | `build_chapter_prompt`, `build_review_prompt`, `build_revision_prompt`, `build_chapter_index` |
 | Agent factories | `create_writer_agent`, `create_reviewer_agent` |
 | Orchestrator | Multi-pass loop: draft → review → revise → write file |
 
 ---
 
-## The four agent tools
+## The five agent tools
 
 ### `read_freebsd_source(path)`
 Reads a file from the FreeBSD source tree. Returns up to 4000 chars. If the path doesn't exist, tries glob for similar files.
@@ -158,6 +158,9 @@ TF-IDF semantic search over the book corpus. Returns top-4 matching chunks with 
 
 ### `explore_tree(path)`
 Lists directory contents in the FreeBSD source tree. Shows files and directories (up to 80 entries).
+
+### `directory_map(path)`
+Returns a structured one-level summary of a directory: subdirectories, Makefile `SRCS`/`KMOD` lines, and for each `.c`/`.h` file the top-of-file purpose comment plus struct and function names defined in it. Lets the writer orient inside a directory in one tool call instead of reading every file individually.
 
 ### `resolve_c_definition(symbol, start_file="")`
 Finds the definition of a C struct, function, macro, or type alias. Follows `#include` chains automatically. Examples: `resolve_c_definition(symbol='struct vm_page')`, `resolve_c_definition(symbol='uma_zcreate', start_file='sys/vm/uma_core.c')`.
@@ -170,10 +173,10 @@ Finds the definition of a C struct, function, macro, or type alias. Follows `#in
 flowchart TD
     Start([chapter from chapters.yaml]) --> Draft
 
-    Draft["**Step 1 — Draft** (writer agent, 25 steps)<br/>build_chapter_prompt → full markdown draft<br/>tools: read_freebsd_source, search_books,<br/>explore_tree, resolve_c_definition"]
+    Draft["**Step 1 — Draft** (writer agent, 40 steps)<br/>build_chapter_prompt → full markdown draft<br/>tools: read_freebsd_source, search_books,<br/>explore_tree, directory_map, resolve_c_definition"]
     Draft --> Review
 
-    Review{"**Step 2 — Review** (reviewer agent, 10 steps)<br/>build_review_prompt → JSON verdict<br/>tools: search_books only<br/>does NOT edit the draft"}
+    Review{"**Step 2 — Review** (reviewer agent, 15 steps)<br/>build_review_prompt → JSON verdict<br/>tools: search_books only<br/>does NOT edit the draft"}
     Review -- "grade=PASS AND<br/>no issues AND<br/>no FAIL criteria" --> FactCheck
     Review -- "any FAIL<br/>(and revisions left)" --> Revise
     Review -- "max_revisions reached<br/>or JSON unparseable twice" --> Unapproved[mark UNVERIFIED]
@@ -215,7 +218,7 @@ prompt can stay small and focused.
 1. **Draft (writer).** Reads `build_chapter_prompt(chapter)` — focus,
    `scope_guard`, sections, key questions, mandatory output template, and the
    existing target file as read-only context. Has full tool access:
-   `read_freebsd_source`, `search_books`, `explore_tree`,
+   `read_freebsd_source`, `search_books`, `explore_tree`, `directory_map`,
    `resolve_c_definition`. Produces a complete markdown draft, free to add
    anything within the template.
 
@@ -264,7 +267,7 @@ The reviewer grades on 7 criteria:
 
 The strict gate (in `_review_passes`) only approves a chapter when `grade == "PASS"` AND `issues[]` is empty AND every criterion passes. This prevents the failure mode where the model returns `grade=PASS` while individual criteria still say `FAIL`.
 
-Default: `--max-revisions 2` (one draft + up to two revision rounds).
+Default: `--max-revisions 3` (one draft + up to three revision rounds).
 
 ---
 
@@ -384,7 +387,7 @@ DaemonDocs/
 
 - **FreeBSD 16-CURRENT** — use only pure-Python packages (`smolagents`, `openai`, `PyPDF2`, `pyyaml`, `numpy`)
 - **Single file** — all logic in `generate-doc.py`, no separate modules
-- **LLM is local** — llama-server on port 8080, not an external API
+- **LLM is self-hosted** — one or more llama-server endpoints (OpenAI-compatible), selected via `OPENAI_BASE_URL`. No external paid APIs. Two `generate-doc.py` processes can run in parallel pointed at different endpoints (e.g. one local GPU, one over the LAN) to halve wall-clock time on a full run.
 - **CHM books** require `hhextract` (hh suite) — graceful fallback with warning
 - **Output files** use `README_*` suffix to not overwrite existing FreeBSD README files
 
