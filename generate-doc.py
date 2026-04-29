@@ -1672,13 +1672,24 @@ class ResolveCDefinition(Tool):
                         if symbol in fs:
                             found_defs.append(fs)
 
-                    # Also search for #define macros
+                    # Also search for #define macros.
+                    # Match BOTH bare macros (`#define FOO 1`) and
+                    # parameterized macros (`#define FOO(a, b) ...`).
+                    # The previous regex required `\s+` after the symbol
+                    # name, which silently missed every parameterized
+                    # macro in the tree — e.g. VNET_DEFINE(t, n),
+                    # CURVNET_SET(arg), IFLIB_CTX(...). The tool then
+                    # returned "No exact definition found" for symbols
+                    # that are real, well-defined macros, and the
+                    # reviewer would flag them as hallucinated. Capture
+                    # everything after the symbol so the rest of the line
+                    # (parameter list + body) is preserved verbatim.
                     for m in re.finditer(
-                        rf'#define\s+{re.escape(symbol)}\s+(.+)',
+                        rf'#define\s+{re.escape(symbol)}([(\s].*)',
                         content
                     ):
-                        macro_body = m.group(1).strip()[:200]
-                        found_defs.append(f"#define {symbol} {macro_body} (from {fpath})")
+                        macro_tail = m.group(1).strip()[:200]
+                        found_defs.append(f"#define {symbol}{macro_tail if macro_tail.startswith('(') else ' ' + macro_tail} (from {fpath})")
 
             except Exception:
                 continue
