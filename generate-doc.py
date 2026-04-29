@@ -1787,6 +1787,30 @@ def build_chapter_prompt(chapter: dict) -> str:
         - If you cannot fill a section with real content, write "See related
           chapters for coverage of this topic" rather than skipping it
 
+        **Quote, don't paraphrase — READ THIS BEFORE WRITING ANY STRUCT OR FUNCTION.**
+        Your training data contains FreeBSD-shaped code that is *almost*
+        right but mixes in field names, function names, and macros from
+        Linux, NetBSD, OpenBSD, and older FreeBSD versions. If you write
+        a struct definition or a function signature from memory, it WILL
+        contain hallucinated fields (e.g. `b_dirtyblkhd`, `b_actf`,
+        `bufq_insert_dirty()`, `MALLOC_DEFINE(M_BIOBUF, ...)`). The
+        reviewer cannot rescue a draft that fabricates structurally —
+        revisions can only patch, not rewrite.
+        - For ANY struct definition, field name, or function signature
+          you put in a code block: first call
+          `read_freebsd_source(path="sys/sys/foo.h")` (or
+          `resolve_c_definition(symbol="struct foo")`), then COPY the
+          relevant lines verbatim into the code block. Do not retype
+          from memory.
+        - For SDT probes, `MALLOC_DEFINE`/`MALLOC_DECLARE` tags, sysctl
+          names, and macro names: same rule — verify by reading the
+          source before claiming the name exists. If `read_freebsd_source`
+          / `resolve_c_definition` doesn't surface it, do not write it.
+        - Prose around the code block can paraphrase freely; the rule is
+          for the code block contents and any inline backticked symbol
+          claims (e.g. mentioning a specific field name, function name,
+          or sysctl OID by name).
+
         **How to return your work — READ THIS CAREFULLY:**
         - You MUST return the complete Markdown chapter as the single argument
           to `final_answer(...)`. Example: `final_answer(content)` where
@@ -1836,7 +1860,30 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
     src_files = chapter.get("source_files", [])
     src_dirs = chapter.get("source_dirs", []) or []
     diagram = chapter.get("mermaid", "flowchart")
+    scope_guard = (chapter.get("scope_guard") or "").strip()
     question_text = "\n".join(f"- {q}" for q in questions)
+
+    # Mirror the writer's scope_guard into the reviewer's rubric so the
+    # reviewer doesn't penalise the draft for content the writer was
+    # explicitly told to suppress. Observed on chapter 1
+    # (`README_internals.md`): the writer dropped struct walkthroughs
+    # per scope_guard, then the reviewer's source_coverage criterion
+    # graded them as missing.
+    if scope_guard:
+        sg_first, sg_sep, sg_rest = scope_guard.partition("\n")
+        sg_body = sg_first + (
+            sg_sep + textwrap.indent(sg_rest, "        ") if sg_sep else ""
+        )
+        scope_guard_block = (
+            "## Scope Guard (the writer was told to honor this — so should you)\n\n"
+            "The chapter author was given the following hard scope rule. Do\n"
+            "NOT flag the draft as incomplete or under-covered for omitting\n"
+            "content this rule forbids. Apply Source Coverage and Completeness\n"
+            "ONLY to material that falls *inside* the scope.\n\n"
+            f"{sg_body}\n\n"
+        )
+    else:
+        scope_guard_block = ""
 
     # Pre-validate every source path so we can inject ground truth and
     # block the reviewer from hallucinating "this file does not exist."
@@ -1873,6 +1920,66 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
             + "\n".join(f"- `{p}` (NOT FOUND)" for p in missing_paths)
             + "\n"
         )
+
+    # Pre-validate symbols (structs and functions) the same way we
+    # pre-validate paths. The reviewer agent has no source-tree tool,
+    # so without injected ground truth it can only hedge ("may use X /
+    # verify against") on any specific symbol the writer claims. Hedges
+    # turn into bad revisions: the writer guesses whichever name the
+    # reviewer mentioned and introduces fresh hallucinations.
+    #
+    # We reuse the same extractors and verifiers that fact_check_draft
+    # runs in Phase 4. Both paths share `_FACT_CHECK_CACHE`, so
+    # validating here makes the post-review fact-check effectively free
+    # for symbols already seen.
+    fact_text = _strip_comparison_section(draft)
+    claimed_structs = _extract_struct_names(fact_text)
+    claimed_funcs = _extract_function_names(fact_text)
+    missing_structs = set(_verify_structs(claimed_structs, SRC_ROOT))
+    missing_funcs = set(_verify_functions(claimed_funcs, SRC_ROOT))
+    verified_structs = [s for s in claimed_structs if s not in missing_structs]
+    verified_funcs = [f for f in claimed_funcs if f not in missing_funcs]
+
+    symbol_block = ""
+    if verified_structs or verified_funcs or missing_structs or missing_funcs:
+        symbol_block = (
+            "## Verified Symbols (DO NOT hedge about these)\n\n"
+            "The following struct and function names from the draft have\n"
+            "been grep-checked against the FreeBSD source tree. Use this\n"
+            "as ground truth for the Accuracy criterion: do NOT raise\n"
+            "issues asking the writer to 'verify' a symbol on this list,\n"
+            "and do NOT suggest alternate names. If a symbol you doubt\n"
+            "is on the verified list, treat it as correct and move on.\n\n"
+        )
+        if verified_structs:
+            symbol_block += (
+                "Verified structs:\n"
+                + "\n".join(f"- `struct {s}`" for s in sorted(verified_structs))
+                + "\n\n"
+            )
+        if verified_funcs:
+            symbol_block += (
+                "Verified functions:\n"
+                + "\n".join(f"- `{f}()`" for f in sorted(verified_funcs))
+                + "\n\n"
+            )
+        if missing_structs:
+            symbol_block += (
+                "Missing structs (FAIL the Accuracy criterion if cited as\n"
+                "if real — these names did not match any `struct NAME {`\n"
+                "definition in the source tree):\n"
+                + "\n".join(f"- `struct {s}` (NOT FOUND)"
+                            for s in sorted(missing_structs))
+                + "\n\n"
+            )
+        if missing_funcs:
+            symbol_block += (
+                "Missing functions (FAIL the Accuracy criterion if cited\n"
+                "as if real — no matching definition found):\n"
+                + "\n".join(f"- `{f}()` (NOT FOUND)"
+                            for f in sorted(missing_funcs))
+                + "\n\n"
+            )
 
     # Build the structure-rubric checklist from the chapter's section list.
     # If the chapter opted out of (e.g.) `Key Data Structures`, the reviewer
@@ -1917,6 +2024,8 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         {chr(10).join(f"- {f}" for f in src_files)}
 
         {verified_block}
+        {symbol_block}
+        {scope_guard_block}
         ## Review Rubric
 
         Grade each criterion PASS / FAIL with a brief explanation:
@@ -1928,13 +2037,17 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            No invented structs, no made-up function names, no wrong file paths.
            Flag anything that looks like a hallucination.
            IMPORTANT: you do NOT have direct access to the source tree.
-           You CANNOT verify whether an arbitrary file path exists. Do not
-           claim that a path "does not exist in the FreeBSD source tree"
-           unless the path appears in the "missing paths" list above —
-           paths in the "Verified Source Paths" list are confirmed to
-           exist. For paths in neither list, focus on whether their *use*
-           in the draft is consistent (right subsystem, right content),
-           not on whether they exist.
+           You CANNOT verify whether an arbitrary file path, struct, or
+           function exists. Do not claim that a name "does not exist in
+           the FreeBSD source tree" unless it appears in a "missing"
+           list above — names in the "Verified Source Paths" or
+           "Verified Symbols" lists are confirmed real. For names in
+           neither list, focus on whether their *use* in the draft is
+           consistent (right subsystem, right relationships), not on
+           whether they exist. FAIL Accuracy when a symbol is in the
+           missing list AND the draft cites it as a real FreeBSD symbol;
+           PASS Accuracy when every cited symbol the draft asserts is
+           either verified or unverifiable (not in either list).
 
         3. **Source Coverage** — Are the expected source files examined and
            discussed? Not just listed — actually explained with code snippets.
@@ -2003,6 +2116,24 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
 
         Be specific in issues: "The struct vm_page is described with fields that
         don't match sys/vm/vm_page.h" not "the data structures section is weak."
+
+        **No hedges.** You do NOT have a source-tree tool of your own.
+        Your ground truth is the "Verified Source Paths" and "Verified
+        Symbols" blocks above (plus their "missing" counterparts). If a
+        path or symbol is on neither list, that is a NON-FINDING — do
+        NOT raise it. Forbidden issue shapes (omit them entirely):
+        - "Verify that <symbol> is the correct name — FreeBSD may use
+          <other_symbol> instead."
+        - "Confirm against actual <file>" / "double-check against the
+          source." You have no way to confirm; the writer will guess
+          whichever name you suggested and may introduce a real bug.
+        - "<name> may not exist" / "<name> might be misspelled" for any
+          name in the Verified Source Paths or Verified Symbols lists.
+        Raise an issue ONLY when (a) a path or symbol appears in a
+        "missing" list above and the draft cites it as real, or (b) you
+        can point to something INSIDE the draft that contradicts another
+        part of the draft. The writer should be able to action every
+        issue without guessing.
     """).lstrip()
 
 
@@ -2157,10 +2288,18 @@ def _run_agent(agent, label: str, prompt: str) -> str:
 
 def create_writer_agent(index: TfidfIndex):
     """Create the writer CodeAgent — reads source, searches books, writes docs."""
+    # Pin sampler params at the call site so primary and secondary
+    # llama-server endpoints behave identically. We've observed at least
+    # one drift mode (chapter 7 returning a status string instead of the
+    # chapter) on the secondary endpoint that did not reproduce on the
+    # primary, traceable to differing /props defaults. These values match
+    # the model's recommended sampling for instruction-following.
     model = OpenAIServerModel(
         model_id=MODEL_CONFIG["model_id"],
         api_base=MODEL_CONFIG["api_base"],
         api_key=MODEL_CONFIG["api_key"],
+        temperature=0.6,
+        top_p=0.95,
     )
 
     return CodeAgent(
@@ -2185,10 +2324,13 @@ def create_writer_agent(index: TfidfIndex):
 
 def create_reviewer_agent(index: TfidfIndex):
     """Create the reviewer agent — critiques drafts, no source tools needed."""
+    # Same pinning as the writer — see create_writer_agent for rationale.
     model = OpenAIServerModel(
         model_id=MODEL_CONFIG["model_id"],
         api_base=MODEL_CONFIG["api_base"],
         api_key=MODEL_CONFIG["api_key"],
+        temperature=0.6,
+        top_p=0.95,
     )
 
     return CodeAgent(
