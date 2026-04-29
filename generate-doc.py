@@ -4021,8 +4021,12 @@ def _add_see_also_links(content: str, title: str, title_map: dict,
     if not links:
         return content
 
-    # Insert links after the See Also header
-    insert_pos = see_also_idx + len("## See Also")
+    # Insert links after the See Also header. The find() above looked for
+    # "\n## See Also" (note the leading newline), so the matched span is
+    # 12 chars long, not 11. Using len("## See Also") here would land the
+    # insertion *inside* the heading — splitting "Also" into "Als" + "o"
+    # in the rendered README.
+    insert_pos = see_also_idx + len("\n## See Also")
     link_text = "\n" + "\n".join(f"- {l}" for l in links) + "\n"
     return content[:insert_pos] + link_text + content[insert_pos:]
 
