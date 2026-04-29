@@ -55,6 +55,25 @@ chapters:
       - "How are architecture-specific files organized?"
     mermaid: flowchart
 
+  - title: "UEFI Bootloader-to-Kernel Handoff"
+    output_file: "stand/efi/loader/README.md"
+    source_dirs:
+      - "stand/efi/loader"
+      - "stand/efi/loader/arch/amd64"
+      - "stand/efi/loader/arch/arm64"
+    source_files:
+      - "stand/efi/loader/arch/amd64/elf64_freebsd.c"
+      - "stand/efi/loader/arch/arm64/exec.c"
+      - "stand/efi/loader/bootinfo.c"
+    focus: >
+      Document how loader.efi loads the kernel, passes the EFI memory map,
+      and hands off control. Compare x86_64 and ARM64 boot metadata mechanisms.
+    key_questions:
+      - "How does the bootloader pass the memory map to the kernel?"
+      - "What is struct bootinfo / bi_module and how is it used?"
+      - "Why is the EFI memory map critical for VM initialization?"
+    mermaid: sequence
+
   - title: "The FreeBSD Kernel — Structure and Entry Point"
     output_file: "sys/README.md"
     source_dirs:
@@ -77,24 +96,25 @@ chapters:
       - "What is the role of locore.S on each architecture?"
     mermaid: sequence
 
-  - title: "UEFI Bootloader-to-Kernel Handoff"
-    output_file: "stand/efi/loader/README.md"
+  - title: "The FreeBSD Build System"
+    output_file: "share/mk/README.md"
     source_dirs:
-      - "stand/efi/loader"
-      - "stand/efi/loader/arch/amd64"
-      - "stand/efi/loader/arch/arm64"
+      - "share/mk"
+      - "tools/build"
     source_files:
-      - "stand/efi/loader/arch/amd64/elf64_freebsd.c"
-      - "stand/efi/loader/arch/arm64/exec.c"
-      - "stand/efi/loader/bootinfo.c"
+      - "Makefile.inc1"
+      - "share/mk/bsd.sys.mk"
+      - "share/mk/bsd.kmod.mk"
+      - "share/mk/bsd.prog.mk"
     focus: >
-      Document how loader.efi loads the kernel, passes the EFI memory map,
-      and hands off control. Compare x86_64 and ARM64 boot metadata mechanisms.
+      Explain how FreeBSD builds: the Makefile hierarchy, .conf files,
+      options handling, and the difference between buildworld and buildkernel.
+      Cover the staging areas and dependency tracking.
     key_questions:
-      - "How does the bootloader pass the memory map to the kernel?"
-      - "What is struct bootinfo / bi_module and how is it used?"
-      - "Why is the EFI memory map critical for VM initialization?"
-    mermaid: sequence
+      - "How does 'make buildworld' orchestrate the full build?"
+      - "What is the role of Makefile.inc1?"
+      - "How are kernel .conf files processed into source sets?"
+    mermaid: flowchart
 
   - title: "Virtual Memory Subsystem"
     output_file: "sys/vm/README.md"
@@ -138,6 +158,40 @@ chapters:
       - "How does the 4BSD scheduler decide which thread runs next?"
     mermaid: sequence
 
+  - title: "Kernel Locking Primitives"
+    output_file: "sys/kern/README_locking.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/sys"
+    source_files:
+      - "sys/kern/kern_mutex.c"
+      - "sys/kern/kern_rwlock.c"
+      - "sys/kern/kern_sx.c"
+      - "sys/kern/kern_lock.c"
+      - "sys/kern/subr_turnstile.c"
+      - "sys/kern/subr_sleepqueue.c"
+      - "sys/kern/subr_witness.c"
+      - "sys/sys/mutex.h"
+      - "sys/sys/rwlock.h"
+      - "sys/sys/sx.h"
+    focus: >
+      Document the FreeBSD kernel locking toolkit. Cover the four main
+      primitives — spin/sleep mutex (mtx), reader/writer lock (rwlock),
+      shared/exclusive lock (sx), and lockmgr (legacy, used by VFS) —
+      explaining when each is appropriate and what guarantees each
+      provides. Cover the priority-propagation machinery (turnstiles)
+      that prevents priority inversion on contended sleep mutexes, the
+      sleep-queue mechanism that backs sx and condvar/msleep, and the
+      WITNESS lock-order verifier. This subsystem cuts across every
+      other chapter — readers hit mtx_lock everywhere and need a
+      single place to understand what it actually does.
+    key_questions:
+      - "When should a developer reach for a mutex vs an sx vs a rwlock — what trade-off does each express?"
+      - "What is a turnstile, and how does priority propagation defeat priority inversion on a contended mtx?"
+      - "How does WITNESS detect lock-order reversals, and why is that a runtime check rather than a static one?"
+      - "What is the difference between a spin mutex and a sleep mutex, and which contexts force you to use a spin mutex?"
+    mermaid: class
+
   - title: "The Buffer Cache and I/O Subsystem"
     output_file: "sys/vm/README_bcache.md"
     source_dirs:
@@ -156,6 +210,73 @@ chapters:
       - "How does the buffer cache interact with the VM page cache?"
       - "What happens when a dirty buffer is written back to disk?"
     mermaid: flowchart
+
+  - title: "GEOM Storage Framework"
+    output_file: "sys/geom/README.md"
+    source_dirs:
+      - "sys/geom"
+    source_files:
+      - "sys/geom/geom.h"
+      - "sys/geom/geom_subr.c"
+      - "sys/geom/geom_io.c"
+      - "sys/geom/geom_dev.c"
+      - "sys/geom/geom_disk.c"
+      - "sys/geom/geom_vfs.c"
+      - "sys/geom/geom_event.c"
+      - "sys/geom/geom_slice.c"
+    focus: >
+      Document the GEOM stackable storage framework that sits between the
+      buffer cache / VFS layer and physical device drivers. Explain the
+      provider/consumer/class model, how bio requests are transformed and
+      forwarded down the stack, the g_event thread, topology locking, and
+      how GEOM classes (mirror, eli, part, label, etc.) compose to build
+      transformations like RAID, encryption, and partitioning.
+    key_questions:
+      - "What are GEOM providers, consumers, and classes — and how does a class express a transformation?"
+      - "How does a bio request travel down a GEOM stack from g_io_request to a disk driver, and back up via g_io_deliver?"
+      - "Why does GEOM have a single-threaded g_event/topology model, and what is the topology lock protecting?"
+      - "How does geom_vfs bridge VFS struct buf I/O into the GEOM bio world?"
+    mermaid: flowchart
+
+  - title: "CAM — Common Access Method storage stack"
+    output_file: "sys/cam/README.md"
+    source_dirs:
+      - "sys/cam"
+      - "sys/cam/scsi"
+      - "sys/cam/ata"
+      - "sys/cam/nvme"
+    source_files:
+      - "sys/cam/cam.h"
+      - "sys/cam/cam_ccb.h"
+      - "sys/cam/cam_xpt.c"
+      - "sys/cam/cam_periph.c"
+      - "sys/cam/cam_sim.c"
+      - "sys/cam/cam_iosched.c"
+      - "sys/cam/scsi/scsi_da.c"
+      - "sys/cam/scsi/scsi_all.c"
+      - "sys/cam/ata/ata_da.c"
+      - "sys/cam/nvme/nvme_all.c"
+    focus: >
+      Document CAM, the Common Access Method storage stack. CAM sits
+      between GEOM (chapter 9 — bio requests on virtual storage
+      providers) and the actual host bus adapter (HBA) drivers. Cover
+      the three main pieces: the **transport (XPT)** that owns the
+      bus/target/LUN topology and routes Command Control Blocks
+      (CCBs); the **SIM** (SCSI Interface Module) layer — what an HBA
+      driver actually implements; and the **peripheral drivers** (da
+      for SCSI disks, ada for ATA disks, nda for NVMe namespaces, cd
+      for optical, sa for tape) that turn a disk-shaped device into a
+      GEOM provider. Cover the CCB lifecycle (allocation → XPT →
+      SIM → device → completion), the cam_iosched I/O scheduler, and
+      how SCSI/ATA/NVMe transports coexist under one CCB-based
+      framework. Show how a read() on /dev/da0 traverses VFS → buffer
+      cache → GEOM → CAM peripheral (da) → XPT → SIM → HBA driver.
+    key_questions:
+      - "What is a Command Control Block (union ccb), and how does its discriminated union represent SCSI, ATA, and NVMe commands uniformly?"
+      - "What is the boundary between an HBA driver (the SIM) and the CAM XPT — what does the SIM owe XPT, and what does XPT do for the SIM?"
+      - "How does a peripheral driver like da(4) attach to a target/LUN discovered by XPT, and how does it expose itself as a GEOM provider?"
+      - "How does cam_iosched's I/O scheduling interact with GEOM-level queueing — who decides ordering, who decides concurrency?"
+    mermaid: class
 
   - title: "Virtual File System (VFS) Layer"
     output_file: "sys/fs/README.md"
@@ -198,6 +319,37 @@ chapters:
       - "How does FFS allocate inodes and data blocks?"
     mermaid: flowchart
 
+  - title: "ZFS Filesystem"
+    # Upstream OpenZFS ships its own README.md at sys/contrib/openzfs/ —
+    # use a sibling name to avoid the read-vs-write collision.
+    output_file: "sys/contrib/openzfs/README_freebsd.md"
+    source_dirs:
+      - "sys/contrib/openzfs/module/zfs"
+      - "sys/contrib/openzfs/include/sys"
+    source_files:
+      - "sys/contrib/openzfs/module/zfs/arc.c"
+      - "sys/contrib/openzfs/module/zfs/dmu.c"
+      - "sys/contrib/openzfs/module/zfs/spa.c"
+      - "sys/contrib/openzfs/module/zfs/vdev.c"
+      - "sys/contrib/openzfs/module/zfs/zil.c"
+      - "sys/contrib/openzfs/module/zfs/zio.c"
+      - "sys/contrib/openzfs/module/zfs/zfs_vnops.c"
+    focus: >
+      Document the ZFS architecture as it ships in FreeBSD via OpenZFS.
+      Cover the layered design: zpool/vdev (storage virtualization), SPA
+      (storage pool allocator), DMU (data management unit, transactional
+      object layer), DSL (dataset/snapshot layer), ZIL (intent log), ZIO
+      (I/O pipeline), ARC (adaptive replacement cache), and the ZPL
+      (POSIX layer that bridges into VFS). Explain copy-on-write,
+      transaction groups, and how ZFS bypasses the buffer cache by
+      caching in the ARC instead.
+    key_questions:
+      - "What is the layering from a userspace read() down through ZPL → DMU → ARC → ZIO → vdev?"
+      - "How do transaction groups (txg) batch writes, and what triggers a txg sync?"
+      - "Why does ZFS use the ARC instead of the FreeBSD buffer cache, and how does that interact with the VM page cache?"
+      - "What is the role of the ZIL, and when is it actually written to (sync writes vs async)?"
+    mermaid: class
+
   - title: "Network Stack Architecture"
     output_file: "sys/net/README.md"
     source_dirs:
@@ -221,6 +373,86 @@ chapters:
       - "What is netisr and why does FreeBSD use network threads?"
       - "How are socket buffers (sbappend/sbreserve) managed?"
     mermaid: sequence
+
+  - title: "VNET — Virtual Network Stacks"
+    output_file: "sys/net/README_vnet.md"
+    source_dirs:
+      - "sys/net"
+    source_files:
+      - "sys/net/vnet.c"
+      - "sys/net/vnet.h"
+    focus: >
+      Document VNET, FreeBSD's per-jail network-stack virtualization.
+      VNET turns nearly every global in the network stack — ifnet
+      lists, routing tables, pf/ipfw rule sets, TCP/UDP PCB hashes,
+      net.* sysctl values — into a per-vnet instance, so a vnet jail
+      sees a completely independent network world. Cover the
+      VNET_DEFINE / VNET / CURVNET_SET machinery, how vnet context is
+      switched on every packet entering or leaving a jail, the
+      destruction protocol (deferred teardown), and the cost model
+      (memory per vnet, sysctl overhead). Distinguish from chapter 12
+      (jail process isolation) — VNET is the network half.
+    key_questions:
+      - "What does VNET_DEFINE actually expand to, and how is per-vnet storage laid out at link time?"
+      - "How does CURVNET_SET / CURVNET_RESTORE switch the vnet context on a per-packet basis without locking overhead?"
+      - "What is the relationship between a jail and a vnet — when does a jail get its own vnet, and when does it share the host's?"
+      - "How is a vnet torn down safely when its jail is destroyed, given that mbufs and timers may still reference its state?"
+    mermaid: class
+
+  - title: "pf — OpenBSD-derived Packet Filter"
+    output_file: "sys/netpfil/pf/README.md"
+    source_dirs:
+      - "sys/netpfil/pf"
+    source_files:
+      - "sys/netpfil/pf/pf.c"
+      - "sys/netpfil/pf/pf_ioctl.c"
+      - "sys/netpfil/pf/pf_lb.c"
+      - "sys/netpfil/pf/pf_norm.c"
+      - "sys/netpfil/pf/pf.h"
+      - "sys/netpfil/pf/if_pfsync.c"
+      - "sys/netpfil/pf/if_pflog.c"
+    focus: >
+      Document pf, FreeBSD's OpenBSD-derived packet filter. Cover how
+      pf attaches to the netpfil pfil_hook framework (the same hook
+      points ipfw uses, see ipfw chapter), pf's rule evaluation model,
+      the state table, NAT, normalization (scrub), the if_pfsync
+      state-replication protocol used in HA pairs, and if_pflog.
+      Explain pf's last-matching-rule-wins semantics and the role of
+      "quick" rules.
+    key_questions:
+      - "What is a pfil hook, and how does pf register itself into the IP input/output paths from chapter 9?"
+      - "How is pf's state table structured, and what does a stateful rule actually create?"
+      - "How does pfsync replicate state to a peer, and what makes a pf+CARP cluster work?"
+      - "What does scrub do, and why is normalization done before filtering?"
+    mermaid: flowchart
+
+  - title: "ipfw and dummynet — FreeBSD's Native Firewall"
+    output_file: "sys/netpfil/ipfw/README.md"
+    source_dirs:
+      - "sys/netpfil/ipfw"
+    source_files:
+      - "sys/netpfil/ipfw/ip_fw2.c"
+      - "sys/netpfil/ipfw/ip_fw_dynamic.c"
+      - "sys/netpfil/ipfw/ip_fw_table.c"
+      - "sys/netpfil/ipfw/ip_fw_nat.c"
+      - "sys/netpfil/ipfw/ip_dummynet.c"
+      - "sys/netpfil/ipfw/ip_dn_io.c"
+    focus: >
+      Document ipfw, FreeBSD's native firewall, and dummynet, the
+      traffic-shaper/AQM subsystem ipfw drives. Cover how ipfw attaches
+      to the same netpfil pfil_hook framework as pf, ipfw's
+      first-matching-rule-wins semantics (opposite of pf), the rule
+      tables (in_kernel hash/radix), dynamic state, in-kernel NAT, and
+      the divert/tee/skipto control flow primitives. Then cover
+      dummynet: pipes, queues, schedulers (FIFO, WF2Q+, FQ-CoDel,
+      FQ-PIE), and how a packet matched by an ipfw rule is enqueued,
+      shaped, and re-injected. Contrast with pf throughout.
+    key_questions:
+      - "How does ipfw's first-matching-rule-wins semantics differ from pf's last-match, and what does that imply for rule design?"
+      - "How does dummynet implement traffic shaping — what is the path from an ipfw 'pipe' rule through to a scheduler dequeue?"
+      - "What is in-kernel NAT in ipfw (libalias-based), and how does it differ from pf's NAT?"
+      - "When does FreeBSD load both pf and ipfw simultaneously, and how do their pfil hook orderings interact?"
+    mermaid: flowchart
 
   - title: "Device Driver Framework"
     output_file: "sys/kern/README_driver.md"
@@ -260,6 +492,42 @@ chapters:
       - "How does FreeBSD handle interrupts in an SMP environment?"
     mermaid: sequence
 
+  - title: "NIC Drivers — from if_em to iflib to if_cxgbe"
+    output_file: "sys/dev/README_nic_drivers.md"
+    source_dirs:
+      - "sys/dev/e1000"
+      - "sys/dev/cxgbe"
+    source_files:
+      - "sys/net/iflib.h"
+      - "sys/net/iflib.c"
+      - "sys/dev/e1000/if_em.c"
+      - "sys/dev/e1000/em_txrx.c"
+      - "sys/dev/cxgbe/t4_main.c"
+      - "sys/dev/cxgbe/adapter.h"
+    focus: >
+      Compare three points on the FreeBSD NIC-driver complexity
+      spectrum, using each as a lens onto a different design choice.
+      Start with **if_em** (Intel 1 Gbps) as a present-day iflib
+      consumer — show how iflib reduces the driver to a small set of
+      device-specific methods (txd_encap, rxd_pkt_get, etc.) and
+      iflib_softc state, with the framework owning the queues, polling
+      loop, and netmap integration. Then dive into **iflib itself**
+      (sys/net/iflib.c, ~6000 lines): the abstractions it imposes —
+      tx/rx queues, descriptor rings, multi-queue mapping, NUMA-aware
+      buffer pools — and why FreeBSD pushed common code up out of
+      individual drivers. Finally use **if_cxgbe** (Chelsio T4/T5/T6
+      10/25/40/100 Gbps) as the case where iflib is *not* enough: it's
+      a non-iflib driver because its hardware exposes far more
+      capabilities (TOE, RDMA, crypto offload, NVMe-over-fabrics) than
+      iflib's model accommodates. Show what a "complex" NIC driver
+      looks like and why it earned its complexity.
+    key_questions:
+      - "What concrete callbacks does an iflib-based driver like if_em provide, and what does iflib do for it that the driver no longer has to?"
+      - "How do tx and rx descriptor rings flow through iflib — from a driver mbuf-encap call down to a hardware ring write, and from interrupt back up to ether_input?"
+      - "Why is if_cxgbe NOT an iflib driver? Which features of the Chelsio hardware (TOE, multi-queue with NIC/TOE/RDMA partitioning, hardware filters) make iflib's abstractions unsuitable?"
+      - "What does t4_main.c attach actually do — how is the chip brought up, firmware loaded, and queues partitioned across NIC/offload roles?"
+    mermaid: class
+
   - title: "Jails and System Isolation"
     output_file: "sys/kern/README_jail.md"
     source_dirs:
@@ -277,22 +545,86 @@ chapters:
       - "What is the difference between jail parameters (allow.*)?"
     mermaid: flowchart
 
-  - title: "The FreeBSD Build System"
-    output_file: "share/mk/README.md"
+  - title: "Capsicum Capability Mode"
+    output_file: "sys/kern/README_capsicum.md"
     source_dirs:
-      - "share/mk"
-      - "tools/build"
+      - "sys/kern"
     source_files:
-      - "Makefile.inc1"
-      - "share/mk/bsd.sys.mk"
-      - "share/mk/bsd.kmod.mk"
-      - "share/mk/bsd.prog.mk"
+      - "sys/kern/sys_capability.c"
+      - "sys/kern/kern_descrip.c"
+      - "sys/sys/capsicum.h"
+      - "sys/sys/caprights.h"
     focus: >
-      Explain how FreeBSD builds: the Makefile hierarchy, .conf files,
-      options handling, and the difference between buildworld and buildkernel.
-      Cover the staging areas and dependency tracking.
+      Document Capsicum, FreeBSD's capability-based sandboxing framework.
+      Cover the two pieces: capability mode (cap_enter — the process
+      drops the ability to access any global namespace) and capability
+      rights (per-file-descriptor rights bitmasks limiting what can be
+      done with each fd). Explain how this is enforced at the syscall
+      entry layer, why it's per-fd rather than per-syscall, and how it
+      composes with jails (orthogonal — Capsicum sandboxes individual
+      processes, jails partition the system).
     key_questions:
-      - "How does 'make buildworld' orchestrate the full build?"
-      - "What is the role of Makefile.inc1?"
-      - "How are kernel .conf files processed into source sets?"
+      - "What changes for a process after cap_enter() — which syscalls become unavailable, and why those specifically?"
+      - "How are capability rights stored on a struct file, and where is the rights check actually performed?"
+      - "How does Capsicum differ architecturally from jails (chapter 12) and from MAC?"
+      - "How does a real-world consumer (e.g. tcpdump, dhclient) restructure itself to run capability-mode-clean?"
     mermaid: flowchart
+
+  - title: "bhyve Hypervisor — VMM Kernel Module"
+    output_file: "sys/amd64/vmm/README.md"
+    source_dirs:
+      - "sys/amd64/vmm"
+      - "sys/amd64/vmm/intel"
+      - "sys/amd64/vmm/amd"
+    source_files:
+      - "sys/amd64/vmm/vmm.c"
+      - "sys/amd64/vmm/vmm_dev_machdep.c"
+      - "sys/amd64/vmm/vmm_instruction_emul.c"
+      - "sys/amd64/vmm/vmm_lapic.c"
+      - "sys/amd64/vmm/vmm_mem_machdep.c"
+      - "sys/amd64/vmm/intel/vmx.c"
+      - "sys/amd64/vmm/amd/svm.c"
+    focus: >
+      Document the kernel half of bhyve, FreeBSD's type-2 hypervisor.
+      Userspace bhyve(8) (in usr.sbin/bhyve/) presents the device model
+      (virtio, PCI emulation, UEFI, etc.); the kernel module covered
+      here owns the VT-x/SVM machinery: vCPU state, EPT/NPT shadow
+      paging, VM-exit dispatch, instruction emulation for MMIO, the
+      local APIC emulation, and the ioctl interface that userspace
+      drives. Cover the vmrun loop, how a guest VM-exits and the
+      kernel decides to handle it inline (e.g. APIC writes) vs return
+      to userspace (e.g. MMIO to a virtio device), and the dirty-bit
+      tracking used for live migration / snapshots.
+    key_questions:
+      - "What is the run loop a vCPU executes in vmm.c, and what triggers a VM-exit out of guest mode?"
+      - "How does VMM use Intel VT-x EPT (or AMD NPT) to give the guest its own physical address space, and how is this related to the host VM system from chapter 4?"
+      - "When a guest does MMIO, how does the instruction emulator decode the trapping instruction, and when does the kernel hand off to userspace for actual emulation?"
+      - "What is the split between vmm.ko (machine-independent dispatch) and the intel/ vs amd/ subdirectories?"
+    mermaid: sequence
+
+  - title: "DTrace Framework"
+    output_file: "sys/cddl/dev/dtrace/README.md"
+    source_dirs:
+      - "sys/cddl/dev/dtrace"
+      - "sys/cddl/contrib/opensolaris/uts/common/dtrace"
+    source_files:
+      - "sys/cddl/contrib/opensolaris/uts/common/dtrace/dtrace.c"
+      - "sys/cddl/dev/dtrace/dtrace_ioctl.c"
+      - "sys/cddl/dev/dtrace/dtrace_load.c"
+      - "sys/cddl/dev/dtrace/fasttrap.c"
+    focus: >
+      Document the DTrace framework as it lives in the FreeBSD kernel.
+      Cover the architecture: providers (sdt, fbt, syscall, profile,
+      proc, fasttrap, etc.) register probes with the DTrace framework;
+      the DIF interpreter executes user-supplied D code in-kernel against
+      probe context; ECBs (Enabling Control Blocks) and aggregations
+      record results; the userspace dtrace(1) command parses D, compiles
+      to DIF, and pulls results back. Explain how this differs from
+      ad-hoc kernel printf debugging and why it's safe to enable in
+      production.
+    key_questions:
+      - "What is a DTrace provider, and how does fbt (function boundary tracing) instrument every kernel function at runtime?"
+      - "What does the DIF interpreter actually execute, and why is that bounded/safe (no loops, bounded memory access)?"
+      - "How does an ECB connect a probe to an action, and how do aggregations produce summary statistics without per-event userspace traffic?"
+      - "What is the role of fasttrap, and how does it instrument userspace processes?"
+    mermaid: class

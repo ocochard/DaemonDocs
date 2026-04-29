@@ -284,20 +284,45 @@ Each chapter has:
 - `sections` — *(optional)* which template sections this chapter should produce. Defaults to the full set: `Quick Summary`, `Architecture`, `Key Data Structures`, `Deep Dive`, `Flow / Diagram`, `Advanced Notes`, `Comparison`, `See Also`. A tree-overview chapter, for example, can drop `Key Data Structures` and `Deep Dive` because there's no specific subsystem to feature. The catalog of valid section names lives in `_SECTION_CATALOG` in `generate-doc.py`.
 - `scope_guard` — *(optional)* free-text hard rule injected into the writer prompt under `## Scope Guard`. Use this when section selection alone isn't enough to keep the writer on-topic. The tree-overview chapter uses it to forbid pulling subsystem internals (vm_page, struct proc, etc.) from referenced source directories.
 
-Current chapters (13):
+Current chapters (24), grouped by subsystem family:
+
+**Boot & kernel core**
 1. FreeBSD Source Tree Overview
-2. The FreeBSD Kernel — Structure and Entry Point
-3. UEFI Bootloader-to-Kernel Handoff
-4. Virtual Memory Subsystem
-5. Process Management and Scheduling
-6. The Buffer Cache and I/O Subsystem
-7. Virtual File System (VFS) Layer
-8. UFS Filesystem Implementation
-9. Network Stack Architecture
-10. Device Driver Framework
-11. Interrupt Handling
-12. Jails and System Isolation
-13. The FreeBSD Build System
+2. UEFI Bootloader-to-Kernel Handoff
+3. The FreeBSD Kernel — Structure and Entry Point
+4. The FreeBSD Build System
+
+**Memory & process**
+5. Virtual Memory Subsystem
+6. Process Management and Scheduling
+7. Kernel Locking Primitives
+
+**Storage I/O**
+8. The Buffer Cache and I/O Subsystem
+9. GEOM Storage Framework
+10. CAM — Common Access Method storage stack
+11. Virtual File System (VFS) Layer
+12. UFS Filesystem Implementation
+13. ZFS Filesystem
+
+**Networking**
+14. Network Stack Architecture
+15. VNET — Virtual Network Stacks
+16. pf — OpenBSD-derived Packet Filter
+17. ipfw and dummynet — FreeBSD's Native Firewall
+
+**Devices & interrupts**
+18. Device Driver Framework
+19. Interrupt Handling
+20. NIC Drivers — from if_em to iflib to if_cxgbe
+
+**Security & isolation**
+21. Jails and System Isolation
+22. Capsicum Capability Mode
+
+**Virtualization & observability**
+23. bhyve Hypervisor — VMM Kernel Module
+24. DTrace Framework
 
 ---
 
@@ -313,7 +338,16 @@ Each chapter produces a markdown file in the FreeBSD source tree:
 | `sys/kern/` | `README_process.md`, `README_driver.md`, `README_intr.md`, `README_jail.md` |
 | `sys/fs/` | `README.md` |
 | `sys/ufs/` | `README.md` |
-| `sys/net/` | `README.md` |
+| `sys/net/` | `README.md`, `README_vnet.md` |
+| `sys/geom/` | `README.md` |
+| `sys/contrib/openzfs/` | `README_freebsd.md` |
+| `sys/kern/` | `README_capsicum.md`, `README_locking.md` (in addition to others above) |
+| `sys/netpfil/pf/` | `README.md` |
+| `sys/netpfil/ipfw/` | `README.md` |
+| `sys/cddl/dev/dtrace/` | `README.md` |
+| `sys/amd64/vmm/` | `README.md` |
+| `sys/cam/` | `README.md` |
+| `sys/dev/` | `README_nic_drivers.md` |
 | `stand/efi/loader/` | `README.md` |
 | `share/mk/` | `README.md` |
 
