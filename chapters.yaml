@@ -11,7 +11,7 @@
 #   mermaid      — what diagram to include (sequence / flowchart / class / state)
 
 chapters:
-  - title: "FreeBSD Source Tree Overview"
+  - title: "Source Tree — Layout and Conventions"
     # NOTE: output is README_internals.md, not README.md — upstream FreeBSD
     # already ships a README.md at the tree root (and we read it as a source
     # file below). Writing there would clobber upstream and cause a
@@ -55,7 +55,7 @@ chapters:
       - "How are architecture-specific files organized?"
     mermaid: flowchart
 
-  - title: "UEFI Bootloader-to-Kernel Handoff"
+  - title: "Boot Process — UEFI Bootloader to Kernel Handoff"
     output_file: "stand/efi/loader/README.md"
     source_dirs:
       - "stand/efi/loader"
@@ -74,7 +74,7 @@ chapters:
       - "Why is the EFI memory map critical for VM initialization?"
     mermaid: sequence
 
-  - title: "The FreeBSD Kernel — Structure and Entry Point"
+  - title: "Kernel Core — Structure and Entry Point"
     output_file: "sys/README.md"
     source_dirs:
       - "sys/kern"
@@ -96,7 +96,7 @@ chapters:
       - "What is the role of locore.S on each architecture?"
     mermaid: sequence
 
-  - title: "The FreeBSD Build System"
+  - title: "Build System — buildworld and buildkernel"
     output_file: "share/mk/README.md"
     source_dirs:
       - "share/mk"
@@ -116,7 +116,7 @@ chapters:
       - "How are kernel .conf files processed into source sets?"
     mermaid: flowchart
 
-  - title: "Virtual Memory Subsystem"
+  - title: "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
     output_file: "sys/vm/README.md"
     source_dirs:
       - "sys/vm"
@@ -138,7 +138,7 @@ chapters:
       - "How does the pmap layer abstract hardware page tables?"
     mermaid: class
 
-  - title: "Process Management and Scheduling"
+  - title: "Process Management — Scheduling and Lifecycle"
     output_file: "sys/kern/README_process.md"
     source_dirs:
       - "sys/kern"
@@ -158,7 +158,7 @@ chapters:
       - "How does the 4BSD scheduler decide which thread runs next?"
     mermaid: sequence
 
-  - title: "Kernel Locking Primitives"
+  - title: "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
     output_file: "sys/kern/README_locking.md"
     source_dirs:
       - "sys/kern"
@@ -192,7 +192,7 @@ chapters:
       - "What is the difference between a spin mutex and a sleep mutex, and which contexts force you to use a spin mutex?"
     mermaid: class
 
-  - title: "The Buffer Cache and I/O Subsystem"
+  - title: "Buffer Cache — Block I/O Subsystem"
     output_file: "sys/vm/README_bcache.md"
     source_dirs:
       - "sys/kern"
@@ -211,7 +211,7 @@ chapters:
       - "What happens when a dirty buffer is written back to disk?"
     mermaid: flowchart
 
-  - title: "GEOM Storage Framework"
+  - title: "GEOM — Storage Framework"
     output_file: "sys/geom/README.md"
     source_dirs:
       - "sys/geom"
@@ -238,7 +238,7 @@ chapters:
       - "How does geom_vfs bridge VFS struct buf I/O into the GEOM bio world?"
     mermaid: flowchart
 
-  - title: "CAM — Common Access Method storage stack"
+  - title: "CAM — Common Access Method Storage Stack"
     output_file: "sys/cam/README.md"
     source_dirs:
       - "sys/cam"
@@ -278,7 +278,7 @@ chapters:
       - "How does cam_iosched's I/O scheduling interact with GEOM-level queueing — who decides ordering, who decides concurrency?"
     mermaid: class
 
-  - title: "Virtual File System (VFS) Layer"
+  - title: "VFS — Virtual File System Layer"
     output_file: "sys/fs/README.md"
     source_dirs:
       - "sys/fs"
@@ -300,7 +300,7 @@ chapters:
       - "How does pathname resolution work (VOP_LOOKUP)?"
     mermaid: class
 
-  - title: "UFS Filesystem Implementation"
+  - title: "UFS — FreeBSD's Native Filesystem"
     output_file: "sys/ufs/README.md"
     source_dirs:
       - "sys/ufs"
@@ -319,7 +319,7 @@ chapters:
       - "How does FFS allocate inodes and data blocks?"
     mermaid: flowchart
 
-  - title: "ZFS Filesystem"
+  - title: "ZFS — Pooled Storage and Copy-on-Write Filesystem"
     # Upstream OpenZFS ships its own README.md at sys/contrib/openzfs/ —
     # use a sibling name to avoid the read-vs-write collision.
     output_file: "sys/contrib/openzfs/README_freebsd.md"
@@ -350,7 +350,7 @@ chapters:
       - "What is the role of the ZIL, and when is it actually written to (sync writes vs async)?"
     mermaid: class
 
-  - title: "Network Stack Architecture"
+  - title: "Network Stack — Architecture and Packet Flow"
     output_file: "sys/net/README.md"
     source_dirs:
       - "sys/net"
@@ -426,7 +426,7 @@ chapters:
       - "What does scrub do, and why is normalization done before filtering?"
     mermaid: flowchart
 
-  - title: "ipfw and dummynet — FreeBSD's Native Firewall"
+  - title: "ipfw and dummynet — Native Firewall and Traffic Shaper"
     output_file: "sys/netpfil/ipfw/README.md"
     source_dirs:
       - "sys/netpfil/ipfw"
@@ -454,7 +454,7 @@ chapters:
       - "When does FreeBSD load both pf and ipfw simultaneously, and how do their pfil hook orderings interact?"
     mermaid: flowchart
 
-  - title: "Device Driver Framework"
+  - title: "Device Driver Framework — newbus and devclass"
     output_file: "sys/kern/README_driver.md"
     source_dirs:
       - "sys/kern"
@@ -472,7 +472,7 @@ chapters:
       - "How do drivers request and manage resources (IRQ, DMA, I/O ports)?"
     mermaid: sequence
 
-  - title: "Interrupt Handling"
+  - title: "Interrupt Handling — Threads, Filters, and Dispatch"
     output_file: "sys/kern/README_intr.md"
     source_dirs:
       - "sys/kern"
@@ -538,7 +538,7 @@ chapters:
       - "Why is if_cxgbe NOT an iflib driver? Which features of the Chelsio hardware (TOE, multi-queue with NIC/TOE/RDMA partitioning, hardware filters) make iflib's abstractions unsuitable, in contrast to if_vr (which is pre-iflib) vs if_em (which is iflib-fitted)?"
     mermaid: class
 
-  - title: "Jails and System Isolation"
+  - title: "Jails — OS-level Isolation"
     output_file: "sys/kern/README_jail.md"
     source_dirs:
       - "sys/kern"
@@ -555,7 +555,7 @@ chapters:
       - "What is the difference between jail parameters (allow.*)?"
     mermaid: flowchart
 
-  - title: "Capsicum Capability Mode"
+  - title: "Capsicum — Capability Mode and Sandboxing"
     output_file: "sys/kern/README_capsicum.md"
     source_dirs:
       - "sys/kern"
@@ -580,7 +580,7 @@ chapters:
       - "How does a real-world consumer (e.g. tcpdump, dhclient) restructure itself to run capability-mode-clean?"
     mermaid: flowchart
 
-  - title: "bhyve Hypervisor — VMM Kernel Module"
+  - title: "bhyve — VMM Kernel Module and Hypervisor"
     output_file: "sys/amd64/vmm/README.md"
     source_dirs:
       - "sys/amd64/vmm"
@@ -612,7 +612,7 @@ chapters:
       - "What is the split between vmm.ko (machine-independent dispatch) and the intel/ vs amd/ subdirectories?"
     mermaid: sequence
 
-  - title: "DTrace Framework"
+  - title: "DTrace — Dynamic Tracing Framework"
     output_file: "sys/cddl/dev/dtrace/README.md"
     source_dirs:
       - "sys/cddl/dev/dtrace"
