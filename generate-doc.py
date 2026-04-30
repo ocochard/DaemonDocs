@@ -4418,6 +4418,47 @@ def _strip_existing_nav_block(content: str) -> str:
     return "\n".join(out)
 
 
+def _build_ancestor_chain(current_file: str,
+                          all_files: "set[str]") -> "list[str]":
+    """Return the chapter files that are ancestors of `current_file`.
+
+    Closest first, root last. Two kinds of ancestor:
+
+    1. The plain `README.md` in the *same directory* as a non-plain
+       README (e.g. `sys/vm/README.md` is an ancestor of
+       `sys/vm/README_bcache.md`). The leaf README treats the
+       directory's main README as the canonical "go up one level"
+       target.
+    2. Any chapter whose `output_file` lives in a strict-prefix
+       directory of the current file's directory. The closest such
+       chapter is preferred over deeper ones.
+
+    Same-directory siblings that are *not* the plain README.md are
+    NOT ancestors — those are peers (e.g. all the `sys/kern/README_*`
+    files are peers of each other, not parents).
+    """
+    cur_dir = os.path.dirname(current_file)
+    cur_base = os.path.basename(current_file)
+    out: list[str] = []
+    # 1. Same-dir README.md sibling (if I'm a README_<topic>).
+    if cur_base != "README.md":
+        candidate = os.path.join(cur_dir, "README.md") if cur_dir else "README.md"
+        if candidate in all_files and candidate != current_file:
+            out.append(candidate)
+    # 2. Strict-prefix-directory ancestors. For each ancestor dir
+    # (closest first), pick whichever chapter file lives there.
+    if cur_dir:
+        parts = cur_dir.split("/")
+        for i in range(len(parts) - 1, -1, -1):
+            anc_dir = "/".join(parts[:i])  # "" for root
+            for f in all_files:
+                if f == current_file or f in out:
+                    continue
+                if os.path.dirname(f) == anc_dir:
+                    out.append(f)
+    return out
+
+
 def build_navigation(chapters: List[dict]) -> dict:
     """Build navigation links across all READMEs and a master index.
 
@@ -4456,6 +4497,13 @@ def build_navigation(chapters: List[dict]) -> dict:
         all_chapters = []
         related = chapter_rels.get(title, [])
 
+        # Pre-compute lookups for the ancestor chain: file -> title.
+        file_to_title = {
+            other.get("output_file", "README.md"): other["title"]
+            for other in chapters
+        }
+        all_files: set[str] = set(file_to_title.keys())
+
         for other in chapters:
             other_title = other["title"]
             other_file = other.get("output_file", "README.md")
@@ -4476,6 +4524,19 @@ def build_navigation(chapters: List[dict]) -> dict:
             if other_title in related:
                 nav_links.append(rel_link)
 
+        # Build the ancestor breadcrumb (closest -> root) so a reader
+        # can walk up one directory at a time. See _build_ancestor_chain
+        # for the rule (same-dir README.md sibling + strict-prefix
+        # directory chapters). Same os.path.relpath logic as the cross-
+        # links above.
+        ancestor_files = _build_ancestor_chain(output_file, all_files)
+        ancestor_links = []
+        cur_dir_abs = os.path.dirname(os.path.join(SRC_ROOT, output_file))
+        for anc_file in ancestor_files:
+            anc_abs = os.path.join(SRC_ROOT, anc_file)
+            anc_rel = os.path.relpath(anc_abs, start=cur_dir_abs)
+            ancestor_links.append(f"[{file_to_title[anc_file]}]({anc_rel})")
+
         # Build the sidebar
         sidebar_lines = [
             _AUTO_GEN_BANNER,
@@ -4483,6 +4544,8 @@ def build_navigation(chapters: List[dict]) -> dict:
             "---",
             "**Navigation:**",
         ]
+        if ancestor_links:
+            sidebar_lines.append(f"  **Up:** {' ▸ '.join(ancestor_links)}")
         if nav_links:
             sidebar_lines.append(f"  **Related:** {' | '.join(nav_links[:5])}")
         sidebar_lines.append(f"  **All chapters:** {' | '.join(all_chapters[:8])}{' ...'}")
