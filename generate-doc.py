@@ -2593,6 +2593,46 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         )
         mermaid_json_line = '            "mermaid_diagram": "PASS: not required",\n'
 
+    # Comparison-quality criterion is conditional: chapters that opt out of
+    # the `## Comparison` section (via `sections:` in chapters.yaml) get an
+    # automatic PASS so revisions don't loop on a section that won't exist.
+    # When Comparison IS present, the reviewer is asked to flag the two
+    # specific failure modes seen in real runs:
+    #   1. Tautology — "X uses Y while Z uses Y" (no actual contrast).
+    #   2. Unsupported cross-OS claim — assertions about Linux/macOS/NetBSD
+    #      internals presented as fact with no concrete differentiator.
+    # The reviewer has no cross-OS source corpus, so this is shape-matching
+    # against the draft, not fact-checking against external sources.
+    wants_comparison = "Comparison" in sections
+    if wants_comparison:
+        comparison_criterion = (
+            "        9. **Comparison Quality** — In the `## Comparison` section, every\n"
+            "           contrastive statement must identify a CONCRETE difference. FAIL if\n"
+            "           you find any of:\n"
+            "             - **Tautology:** statements of the form *\"FreeBSD uses X while\n"
+            "               OS_Y also uses X\"* — the claimed contrast is empty (e.g.\n"
+            "               *\"FreeBSD's vm_map is a red-black tree, while Linux uses a\n"
+            "               red-black tree\"*).\n"
+            "             - **Unsupported cross-OS claim:** assertions about Linux / macOS\n"
+            "               / NetBSD / OpenBSD internals stated as fact without naming a\n"
+            "               concrete differentiator (e.g. *\"NetBSD uses SLAB while FreeBSD\n"
+            "               uses UMA\"* — collapses a multi-axis design difference into a\n"
+            "               wrong one-liner).\n"
+            "             - **Vague contrast:** *\"Linux handles this differently\"* with\n"
+            "               no specifics — no struct name, no algorithm name, nothing the\n"
+            "               reader could go look up.\n"
+            "           Quote the offending sentence(s) in `issues` so the writer can rewrite\n"
+            "           or remove them. PASS if every Comparison bullet either gives a\n"
+            "           concrete difference or is removed.\n"
+        )
+        comparison_json_line = '            "comparison_quality": "PASS/FAIL: reason (quote any tautology/unsupported claim)",\n'
+    else:
+        comparison_criterion = (
+            "        9. **Comparison Quality** — N/A for this chapter (no Comparison\n"
+            "           section). Always grade `comparison_quality` as `PASS: not required`.\n"
+        )
+        comparison_json_line = '            "comparison_quality": "PASS: not required",\n'
+
     return textwrap.dedent(f"""\
         You are reviewing a draft chapter for "FreeBSD Internals."
         Your job is to find problems — be strict but fair.
@@ -2675,6 +2715,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            rationale — apply this only where a junior reader would
            reasonably ask "but why is it built that way?"
 
+{comparison_criterion}
         ## Draft to Review
 
         {draft}
@@ -2692,8 +2733,8 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
 {mermaid_json_line}            "accessibility": "PASS/FAIL: reason",
             "structure": "PASS/FAIL: reason",
             "no_marketing": "PASS/FAIL: reason (quote any offending sentences)",
-            "rationale": "PASS/FAIL: reason (quote the paragraph if FAIL)"
-          }},
+            "rationale": "PASS/FAIL: reason (quote the paragraph if FAIL)",
+{comparison_json_line}          }},
           "issues": [
             "Specific issue 1 with actionable fix",
             "Specific issue 2 with actionable fix"

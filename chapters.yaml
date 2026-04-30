@@ -180,6 +180,20 @@ chapters:
       - "What is the role of Makefile.inc1?"
       - "How are kernel .conf files processed into source sets?"
     mermaid: flowchart
+    # Drop Comparison: the FreeBSD build system (Makefile.inc1, share/mk
+    # rule files, src.conf(5)) has no real cross-OS analog at the level of
+    # detail this chapter operates at. Linux uses Kbuild/Kconfig, NetBSD
+    # uses a similar bsd.*.mk family, but a meaningful contrast would be
+    # its own chapter — not a tacked-on Comparison. Without this opt-out,
+    # the writer fills space with weakly-grounded one-liners.
+    sections:
+      - "Quick Summary"
+      - "Architecture"
+      - "Key Data Structures"
+      - "Deep Dive"
+      - "Flow / Diagram"
+      - "Advanced Notes"
+      - "See Also"
 
   - title: "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
     family: "memory-process"
@@ -886,3 +900,17 @@ chapters:
       - "What is the typed-message system in ng_parse, and why does netgraph use it instead of raw byte buffers for control messages?"
       - "How does userland (ngctl(8), libnetgraph) attach to the kernel graph, and how does ng_socket bridge socket I/O to graph messages?"
     mermaid: flowchart
+    # Drop Comparison: netgraph has no real cross-OS analog. Linux
+    # nftables/tc and OpenBSD divert(4) solve narrower, differently-shaped
+    # problems; a meaningful contrast would be its own essay rather than
+    # a tacked-on Comparison section. Without this opt-out the writer
+    # tends to invent weakly-grounded one-liners ("Linux uses tc instead
+    # of netgraph") that mislead more than they explain.
+    sections:
+      - "Quick Summary"
+      - "Architecture"
+      - "Key Data Structures"
+      - "Deep Dive"
+      - "Flow / Diagram"
+      - "Advanced Notes"
+      - "See Also"
