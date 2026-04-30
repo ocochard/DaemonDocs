@@ -17,6 +17,108 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [TOP PRIORITY — OPEN] Struct field names and function-call mechanics not grounded in source; fact-check doesn't reach into struct bodies
+
+Observed on the kernel-core chapter (`sys/README.md`, regenerated
+2026-04-30, fw1-ch3.log). The writer described `struct sysinit` two
+runs in a row with field names that **do not exist in
+`sys/sys/kernel.h`**:
+
+- Draft says: `{ const char *name; int si_sub; int si_order;
+  sysinit_func_t si_func; ... }`
+- Reality: `{ enum sysinit_sub_id subsystem; enum sysinit_elem_order
+  order; STAILQ_ENTRY(sysinit) next; sysinit_cfunc_t func; const void
+  *udata; }`
+
+Every field name is wrong (extra `si_` prefix; `subsystem` →
+`si_sub`; `order` → `si_order`; `func` → `si_func`; `udata` →
+fictional `si_arg`). Every type is wrong (`int` instead of enum;
+`sysinit_func_t` instead of `sysinit_cfunc_t`). The `STAILQ_ENTRY`
+list linkage is missing entirely.
+
+In the same run, the writer also invented a runtime `qsort(sysinit_set,
+sysinit_set_size, sizeof(struct sysinit), sysinit_compar)` call. There
+is no such call. The actual sort is `STAILQ_MERGESORT(list, NULL,
+sysinit_compar, sysinit, next)` in `sys/kern/init_main.c:203`. The
+*previous* run had it closer to right ("merge sort algorithm") and
+the new run **regressed**, replacing a vague-but-correct claim with a
+specific-but-fabricated one.
+
+**Why the pipeline missed it:**
+
+1. **Fact-check only verifies top-level symbol existence.** It checks
+   that `struct sysinit` exists, that `mi_startup` exists, that
+   `sysinit_compar` exists — and they all do. It does **not** parse
+   `sys/sys/kernel.h` to compare the struct's actual field list
+   against the field names the draft claims. So `si_sub`/`si_order`/
+   `si_func` slip through because they look like field references,
+   not symbols.
+2. **Reviewer is tool-less.** It can't read `sys/sys/kernel.h` to
+   confirm field names, so to it `int si_sub` and `enum sysinit_sub_id
+   subsystem` are equally plausible. The reviewer's `accuracy: FAIL`
+   in this run was firing on a *different* fact (`vm_init()` clearing
+   `TDP_NOFAULTING`), not on the struct fields, and not on the
+   fabricated `qsort` call.
+3. **Writer paraphrases from training-data memory** when describing
+   small data structures, despite the existing "quote-don't-paraphrase"
+   prompt rule. The Authoritative Symbol Catalog confirms the *symbol*
+   exists but does not give the writer the *field list*, so the writer
+   fills the gap from memory.
+4. **Cross-run instability.** Two runs of the same chapter produce
+   substantively different (and differently wrong) descriptions of
+   the same struct. This is the user-visible symptom: regenerating a
+   chapter shouldn't change a struct definition.
+
+**Why this is the top priority:** it directly defeats the chapter's
+educational purpose. A reader who copies the `struct sysinit` example
+into their own code, or who tries to `grep` the source for `si_sub`,
+will hit a dead end and lose trust in the entire corpus. Unlike
+prose-level imprecision (which a careful reader can route around),
+fabricated struct fields look authoritative and propagate into reader
+notes and code.
+
+**Possible fixes** (in order of cost / impact):
+
+1. **Strict struct-body fact-check.** When the draft contains a
+   `struct <name> { ... }` code block, parse the cited header
+   (`sys/sys/kernel.h`, etc.) and require every field name in the
+   draft to appear as a field in the real struct. FAIL the chapter
+   on any unknown field name. This is the lowest-cost change and
+   would have caught both runs of the sysinit hallucination.
+   Implementation: add a `_factcheck_struct_bodies` pass alongside
+   the existing path/symbol verification in
+   `_run_factcheck`/`fact_check_draft`.
+2. **Force struct definitions to be verbatim quotes.** Tighten the
+   writer prompt: any `struct X { ... }` block must be the result of
+   `read_freebsd_source` on the defining header — not paraphrased.
+   The writer can elide fields with `/* ... */` but cannot rename or
+   retype them. Pair with (1) so the rule is enforced, not just
+   requested.
+3. **Inject struct field lists into the Authoritative Symbol
+   Catalog.** The catalog already names the struct; extend
+   `_resolve_c_definition` (or its catalog-feeding path) to include
+   the field list for cited structs so the writer has the right
+   answer in front of it instead of guessing.
+4. **Function-call shape verification.** For function calls cited in
+   prose ("`mi_startup` calls `qsort(...)`"), grep the source for the
+   callee within a window of the caller. Catches the fabricated
+   `qsort(sysinit_set, ...)` case. Higher false-positive risk —
+   experiment after (1) lands.
+
+**How to apply:** start with fix (1). It is local to fact-check, can
+be tested against the existing `sys/README.md` regen as a fixture
+(both runs would FAIL fact-check), and does not change writer
+behavior. If (1) reduces the rate without eliminating it, add (2).
+
+**Reproduction:** run `git diff sys/README.md` after the
+2026-04-30 regen — both old and new versions show the same wrong
+field names; the new version additionally fabricates the `qsort`
+call. Ground truth is `sys/sys/kernel.h:struct sysinit` (5 fields:
+`subsystem`, `order`, `next`, `func`, `udata`) and
+`sys/kern/init_main.c:203` (`STAILQ_MERGESORT`, not `qsort`).
+
+---
+
 ### [PARTIALLY MITIGATED] Writer hallucinates heavily on the initial draft (chapter-dependent)
 
 Observed on the buffer cache chapter (`sys/vm/README_bcache.md`,

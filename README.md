@@ -429,3 +429,69 @@ DaemonDocs/
 - **CHM books** require `hhextract` (hh suite) — graceful fallback with warning
 - **Output files** use `README_*` suffix to not overwrite existing FreeBSD README files
 
+---
+
+## Annex — Why citations are not the same as quotations
+
+A subtle failure mode that comes up often enough to be worth naming
+explicitly, because it explains why the pipeline keeps adding
+verification layers instead of "just trusting the writer":
+
+**The writer can produce two visually identical outputs from
+completely different behaviors.**
+
+- **Behavior A (intended).** Read the cited file → find the
+  declaration → quote it verbatim into the draft → write a paragraph
+  explaining what was just quoted.
+- **Behavior B (actual, often).** Recall what the declaration looked
+  like in some version the model trained on → write a plausible-looking
+  C struct or function signature → write the explanatory paragraph
+  about *that* recalled version → cite the file because the model
+  knows the symbol lives there.
+
+Both produce a code block followed by `cited from sys/sys/kernel.h`.
+A reader can't tell them apart. The fact that the citation is
+correct (the symbol *does* live in that file) makes Behavior B feel
+grounded even when the content was synthesized from memory.
+
+A real example, observed on `sys/README.md` regenerated 2026-04-30:
+the writer's tool transcript shows `sys/sys/kernel.h` was **never
+read** during the run, yet the draft contains a `struct sysinit { ... }`
+code block citing that header. The block uses field names
+(`si_sub`, `si_order`, `si_func`) that don't exist — the real fields
+are `subsystem`, `order`, `next`, `func`, `udata`. The citation is
+navigationally correct ("this lives in kernel.h") but quotationally
+fictional ("this is what kernel.h says").
+
+This is why the pipeline takes a **defense-in-depth** approach
+instead of relying on prompt rules alone:
+
+1. **Authoritative Symbol Catalog** (pre-draft). Verifies that cited
+   symbols exist before the writer composes prose. Catches "function
+   `foo_bar` doesn't exist" — but not "function `foo_bar` exists with
+   different arguments than you described."
+2. **Reviewer rubric** (post-draft, tool-less). Grades shape:
+   completeness, structure, marketing language, comparison quality.
+   Cannot fact-check fields or call signatures because it has no way
+   to read the source.
+3. **Fact-check** (post-revision). Re-greps the source for cited
+   paths, symbols, macros, DTrace probes — anything top-level. Catches
+   "you cited `sys/kern/init_main.c:sysinit_compar` but it's actually
+   in `sys/kern/init_main.c:sysinit_mklist`" — but currently does not
+   reach into struct bodies or function call mechanics.
+
+Each layer covers a different failure mode. None of them, individually,
+prevents Behavior B. Together they catch most of it; what remains is
+the open question tracked in `FUTURE_IMPROVEMENTS.md`: extending
+fact-check to verify struct field names and function-call shapes
+against the actual source, so a citation can no longer claim more
+than it earned.
+
+The take-away for anyone reading or extending this project:
+**a citation is a navigation hint, not proof of grounding.** The
+verification layers exist precisely because the writer's
+intent-to-quote and its actual-content can diverge silently. Treat
+"this cites sys/foo.h" as "this *says* it came from sys/foo.h" —
+and rely on the verification layers, not the citation, for whether
+the content matches the source.
+
