@@ -47,6 +47,14 @@ chapters:
     # snippets and code walks from sys/vm and sys/kern into the main
     # README, which then duplicates (and often contradicts) the
     # subsystem-specific chapters. Keep it strictly directory-purpose.
+    #
+    # Build-system carve-out: chapter 4 ("Build System — buildworld and
+    # buildkernel") owns *how* the build works (Makefile.inc1, share/mk
+    # rules, build phases, src.conf options, kernel config processing,
+    # cross-compilation). This chapter owns *what lives where* in the
+    # source tree. Without the explicit guard below, both chapters end
+    # up walking through `make buildworld` phases — observed 2026-04-30
+    # on the buildworld-flow key_question.
     scope_guard: >
       This is a tree-level overview. Do NOT feature specific subsystem
       structs (vm_page, vm_map, struct proc, struct vnode, struct
@@ -55,19 +63,32 @@ chapters:
       sys/kern, give a one-sentence directory-purpose only and refer the
       reader to the relevant chapter. No struct field-by-field tables,
       no function-body excerpts, no #include details.
+
+      Do NOT explain *how* the build system works — Makefile.inc1, the
+      share/mk rule library, build phases (bootstrap tools, cross-tools,
+      libraries, userland, kernel), src.conf(5) options, dependency
+      tracking, out-of-tree builds, kernel config processing, and cross-
+      compilation all belong to the Build System chapter (share/mk/README.md).
+      You may mention that `make buildworld` exists, name the top-level
+      Makefile, and link to the Build System chapter for details — but
+      do NOT walk through the buildworld flow, do NOT enumerate the
+      bsd.*.mk files, and do NOT show Makefile snippets here.
     source_dirs: []
     source_files:
       - "README.md"
       - "Makefile"
       - "UPDATING"
     focus: >
-      Map the FreeBSD source tree layout. Explain how the build system organizes
-      userland, kernel, libraries, and contributed code. Cover the roles of
-      bin/, sbin/, usr.bin/, usr.sbin/, lib/, sys/, stand/, contrib/, and gnu/.
+      Map the FreeBSD source tree layout: the directory taxonomy and the
+      principle that source location mirrors install path. Cover the roles
+      of bin/, sbin/, usr.bin/, usr.sbin/, lib/, sys/, stand/, contrib/,
+      gnu/, cddl/, share/, rescue/, and tests/. Explain the licensing
+      groups (base BSD code vs contrib/gnu/cddl). The *how* of the build
+      itself is the Build System chapter's job — only point at it from here.
     key_questions:
-      - "How does the FreeBSD build system (make buildworld) traverse the tree?"
-      - "What is the separation between base system and contrib code?"
-      - "How are architecture-specific files organized?"
+      - "What lives in each top-level directory, and why?"
+      - "What is the separation between base system and contrib/gnu/cddl code?"
+      - "How are architecture-specific files organized under sys/ and stand/?"
     mermaid: flowchart
 
   - title: "Boot Process — UEFI Bootloader to Kernel Handoff"
@@ -134,6 +155,22 @@ chapters:
       - "share/mk/bsd.sys.mk"
       - "share/mk/bsd.kmod.mk"
       - "share/mk/bsd.prog.mk"
+    # Companion guard to chapter 1 (Source Tree). The directory taxonomy
+    # — what lives in bin/, sbin/, usr.bin/, lib/, contrib/, gnu/, etc.
+    # — is owned by README_internals.md. Without this guard, the writer
+    # restates the taxonomy here as preamble to "and then make builds
+    # them," which duplicates ~half of chapter 1.
+    scope_guard: >
+      This chapter is about *how* the build orchestrates compilation, not
+      *where* the source code lives. Do NOT enumerate the directory
+      taxonomy (bin/ for system commands, sbin/ for system admin, lib/
+      for libraries, contrib/ for third-party code, etc.) — that belongs
+      to the Source Tree chapter (README_internals.md). When you need to
+      reference where a category of source lives, give it a single phrase
+      and link to the Source Tree chapter. Focus your prose on the
+      Makefile hierarchy, share/mk rule files, build phases and their
+      ordering, src.conf(5) options, kernel config processing, cross-
+      compilation, dependency tracking, and out-of-tree builds.
     focus: >
       Explain how FreeBSD builds: the Makefile hierarchy, .conf files,
       options handling, and the difference between buildworld and buildkernel.
