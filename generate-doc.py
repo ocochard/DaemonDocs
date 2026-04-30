@@ -4479,10 +4479,18 @@ def build_navigation(chapters: List[dict]) -> dict:
 
 def _add_see_also_links(content: str, title: str, title_map: dict,
                         current_file: str, chapter_rels: dict) -> str:
-    """Add cross-links to the See Also section of a README."""
+    """Add cross-links to the See Also section of a README.
+
+    Idempotent: any list-item line in the See Also section whose link
+    target points at a known chapter README (i.e. matches a value in
+    `title_map`) is treated as auto-generated and stripped before fresh
+    links are inserted. The writer's own See Also content uses different
+    relative paths (e.g. `vm/README.md` from inside `sys/`) and is left
+    alone. Without this, every nav rebuild prepended another copy and
+    READMEs accumulated dozens of duplicate link blocks
+    (sys/vm/README_bcache.md hit 14 copies on 2026-04-30).
+    """
     related = chapter_rels.get(title, [])
-    if not related:
-        return content
 
     # Find the See Also section
     see_also_idx = content.find("\n## See Also\n")
@@ -4491,7 +4499,51 @@ def _add_see_also_links(content: str, title: str, title_map: dict,
     if see_also_idx == -1:
         return content
 
-    # Build cross-links
+    # ---- Strip any prior auto-generated list items in this section ----
+    # Build the set of relative paths that point at a chapter README,
+    # computed from this file's vantage point. A list-item with one of
+    # those targets was inserted by a previous run.
+    auto_targets: set[str] = set()
+    for ch_title, ch_file in title_map.items():
+        if ch_file == current_file:
+            continue
+        rel_dir = os.path.dirname(ch_file) or "."
+        if rel_dir == ".":
+            auto_targets.add(os.path.basename(ch_file))
+        else:
+            depth = len(rel_dir.split("/")) + 1
+            auto_targets.add("../" * depth + ch_file)
+
+    # Section spans from after the header line to the next `## ` heading
+    # or end of file. Operate line-by-line within that span.
+    header_end = see_also_idx + len("\n## See Also")
+    # Skip to end of header line (handles "## See Also" with trailing
+    # whitespace or text on the same line).
+    nl_after_header = content.find("\n", header_end)
+    if nl_after_header == -1:
+        return content
+    body_start = nl_after_header + 1
+
+    # Find end of section (next top-level heading or EOF).
+    next_h2 = re.search(r"(?m)^## ", content[body_start:])
+    body_end = body_start + next_h2.start() if next_h2 else len(content)
+
+    section_body = content[body_start:body_end]
+    auto_link_re = re.compile(r"^\s*-\s*\[[^\]]+\]\(([^)]+)\)")
+    kept_lines = []
+    for line in section_body.split("\n"):
+        m = auto_link_re.match(line)
+        if m and m.group(1) in auto_targets:
+            continue  # drop a prior auto-inserted link
+        kept_lines.append(line)
+    # Collapse runs of >1 blank lines that the strip may have left behind.
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept_lines))
+    content = content[:body_start] + cleaned + content[body_end:]
+
+    if not related:
+        return content
+
+    # ---- Build fresh cross-links ----
     links = []
     for rel_title in related:
         rel_file = title_map.get(rel_title)
