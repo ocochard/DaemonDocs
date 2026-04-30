@@ -238,9 +238,9 @@ reviewer) are still on hold — Option 1 has been good enough so far.
 ### [DONE] Writer can drift into "I'm a coding agent that writes files" mode and emit a status string instead of the chapter
 
 Observed on chapter 7 (VFS) when running against a second llama-server
-endpoint (192.168.100.136) on 2026-04-28. Same model
-(`Qwen3.6-35B-A3B-UD-Q4_K_XL`) as the primary endpoint, but slightly
-different sampling defaults exposed by `/props`.
+endpoint on 2026-04-28. Same model (`Qwen3.6-35B-A3B-UD-Q4_K_XL`) as
+the primary endpoint, but slightly different sampling defaults exposed
+by `/props`.
 
 What happened, step by step:
 
@@ -280,8 +280,8 @@ exhibit this — it returns the chapter via `final_answer()` correctly.
    draft. Documented in `CODE_MAP.md` ("Stub detection").
 3. **Sampler params pinned** — `create_writer_agent` and
    `create_reviewer_agent` pass `temperature=0.6, top_p=0.95` to
-   `OpenAIServerModel` so fw1 and fw2 endpoints behave identically
-   regardless of what each llama-server has as `/props` defaults.
+   `OpenAIServerModel` so all llama-server endpoints behave identically
+   regardless of what each one has as `/props` defaults.
    `OpenAIServerModel`'s `**kwargs` flow into `self.kwargs` and are
    applied last in `_prepare_completion_kwargs`.
 
