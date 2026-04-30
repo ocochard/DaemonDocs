@@ -619,6 +619,46 @@ bhyve, DTrace, netgraph). The chapter set has grown from 13 to **25**.
 Remaining candidates are listed above; pick whichever has demonstrated
 user value.
 
+#### Networking deep-dive chapters (gated on struct-body fact-check)
+
+The Network Stack chapter (ch15, `sys/net/README.md`) is an end-to-end
+*packet-flow tour* — recv path, send path, netisr, socket buffers — but
+it deliberately does not deep-dive into mbuf, TCP/UDP, or the IP layer
+because each of those is too dense to fit alongside the integration
+narrative. Three chapters worth adding, in this order of value:
+
+| Chapter | Why it matters | Source |
+|---|---|---|
+| **mbuf — Network Buffer Allocation and Chaining** | Foundational; cited from every networking chapter; covers `m_get`/`m_getcl`/`m_pullup`/`m_copydata`, `m_next` vs `m_nextpkt`, `pkthdr`, `m_ext` clusters, mbuf zones, `m_tag` send/receive tags, exhaustion behavior. Currently every other networking chapter hand-waves over this. | `sys/sys/mbuf.h`, `sys/kern/uipc_mbuf.c`, `sys/kern/uipc_mbuf2.c`, `sys/kern/subr_mbpool.c` |
+| **Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP, Modular Stacks** | The FreeBSD-distinctive transport story: `struct inpcb`/`struct tcpcb` pair, inp hash tables, pluggable congestion control (`cc_newreno`/`cc_cubic`/`cc_dctcp`/`cc_rack`), TCP timers, syncache vs SYN cookies, modular TCP stacks (`tcp_stacks/`, RACK, BBR). Generic protocol description belongs in textbooks; this chapter focuses on what FreeBSD does differently. | `sys/netinet/in_pcb.c`, `sys/netinet/tcp_*.c`, `sys/netinet/udp_*.c`, `sys/netinet/cc/`, `sys/netinet/tcp_stacks/` |
+| **IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop** | One chapter covering what's *common* between v4 and v6 (forwarding, fragmentation, multicast) with v4-vs-v6 as a comparison axis. The `nhop` / `fib` rewrite is the central architectural story — more interesting than rehashing two protocols separately. | `sys/netinet/ip_input.c`, `sys/netinet/ip_output.c`, `sys/netinet6/`, `sys/net/route/` |
+
+**Why:** mbufs and transport PCBs are the two biggest current gaps in
+networking depth — ch15 names them but doesn't explain them. The IP
+chapter consolidates v4+v6 around the FIB/nhop rewrite, which is the
+genuinely novel architectural change worth documenting.
+
+**How to apply — gated on struct-body fact-check landing first.**
+Networking chapters are exactly where the `struct sysinit`-style
+hallucination (top-priority entry above) hurts most: `struct mbuf`,
+`struct ip`, `struct tcphdr`, `struct tcpcb`, `struct inpcb` are dense,
+frequently cited, and stable across decades of training-data history
+— the worst-case combination for the writer to paraphrase from memory
+instead of quoting. A reader who copy-pastes a fabricated `struct mbuf`
+and then can't compile against `sys/sys/mbuf.h` is the failure these
+chapters most need to avoid. Add these three only after the
+struct-body fact-check (or equivalent grounding fix) is in place, so
+field-level fabrications fail the chapter rather than ship as
+authoritative-looking code blocks.
+
+UDP does **not** get its own chapter — it's small enough to fit as a
+section inside the Transport Protocols chapter alongside the inpcb
+machinery. A standalone UDP chapter would mostly be padding.
+
+IPv4 and IPv6 are kept in **one** chapter rather than split. Splitting
+them produces too much overlap (forwarding, FIB integration, multicast)
+and hides the v4-vs-v6 contrast that makes the differences memorable.
+
 ### 2. Add cross-cutting / pattern chapters
 
 Orthogonal to subsystems but high-value for coding agents. *Cheaper* to
