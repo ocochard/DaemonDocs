@@ -533,7 +533,7 @@ def _extract_git_log(src_root: str, path: str, max_commits: int = 15) -> str:
             ["git", "-C", src_root, "log", "--follow",
              f"--format=%h%n%s%n%b%n---COMMIT_SEP---",
              "-n", str(max_commits), "--", full],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, errors='replace', timeout=30,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return ""
@@ -1889,6 +1889,137 @@ def _chapter_sections(chapter: dict) -> list:
     return resolved
 
 
+# --- Symbol catalog (writer-prompt ground truth) ---------------------------
+#
+# The writer hallucinates plausible-but-fake symbol names because its
+# training data is dense with FreeBSD-shaped code from neighbouring OSes.
+# `read_freebsd_source` and `resolve_c_definition` exist to ground it,
+# but the writer only reaches for them when it already knows what to
+# look up — for novel names it just emits whatever feels right.
+#
+# The fix is to pre-compute the chapter's authoritative symbol surface
+# (struct + function names defined in the chapter's source files) and
+# inject it into the prompt. With a real shortlist in front of it, the
+# writer reaches for those names instead of inventing.
+
+# Per-chapter catalog budget. We cap aggregated symbols at ~600 names
+# (≈ 6 KB at 10 chars/symbol) to keep the writer prompt under control.
+# Symbols are listed alphabetically; if we hit the cap, the catalog
+# notes the truncation so the writer doesn't take the omission as
+# "those symbols don't exist."
+_CATALOG_MAX_STRUCTS = 200
+_CATALOG_MAX_FUNCS = 400
+# Per-file size cap mirrors directory_map's — generated files
+# (linker_set.h-ish) are 100 KB+ of irrelevant noise.
+_CATALOG_FILE_SIZE_CAP = 256 * 1024
+# Per-dir file cap for source_dirs. Keeps a chapter that lists
+# `sys/kern/` as a dir from dragging in 600 files.
+_CATALOG_FILES_PER_DIR = 30
+
+
+def _build_symbol_catalog(chapter: dict) -> str:
+    """Build the authoritative struct/function catalog for a chapter.
+
+    Walks the chapter's `source_files` (read each fully) and a bounded
+    sample of files inside each `source_dirs` entry, aggregates
+    struct names and function names with `_dirmap_extract_names`, and
+    returns a Markdown block ready to interpolate into the writer
+    prompt. Returns "" if the chapter has no source-tree pointers.
+
+    The catalog is the source of truth the writer should reach for
+    FIRST before guessing a struct or function name. It is not
+    exhaustive — real FreeBSD touches symbols defined in headers we
+    didn't sample — but it is correct: every name in the catalog has
+    a `struct NAME {` or function-definition line in the listed file.
+    """
+    src_files = chapter.get("source_files", []) or []
+    src_dirs = chapter.get("source_dirs", []) or []
+    if not src_files and not src_dirs:
+        return ""
+
+    structs: set = set()
+    funcs: set = set()
+
+    def harvest(full_path: str):
+        try:
+            sz = os.path.getsize(full_path)
+        except OSError:
+            return
+        if sz > _CATALOG_FILE_SIZE_CAP:
+            return
+        try:
+            with open(full_path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            return
+        s_names, f_names = _dirmap_extract_names(content)
+        structs.update(s_names)
+        funcs.update(f_names)
+
+    for rel in src_files:
+        if not (rel.endswith(".c") or rel.endswith(".h")):
+            continue  # README, Makefile, etc. have no C symbols
+        full = os.path.join(SRC_ROOT, rel)
+        if os.path.isfile(full):
+            harvest(full)
+
+    for rel in src_dirs:
+        full = os.path.join(SRC_ROOT, rel)
+        if not os.path.isdir(full):
+            continue
+        try:
+            entries = sorted(os.listdir(full))
+        except OSError:
+            continue
+        c_h = [n for n in entries
+               if n.endswith(".c") or n.endswith(".h")]
+        for name in c_h[:_CATALOG_FILES_PER_DIR]:
+            harvest(os.path.join(full, name))
+
+    if not structs and not funcs:
+        return ""
+
+    s_sorted = sorted(structs)
+    f_sorted = sorted(funcs)
+    s_truncated = len(s_sorted) > _CATALOG_MAX_STRUCTS
+    f_truncated = len(f_sorted) > _CATALOG_MAX_FUNCS
+    s_sorted = s_sorted[:_CATALOG_MAX_STRUCTS]
+    f_sorted = f_sorted[:_CATALOG_MAX_FUNCS]
+
+    parts = [
+        "## Authoritative Symbol Catalog",
+        "",
+        "These struct names and function names have been extracted from",
+        "the chapter's source files. Every name here is REAL — the symbol",
+        "is defined in one of the listed files. Reach for THESE names",
+        "first. If you need a name in this domain that isn't on the list,",
+        "call `read_freebsd_source` or `resolve_c_definition` to verify",
+        "before writing it — do NOT guess from training-data familiarity.",
+        "",
+        "This list is *not exhaustive*: real FreeBSD touches symbols",
+        "defined in headers not sampled here. Absence from the list is",
+        "NOT proof a name is fake — but presence IS proof a name is",
+        "real. Treat it as a shortlist of safe choices, not a closed set.",
+        "",
+    ]
+    if s_sorted:
+        parts.append(f"**Verified structs ({len(s_sorted)}"
+                     f"{' truncated' if s_truncated else ''}):**")
+        # Wrap the names into rows of ~6 names each to keep token cost
+        # predictable. The writer doesn't need clickable lists; it needs
+        # a glance-able catalog.
+        for i in range(0, len(s_sorted), 6):
+            parts.append("  " + ", ".join(f"`{s}`" for s in s_sorted[i:i+6]))
+        parts.append("")
+    if f_sorted:
+        parts.append(f"**Verified functions ({len(f_sorted)}"
+                     f"{' truncated' if f_truncated else ''}):**")
+        for i in range(0, len(f_sorted), 6):
+            parts.append("  " + ", ".join(f"`{f}()`" for f in f_sorted[i:i+6]))
+        parts.append("")
+    return "\n".join(parts)
+
+
 def build_chapter_prompt(chapter: dict) -> str:
     """Build the instruction prompt for the writer agent."""
     src_files = chapter.get("source_files", [])
@@ -2044,6 +2175,22 @@ def build_chapter_prompt(chapter: dict) -> str:
     else:
         scope_guard_block = ""
 
+    # Per-chapter symbol catalog — pre-extract real struct/function
+    # names from the chapter's source files so the writer can reach
+    # for them instead of guessing names that "feel right" from
+    # neighbouring-OS training data. Same indentation rule as the
+    # other interpolated blocks: first line lands at the f-string
+    # scaffolding column, every subsequent line needs pre-indent.
+    catalog_raw = _build_symbol_catalog(chapter)
+    if catalog_raw:
+        cat_first, cat_sep, cat_rest = catalog_raw.partition("\n")
+        cat_body = cat_first + (
+            cat_sep + textwrap.indent(cat_rest, "        ") if cat_sep else ""
+        )
+        catalog_block = f"\n        {cat_body}\n"
+    else:
+        catalog_block = ""
+
     return textwrap.dedent(f"""\
         You are writing a chapter for "FreeBSD Internals" — a
         guide that helps anyone interested in operating systems understand
@@ -2053,7 +2200,7 @@ def build_chapter_prompt(chapter: dict) -> str:
 
         ## Focus
         {focus}
-        {scope_guard_block}
+        {scope_guard_block}{catalog_block}
         ## Instructions
         {chr(10).join(f"{s}" for s in steps)}
 
@@ -2277,6 +2424,88 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
                 + "\n\n"
             )
 
+    # Pre-validate kernel-config options, DTrace SDT probes, and
+    # MALLOC_DEFINE tags the same way as structs/functions. Same
+    # rationale: the reviewer can't grep, so it either hedges (waste)
+    # or invents wrongness (worse). The verifiers below run against
+    # `sys/conf/options*` / `SDT_PROBE_DEFINE*` / `MALLOC_DEFINE*`
+    # respectively and are cheap because the corpora are small (a few
+    # hundred entries each); options + SDT do not share `_FACT_CHECK_CACHE`
+    # because their verifiers don't go through `_verify_with_cache`,
+    # but MALLOC tags do, so a tag verified here is free for fact-check.
+    claimed_options = _extract_kernel_options(fact_text)
+    claimed_probes = _extract_dtrace_probes(fact_text)
+    claimed_mallocs = _extract_malloc_tags(fact_text)
+    missing_options = set(_verify_kernel_options(claimed_options, SRC_ROOT))
+    missing_probes_full = set(_verify_dtrace_probes(claimed_probes, SRC_ROOT))
+    # `_verify_dtrace_probes` returns "provider:::name" strings; we
+    # need to know which (provider, name) tuples are missing, so map back.
+    missing_probes = {
+        (p, n) for (p, n) in claimed_probes
+        if f"{p}:::{n}" in missing_probes_full
+    }
+    missing_mallocs = set(_verify_malloc_tags(claimed_mallocs, SRC_ROOT))
+    verified_options = [o for o in claimed_options if o not in missing_options]
+    verified_probes = [(p, n) for (p, n) in claimed_probes
+                       if (p, n) not in missing_probes]
+    verified_mallocs = [m for m in claimed_mallocs if m not in missing_mallocs]
+
+    macro_block = ""
+    if (verified_options or missing_options or
+            verified_probes or missing_probes or
+            verified_mallocs or missing_mallocs):
+        macro_block = (
+            "## Verified Macros & Tags (DO NOT hedge about these)\n\n"
+            "Kernel-config options, DTrace SDT probes, and MALLOC_DEFINE\n"
+            "tags from the draft have been grep-checked against the\n"
+            "FreeBSD source tree. Treat the verified lists as ground truth\n"
+            "for the Accuracy criterion: do NOT ask the writer to 'verify'\n"
+            "items on these lists, and do NOT propose alternate names.\n\n"
+        )
+        if verified_options:
+            macro_block += (
+                "Verified kernel-config options:\n"
+                + "\n".join(f"- `option {o}`" for o in sorted(verified_options))
+                + "\n\n"
+            )
+        if missing_options:
+            macro_block += (
+                "Missing kernel-config options (FAIL Accuracy if cited as\n"
+                "real — no match in `sys/conf/options*` or `sys/conf/NOTES`):\n"
+                + "\n".join(f"- `{o}` (NOT FOUND)"
+                            for o in sorted(missing_options))
+                + "\n\n"
+            )
+        if verified_probes:
+            macro_block += (
+                "Verified DTrace SDT probes:\n"
+                + "\n".join(f"- `{p}:::{n}`"
+                            for (p, n) in sorted(verified_probes))
+                + "\n\n"
+            )
+        if missing_probes:
+            macro_block += (
+                "Missing DTrace SDT probes (FAIL Accuracy if cited as real\n"
+                "— no matching `SDT_PROBE_DEFINE*` macro in sys/):\n"
+                + "\n".join(f"- `{p}:::{n}` (NOT FOUND)"
+                            for (p, n) in sorted(missing_probes))
+                + "\n\n"
+            )
+        if verified_mallocs:
+            macro_block += (
+                "Verified MALLOC_DEFINE tags:\n"
+                + "\n".join(f"- `{m}`" for m in sorted(verified_mallocs))
+                + "\n\n"
+            )
+        if missing_mallocs:
+            macro_block += (
+                "Missing MALLOC_DEFINE tags (FAIL Accuracy if cited as real\n"
+                "— no matching `MALLOC_DEFINE`/`MALLOC_DECLARE` in sys/):\n"
+                + "\n".join(f"- `{m}` (NOT FOUND)"
+                            for m in sorted(missing_mallocs))
+                + "\n\n"
+            )
+
     # Build the structure-rubric checklist from the chapter's section list.
     # If the chapter opted out of (e.g.) `Key Data Structures`, the reviewer
     # must NOT flag it as missing — that would always FAIL the structure
@@ -2321,6 +2550,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
 
         {verified_block}
         {symbol_block}
+        {macro_block}
         {scope_guard_block}
         ## Review Rubric
 
@@ -2333,17 +2563,19 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            No invented structs, no made-up function names, no wrong file paths.
            Flag anything that looks like a hallucination.
            IMPORTANT: you do NOT have direct access to the source tree.
-           You CANNOT verify whether an arbitrary file path, struct, or
-           function exists. Do not claim that a name "does not exist in
-           the FreeBSD source tree" unless it appears in a "missing"
-           list above — names in the "Verified Source Paths" or
-           "Verified Symbols" lists are confirmed real. For names in
-           neither list, focus on whether their *use* in the draft is
-           consistent (right subsystem, right relationships), not on
-           whether they exist. FAIL Accuracy when a symbol is in the
-           missing list AND the draft cites it as a real FreeBSD symbol;
-           PASS Accuracy when every cited symbol the draft asserts is
-           either verified or unverifiable (not in either list).
+           You CANNOT verify whether an arbitrary file path, struct,
+           function, kernel-config option, DTrace SDT probe, or
+           MALLOC_DEFINE tag exists. Do not claim that a name "does not
+           exist in the FreeBSD source tree" unless it appears in a
+           "missing" list above — names in the "Verified Source Paths",
+           "Verified Symbols", or "Verified Macros & Tags" lists are
+           confirmed real. For names in neither list, focus on whether
+           their *use* in the draft is consistent (right subsystem,
+           right relationships), not on whether they exist. FAIL
+           Accuracy when an item is in any missing list AND the draft
+           cites it as a real FreeBSD entity; PASS Accuracy when every
+           cited symbol/option/probe/tag is either verified or
+           unverifiable (not in any list).
 
         3. **Source Coverage** — Are the expected source files examined and
            discussed? Not just listed — actually explained with code snippets.
@@ -2414,22 +2646,24 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         don't match sys/vm/vm_page.h" not "the data structures section is weak."
 
         **No hedges.** You do NOT have a source-tree tool of your own.
-        Your ground truth is the "Verified Source Paths" and "Verified
-        Symbols" blocks above (plus their "missing" counterparts). If a
-        path or symbol is on neither list, that is a NON-FINDING — do
-        NOT raise it. Forbidden issue shapes (omit them entirely):
+        Your ground truth is the "Verified Source Paths", "Verified
+        Symbols", and "Verified Macros & Tags" blocks above (plus their
+        "missing" counterparts). If a path / symbol / option / probe /
+        tag is on neither list, that is a NON-FINDING — do NOT raise
+        it. Forbidden issue shapes (omit them entirely):
         - "Verify that <symbol> is the correct name — FreeBSD may use
           <other_symbol> instead."
         - "Confirm against actual <file>" / "double-check against the
           source." You have no way to confirm; the writer will guess
           whichever name you suggested and may introduce a real bug.
         - "<name> may not exist" / "<name> might be misspelled" for any
-          name in the Verified Source Paths or Verified Symbols lists.
-        Raise an issue ONLY when (a) a path or symbol appears in a
-        "missing" list above and the draft cites it as real, or (b) you
-        can point to something INSIDE the draft that contradicts another
-        part of the draft. The writer should be able to action every
-        issue without guessing.
+          name in the Verified Source Paths, Verified Symbols, or
+          Verified Macros & Tags lists.
+        Raise an issue ONLY when (a) a path / symbol / option / probe /
+        tag appears in a "missing" list above and the draft cites it as
+        real, or (b) you can point to something INSIDE the draft that
+        contradicts another part of the draft. The writer should be
+        able to action every issue without guessing.
     """).lstrip()
 
 
@@ -3389,9 +3623,17 @@ def _batched_grep_present(symbols: List[str], pattern_template: str,
         f"head -c 1048576"
     )
     try:
+        # `errors='replace'` is load-bearing: FreeBSD source contains a
+        # few non-UTF8 bytes (Latin-1 author names in old driver
+        # comments). Without an error policy, Python's text-mode
+        # subprocess decode raises UnicodeDecodeError mid-pipeline and
+        # the whole run aborts before atomic write. ch14 (sys/net)
+        # hit this on 2026-04-30 — one bad byte killed an hour of work.
+        # The same policy is applied to every other grep-over-tree
+        # subprocess.run() in this file for the same reason.
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            timeout=_GREP_TIMEOUT_SEC,
+            errors='replace', timeout=_GREP_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
         # Conservative behaviour: treat a timeout as "verification not
@@ -3549,7 +3791,7 @@ def _verify_kernel_options(options: List[str], src_root: str) -> List[str]:
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            timeout=_GREP_TIMEOUT_SEC,
+            errors='replace', timeout=_GREP_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
         return []  # treat as unverified rather than all-missing
@@ -3605,7 +3847,7 @@ def _verify_dtrace_probes(probes: List[Tuple[str, str]],
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            timeout=_GREP_TIMEOUT_SEC,
+            errors='replace', timeout=_GREP_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
         return []
@@ -3622,6 +3864,61 @@ def _verify_dtrace_probes(probes: List[Tuple[str, str]],
     return not_found
 
 
+# --- MALLOC_DEFINE / MALLOC_DECLARE tags -----------------------------------
+#
+# Writers reach for `M_FOO` malloc tags as a way to make a section feel
+# concrete ("allocations are tracked under `M_PROC`"), and they invent
+# tags as readily as they invent struct names. Real tags are introduced
+# by `MALLOC_DEFINE(M_FOO, "name", "desc");` and shared via
+# `MALLOC_DECLARE(M_FOO);` in headers. We extract `M_*` tokens from the
+# draft and grep `sys/` for either macro mentioning that token.
+#
+# The token regex insists on `M_` followed by ≥2 uppercase chars to
+# avoid collecting one-letter macros (`M_PI`, etc.) and ALL-CAPS prose
+# fragments. We further filter out a handful of tokens that look like
+# tags but aren't (mbuf flags, network mask constants).
+
+_MALLOC_TAG_RE = re.compile(r'`(M_[A-Z][A-Z0-9_]{1,})`')
+
+# Common `M_FOO` tokens that are NOT malloc tags — mbuf flags, network
+# mask constants, generic option markers. Verifying these against
+# MALLOC_DEFINE will always fail and waste fact-fix steps on real text.
+_MALLOC_TAG_IGNORE = frozenset({
+    "M_NOWAIT", "M_WAITOK", "M_ZERO", "M_NODUMP", "M_USE_RESERVE",
+    "M_NOVM", "M_BESTFIT", "M_FIRSTFIT", "M_EXEC", "M_CONTIG",
+    "M_PKTHDR", "M_EOR", "M_MCAST", "M_BCAST", "M_FRAG", "M_LASTFRAG",
+    "M_PROTO1", "M_PROTO2", "M_PROTO3", "M_PROTO4", "M_PROTO5",
+    "M_VLANTAG", "M_PROMISC", "M_NOFREE", "M_EXT", "M_HASHTYPE_OPAQUE",
+})
+
+
+def _extract_malloc_tags(text: str) -> List[str]:
+    """Extract claimed MALLOC_DEFINE tag names (`M_FOO`) from the draft."""
+    found = set()
+    for m in _MALLOC_TAG_RE.finditer(text):
+        tag = m.group(1)
+        if tag and tag not in _MALLOC_TAG_IGNORE:
+            found.add(tag)
+    return sorted(found)
+
+
+def _verify_malloc_tags(tags: List[str], src_root: str) -> List[str]:
+    """Verify claimed `M_FOO` malloc tags exist in `sys/`.
+
+    A tag is real if some `MALLOC_DEFINE(M_FOO, ...)` or
+    `MALLOC_DECLARE(M_FOO)` macro references it. Backed by the shared
+    `_FACT_CHECK_CACHE` (kind='malloc') so re-runs are free.
+    """
+    # `pattern_template` is the Python re re-scan; `shape_grep` is the
+    # BSD-grep stage-2 filter that keeps only candidate macro lines so
+    # the 1 MB output cap holds them.
+    return _verify_with_cache(
+        "malloc", tags, src_root,
+        pattern_template=r"MALLOC_(?:DEFINE|DECLARE)\s*\(\s*({alt})\b",
+        shape_grep=r"MALLOC_(DEFINE|DECLARE)\(",
+    )
+
+
 def fact_check_draft(draft: str, src_root: str) -> dict:
     """Run structured fact-checking on a draft chapter.
 
@@ -3632,6 +3929,7 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
         - 'funcs_not_found': list of missing function names
         - 'kernel_options_not_found': list of unverifiable kernel-config options
         - 'dtrace_probes_not_found': list of unverifiable DTrace SDT probes
+        - 'malloc_tags_not_found': list of unverifiable MALLOC_DEFINE tags
         - 'total_issues': count of all issues
 
     The `## Comparison` section is stripped before extraction. That section
@@ -3644,6 +3942,7 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
     funcs = _extract_function_names(fact_text)
     kernel_options = _extract_kernel_options(fact_text)
     dtrace_probes = _extract_dtrace_probes(fact_text)
+    malloc_tags = _extract_malloc_tags(fact_text)
 
     paths_missing = _verify_file_paths(file_paths, src_root)
     paths_corrected = [x for x in paths_missing if ' → ' in x]
@@ -3653,6 +3952,7 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
     funcs_missing = _verify_functions(funcs, src_root)
     kernel_options_missing = _verify_kernel_options(kernel_options, src_root)
     dtrace_probes_missing = _verify_dtrace_probes(dtrace_probes, src_root)
+    malloc_tags_missing = _verify_malloc_tags(malloc_tags, src_root)
 
     return {
         'file_paths_not_found': paths_missing,
@@ -3661,10 +3961,12 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
         'funcs_not_found': funcs_missing,
         'kernel_options_not_found': kernel_options_missing,
         'dtrace_probes_not_found': dtrace_probes_missing,
+        'malloc_tags_not_found': malloc_tags_missing,
         'total_issues': (len(paths_missing) + len(paths_corrected) +
                          len(structs_missing) + len(funcs_missing) +
                          len(kernel_options_missing) +
-                         len(dtrace_probes_missing)),
+                         len(dtrace_probes_missing) +
+                         len(malloc_tags_missing)),
     }
 
 
@@ -3709,6 +4011,13 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
             f"{', '.join(facts['dtrace_probes_not_found'])}. "
             f"These appear hallucinated — remove the claim or replace "
             f"with a real probe (grep for `SDT_PROBE_DEFINE` in sys/)."
+        )
+    if facts.get('malloc_tags_not_found'):
+        issues.append(
+            f"MALLOC_DEFINE/MALLOC_DECLARE tags not found in sys/: "
+            f"{', '.join(facts['malloc_tags_not_found'])}. "
+            f"These appear hallucinated — remove the claim or replace "
+            f"with a real tag (grep for `MALLOC_DEFINE` in sys/)."
         )
 
     return textwrap.dedent(f"""\
