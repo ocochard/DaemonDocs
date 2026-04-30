@@ -2729,6 +2729,153 @@ def build_revision_prompt(chapter: dict, draft: str, review: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# --- Per-chapter tool-use stats --------------------------------------------
+#
+# `source_stats.py` exists as a post-hoc log scanner: it greps tool-call
+# lines out of /tmp/*.log and rolls them up by tool, file, and chapter.
+# That works but has two real limitations:
+#   - it can only see what the printer emitted (so revisions or stages
+#     that share a chapter blur together), and
+#   - the "per chapter" axis comes from a `Generating chapter N:` line
+#     in the log, which is fragile across queue restarts.
+#
+# Embedding the same accounting inside `run_chapter` keeps it accurate
+# (memory is the source of truth, not log text), keeps it per-stage
+# (draft / review-N / revision-N / fact-fix is preserved), and
+# eventually lets `source_stats.py` retire — though it stays useful for
+# scanning logs from old runs that pre-date this banner.
+
+# Match `tool(arg='value')` or `tool(arg="value")` with whitespace
+# tolerance. These mirror the regexes in source_stats.py — keep them in
+# sync if a writer tool gets added or renamed.
+_STATS_TOOL_PATTERNS = [
+    ("read_freebsd_source",
+     re.compile(r"""read_freebsd_source\(\s*path\s*=\s*['"]([^'"]+)['"]""")),
+    ("search_books",
+     re.compile(r"""search_books\(\s*query\s*=\s*['"]([^'"]+)['"]""")),
+    ("directory_map",
+     re.compile(r"""directory_map\(\s*path\s*=\s*['"]([^'"]+)['"]""")),
+    ("explore_tree",
+     re.compile(r"""explore_tree\(\s*path\s*=\s*['"]([^'"]+)['"]""")),
+    ("resolve_c_definition",
+     re.compile(r"""resolve_c_definition\(\s*symbol\s*=\s*['"]([^'"]+)['"]""")),
+]
+
+
+def _collect_tool_stats(agent) -> dict:
+    """Walk agent.memory.steps and tally tool calls in each `code_action`.
+
+    Returns {
+        'tool_counts': {tool_name: int},
+        'reads': [path, path, ...],
+        'maps': [path, ...],
+        'resolves': [symbol, ...],
+        'searches': [query, ...],
+    }
+
+    `agent.run(reset=True)` (the default) wipes memory at the start of
+    each run, so calling this helper right after a `_run_agent(...)`
+    captures only *that* stage's calls. Caller is responsible for
+    snapshotting per stage and merging.
+    """
+    stats = {
+        "tool_counts": {},
+        "reads": [],
+        "maps": [],
+        "resolves": [],
+        "searches": [],
+    }
+    mem = getattr(agent, "memory", None)
+    steps = getattr(mem, "steps", None) if mem is not None else None
+    if not isinstance(steps, list):
+        return stats
+    for step in steps:
+        code = getattr(step, "code_action", None)
+        if not isinstance(code, str) or not code:
+            continue
+        for tool, pat in _STATS_TOOL_PATTERNS:
+            for m in pat.finditer(code):
+                stats["tool_counts"][tool] = stats["tool_counts"].get(tool, 0) + 1
+                arg = m.group(1)
+                if tool == "read_freebsd_source":
+                    stats["reads"].append(arg)
+                elif tool == "directory_map":
+                    stats["maps"].append(arg)
+                elif tool == "resolve_c_definition":
+                    stats["resolves"].append(arg)
+                elif tool == "search_books":
+                    stats["searches"].append(arg[:80])
+    return stats
+
+
+def _merge_tool_stats(dst: dict, src: dict, stage: str) -> None:
+    """Merge a single-stage `_collect_tool_stats` result into the chapter accumulator.
+
+    `dst` is the chapter-level accumulator that `run_chapter` carries
+    across the whole pipeline. It mirrors the shape of the per-stage
+    dict but with one extra key (`per_stage`) recording the tool count
+    contributed by each labelled stage so the banner can show
+    distribution (draft vs review vs fact-fix).
+    """
+    if "per_stage" not in dst:
+        dst.update({
+            "tool_counts": {},
+            "reads": [],
+            "maps": [],
+            "resolves": [],
+            "searches": [],
+            "per_stage": {},
+        })
+    stage_total = 0
+    for k, v in src["tool_counts"].items():
+        dst["tool_counts"][k] = dst["tool_counts"].get(k, 0) + v
+        stage_total += v
+    for key in ("reads", "maps", "resolves", "searches"):
+        dst[key].extend(src[key])
+    if stage_total:
+        dst["per_stage"][stage] = dst["per_stage"].get(stage, 0) + stage_total
+
+
+def _format_stats_banner(stats: dict) -> str:
+    """Render the chapter accumulator as a printable banner.
+
+    The banner deliberately echoes `source_stats.py`'s output shape so
+    that scanning either source feels familiar. Truncated to the most
+    informative slices: per-tool totals, per-stage totals, top reads,
+    top resolved symbols.
+    """
+    if not stats.get("per_stage"):
+        return ""
+    lines = ["  ──── tool-use summary ────"]
+    total = sum(stats["tool_counts"].values())
+    lines.append(f"  total tool calls: {total}")
+    if stats["per_stage"]:
+        per_stage = ", ".join(
+            f"{stage}={n}" for stage, n in stats["per_stage"].items()
+        )
+        lines.append(f"  per stage: {per_stage}")
+    if stats["tool_counts"]:
+        per_tool = ", ".join(
+            f"{tool}={n}" for tool, n in
+            sorted(stats["tool_counts"].items(), key=lambda x: -x[1])
+        )
+        lines.append(f"  per tool: {per_tool}")
+    # Top-N file reads — duplicates collapsed.
+    if stats["reads"]:
+        from collections import Counter
+        top_reads = Counter(stats["reads"]).most_common(5)
+        if top_reads:
+            preview = ", ".join(f"{p}×{n}" for p, n in top_reads)
+            lines.append(f"  top reads: {preview}")
+    if stats["resolves"]:
+        from collections import Counter
+        top_res = Counter(stats["resolves"]).most_common(5)
+        if top_res:
+            preview = ", ".join(f"{s}×{n}" for s, n in top_res)
+            lines.append(f"  top resolves: {preview}")
+    return "\n".join(lines)
+
+
 def _agent_step_count(agent) -> Optional[int]:
     """Best-effort: return the number of steps the agent took on its last run.
 
@@ -2786,7 +2933,8 @@ def _looks_like_stub(text: str) -> bool:
     return False
 
 
-def _run_agent(agent, label: str, prompt: str) -> str:
+def _run_agent(agent, label: str, prompt: str,
+               stats: Optional[dict] = None) -> str:
     """Run an agent and warn if it hit its step cap.
 
     Hitting the cap usually means the model ran out of room to produce
@@ -2797,12 +2945,19 @@ def _run_agent(agent, label: str, prompt: str) -> str:
     in — which can be a dict, list, or other non-string. Every caller here
     expects a string (they call `.strip()`, write to disk, or feed into
     JSON-extraction). Coerce at this boundary so callers never have to.
+
+    `stats` (optional) is the chapter-level tool-use accumulator. When
+    supplied, the per-stage tool calls extracted from `agent.memory.steps`
+    are merged in under `label`. Memory is reset on the next `agent.run()`,
+    so collection happens here while it's still fresh.
     """
     result = agent.run(prompt)
     cap = getattr(agent, "max_steps", None)
     used = _agent_step_count(agent)
     if isinstance(cap, int) and isinstance(used, int) and used >= cap:
         print(f"  ⚠ {label}: hit max_steps={cap} — output may be truncated")
+    if stats is not None:
+        _merge_tool_stats(stats, _collect_tool_stats(agent), label)
     if result is None:
         return ""
     if isinstance(result, str):
@@ -3052,6 +3207,11 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
     # narrow and never overlaps tool reads.
     had_backup = False
 
+    # Per-chapter tool-use accumulator. Every `_run_agent` call below
+    # passes this in, and we emit a banner just before returning. See
+    # `_collect_tool_stats` / `_format_stats_banner` for the shape.
+    stats: dict = {}
+
     success = False
     try:
         # ---- Pass 1: initial draft ----
@@ -3059,7 +3219,7 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         print("  [draft] writing initial chapter ...")
 
         try:
-            draft = _run_agent(writer, "draft", prompt)
+            draft = _run_agent(writer, "draft", prompt, stats=stats)
         except Exception as e:
             print(f"  ✗ initial draft failed: {e}")
             return False
@@ -3093,7 +3253,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 + "   is to return the content string — nothing else.\n"
             )
             try:
-                draft = _run_agent(writer, "draft-retry", retry_prompt)
+                draft = _run_agent(writer, "draft-retry", retry_prompt,
+                                   stats=stats)
             except Exception as e:
                 print(f"  ✗ initial draft retry failed: {e}")
                 return False
@@ -3131,7 +3292,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
 
             try:
                 review_prompt = build_review_prompt(chapter, draft)
-                review_raw = _run_agent(reviewer, f"review {revision}", review_prompt)
+                review_raw = _run_agent(reviewer, f"review {revision}",
+                                        review_prompt, stats=stats)
             except Exception as e:
                 print(f"  ✗ review {revision} failed: {e}")
                 break
@@ -3185,7 +3347,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
 
             try:
                 revision_prompt = build_revision_prompt(chapter, draft, review_raw)
-                new_draft = _run_agent(writer, f"revision {revision}", revision_prompt)
+                new_draft = _run_agent(writer, f"revision {revision}",
+                                       revision_prompt, stats=stats)
             except Exception as e:
                 print(f"  ✗ revision {revision} failed: {e}")
                 break
@@ -3257,7 +3420,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             print("  [fact-fix] rewriting to address fact-check issues ...")
             try:
                 fact_prompt = _build_fact_check_prompt(chapter, draft, facts)
-                new_draft = _run_agent(writer, "fact-fix", fact_prompt)
+                new_draft = _run_agent(writer, "fact-fix", fact_prompt,
+                                       stats=stats)
                 if _looks_like_stub(new_draft):
                     # Hit max_steps before producing prose. Keep the
                     # pre-fact-fix draft (still contains hallucinations
@@ -3315,6 +3479,9 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         lines = draft.count("\n")
         rev_label = f" after {revision} revision(s)" if revision > 0 else ""
         print(f"  ✓ wrote {lines} lines to {output_path}{rev_label}")
+        banner = _format_stats_banner(stats)
+        if banner:
+            print(banner)
         return True
 
     finally:

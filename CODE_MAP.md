@@ -109,7 +109,8 @@ pattern.
 | Change sampler params | `create_writer_agent` / `create_reviewer_agent` | Pass kwargs to `OpenAIServerModel(...)`. They land on every API call via `self.kwargs` in smolagents' `Model._prepare_completion_kwargs`. |
 | Add a new chapter | `chapters.yaml` only | Schema is documented in the YAML's header comment. `output_file` must NOT collide with an upstream-shipped FreeBSD file; if it does, use a sibling name (see chapter 1's `README_internals.md` rationale). Set `family:` (one of the 7 tags) so the new chapter shows up in the right family-mate "Related" sidebars by default; add `related:` only if family-mates aren't right. |
 | Change which chapters appear as "Related" in a sidebar | `chapters.yaml` (`related:` field) | The chapter relationship map is derived from `chapters.yaml` by `_build_chapter_rels` — `related:` wins, family-mates are the fallback. Do NOT reintroduce a hand-maintained `CHAPTER_RELS` dict in `generate-doc.py` — that duplication was the bug fixed by this design (rename in YAML, dict goes silently stale). |
-| Add a writer tool | Banner **Smolagents tools** + `create_writer_agent` `tools=[...]` | `additional_authorized_imports` is **deliberately minimal** (`re`, `json`). Do not add `os` or `pathlib` — see the comment in `create_writer_agent` for why. |
+| Add a writer tool | Banner **Smolagents tools** + `create_writer_agent` `tools=[...]` | `additional_authorized_imports` is **deliberately minimal** (`re`, `json`). Do not add `os` or `pathlib` — see the comment in `create_writer_agent` for why. Also add a regex to `_STATS_TOOL_PATTERNS` so the per-chapter tool-use banner counts the new tool. |
+| Track a new tool-use metric in the per-chapter banner | `_collect_tool_stats` / `_format_stats_banner` | `_run_agent` calls `_collect_tool_stats` after every agent.run; `run_chapter` accumulates via `_merge_tool_stats` and prints the banner before returning. CodeAgent's tool calls live in `agent.memory.steps[i].code_action` (Python source), not in `tool_calls`, so the helpers regex over `code_action` text. Memory resets on each `agent.run(reset=True)` so collection MUST happen inside `_run_agent` before the next stage runs. |
 
 ---
 
@@ -147,6 +148,14 @@ pattern.
   ch14 (sys/net) hit this on 2026-04-30. Any new
   `subprocess.run(..., text=True, ...)` that reads from `sys/`
   needs `errors='replace'` for the same reason.
+- **Tool-use stats are extracted from `step.code_action`, not
+  `step.tool_calls`** — for `CodeAgent`, `tool_calls` records the
+  outer `python_interpreter` call once per step; the *real* tool
+  invocations (`read_freebsd_source(...)`, etc.) live as Python
+  source inside `code_action`. `_collect_tool_stats` regexes the
+  source text. Also: `agent.run(reset=True)` (the default) wipes
+  `agent.memory` at the start of every call, so stats MUST be
+  collected inside `_run_agent` before the next stage runs.
 
 ---
 
