@@ -3200,10 +3200,11 @@ def _criteria_fail_count(criteria: object) -> int:
     null or list values. Treat anything non-string as a failure (safer
     default for the summary line).
     """
-    # 8 criteria total: completeness, accuracy, source_coverage,
-    # mermaid_diagram, accessibility, structure, no_marketing, rationale.
+    # 9 criteria total: completeness, accuracy, source_coverage,
+    # mermaid_diagram, accessibility, structure, no_marketing, rationale,
+    # comparison_quality.
     if not isinstance(criteria, dict):
-        return 8
+        return 9
     fails = 0
     for v in criteria.values():
         if not isinstance(v, str) or v.startswith("FAIL"):
@@ -3389,15 +3390,15 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         # last (worse) draft. Instead we keep the draft from the round
         # with the fewest FAIL criteria; ties go to the *later* round
         # (later drafts have had more issues addressed even if criteria
-        # count is unchanged). best_fails starts at 9 — strictly worse
-        # than any real review (max possible is 8) — so the very first
+        # count is unchanged). best_fails starts at 10 — strictly worse
+        # than any real review (max possible is 9) — so the very first
         # graded draft always wins on first comparison.
         warnings: List[str] = []
         revision = 0
         approved = False
         parse_retry_used = False
         best_draft = draft
-        best_fails = 9
+        best_fails = 10
         best_round = 0
         last_fails: Optional[int] = None  # fail_count of the most recent graded round
 
@@ -3430,7 +3431,7 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             criteria = review_json.get("criteria", {}) or {}
 
             fail_count = _criteria_fail_count(criteria)
-            print(f"         grade={grade}  ({8 - fail_count}/8 criteria pass)")
+            print(f"         grade={grade}  ({9 - fail_count}/9 criteria pass)")
             # Print every issue and every praise — truncating these hides
             # the diagnostic information needed to figure out why the
             # reviewer didn't approve. The log is verbose by design.
@@ -3498,13 +3499,13 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 and last_fails > best_fails
             ):
                 print(f"  [rollback] revision {revision} regressed "
-                      f"({8 - last_fails}/8) — using revision {best_round} "
-                      f"({8 - best_fails}/8) instead")
+                      f"({9 - last_fails}/9) — using revision {best_round} "
+                      f"({9 - best_fails}/9) instead")
                 draft = best_draft
                 warnings.append(
                     f"revisions regressed; kept revision {best_round} "
-                    f"({8 - best_fails}/8 criteria) over revision {revision} "
-                    f"({8 - last_fails}/8)"
+                    f"({9 - best_fails}/9 criteria) over revision {revision} "
+                    f"({9 - last_fails}/9)"
                 )
 
         # ---- Fact-checking pass ----

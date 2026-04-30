@@ -395,54 +395,71 @@ every cross-directory See Also link in the corpus.
 Existing READMEs still have the broken paths baked in until each is
 regenerated. A full corpus regen is queued for the next overnight run.
 
-### Reviewer rubric doesn't penalize empty or contradictory Comparison sections
+### [DONE] Reviewer rubric doesn't penalize empty or contradictory Comparison sections
 
 Observed on `sys/vm/README.md` (2026-04-30). The Comparison section
-contains statements that pretend to contrast but don't:
+contained statements that pretended to contrast but didn't:
 
 > *"FreeBSD's `vm_map` is a red-black tree, while Linux uses a
 > red-black tree."*
 
-It also contains thinly-grounded cross-OS claims:
+It also contained thinly-grounded cross-OS claims:
 
 > *"NetBSD uses SLAB, while FreeBSD uses UMA."* (NetBSD's UVM is a
 > substantially different design from FreeBSD's VM, not a SLAB-vs-UMA
 > swap.)
 
-The current reviewer rubric checks Accuracy against the FreeBSD source
-tree (which it now has ground-truth injection for) but has no
-criterion that fires on **comparison-section quality**: a statement
+The reviewer's Accuracy criterion checks against the FreeBSD source
+tree (with ground-truth injection for paths/symbols/macros) but had
+no criterion that fired on **comparison-section quality**: a statement
 like "X uses Y while Z uses Y" passes Accuracy (both halves can be
 true) without passing usefulness.
 
-**Why it matters:** this is a content-quality issue, not a
-fabrication issue, so none of the existing fact-check / symbol-catalog
-machinery catches it. It also lowers user trust in the rest of the
-chapter — a reader who notices the contradiction starts doubting
-sections they can't independently verify.
+**Status:** fixed via two complementary changes shipped 2026-04-30.
 
-**Possible fixes** (cheapest first):
+**Change 1: opt-out via `chapters.yaml` (Option B).** The pre-existing
+per-chapter `sections:` mechanism already supports dropping any
+section. Two chapters whose source surface is purely FreeBSD-internal
+with no real cross-OS analog at this level of detail now opt out:
 
-1. **Add a Comparison-quality criterion to `build_review_prompt`.**
-   Something like: *"In Comparison sections, every contrastive
-   statement must identify a concrete difference. Statements of the
-   form 'X uses Y while Z uses Y' (no actual contrast) or unsupported
-   cross-OS claims must be flagged."* Reviewer is tool-less so it
-   can't verify NetBSD's allocator, but it can catch the trivially
-   self-contradicting form.
-2. **Drop Comparison from the default section list** for chapters
-   where the writer has no cross-OS grounding. The writer prompt
-   currently asks for it on every chapter; making it opt-in via
-   `chapters.yaml` would prevent the writer from filling space with
-   weakly-grounded claims when it has nothing useful to say.
-3. **Require a citation per comparison bullet** (book reference or
-   source-tree path on the *other* OS, which we don't have). Not
-   feasible without a non-FreeBSD source corpus, but listed for
-   completeness.
+- **Build System — buildworld and buildkernel** (chapter 4) — Linux
+  Kbuild and NetBSD's bsd.*.mk are real systems but a meaningful
+  contrast would be its own essay, not a paragraph.
+- **netgraph — Graph-based Networking Framework** (chapter 25) —
+  Linux nftables/tc and OpenBSD divert(4) solve narrower,
+  differently-shaped problems; no useful one-paragraph contrast.
 
-**Status:** open. Option 1 is the obvious first step; Option 2 is
-worth considering for chapters whose source surface is purely
-FreeBSD-internal (most of them).
+Source Tree (chapter 1) was already opted out via its tree-overview
+sections list. Total chapters opting out of Comparison: 3 of 25.
+
+**Change 2: Comparison-Quality criterion (Option A).** New criterion
+9 in `build_review_prompt`, gated on `"Comparison" in sections` (same
+shape as the existing `wants_diagram` Mermaid gate). Chapters that
+opted out auto-pass with `"comparison_quality": "PASS: not required"`.
+Chapters that kept Comparison get graded on three explicit failure
+shapes:
+
+- **Tautology** — "FreeBSD uses X while Linux also uses X."
+- **Unsupported cross-OS claim** — assertions about Linux/macOS/NetBSD
+  internals stated as fact with no concrete differentiator.
+- **Vague contrast** — "Linux handles this differently" with no
+  specifics.
+
+The reviewer has no cross-OS source corpus, so this is shape-matching
+against the draft, not fact-checking against external sources. Both
+example sentences from the post-mortem above are FAIL by this rule.
+
+**Why both changes:** Option B alone leaves chapters that *do* opt in
+unchecked (the writer can still emit weak Comparisons there). Option
+A alone still pays Comparison-generation cost on chapters that have
+nothing useful to say. Together: B prevents the "fill space" failure
+mode upstream by not asking; A catches residual weak content on
+chapters that legitimately keep Comparison.
+
+The third option from the original plan — *"Require a citation per
+comparison bullet (book reference or non-FreeBSD source path)"* —
+remains infeasible without a non-FreeBSD source corpus and is
+unlikely to ship.
 
 ---
 

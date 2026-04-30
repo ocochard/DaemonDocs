@@ -24,7 +24,7 @@ The goal is **not** to reproduce man pages. The goal is to help anyone who knows
 3. **Builds a TF-IDF search index** over the combined corpus (numpy only)
 4. **For each chapter** in `chapters.yaml`:
    - A writer agent studies the source code and searches the corpus
-   - A reviewer agent grades the draft on 7 criteria (including a check that no marketing language slipped in)
+   - A reviewer agent grades the draft on 9 criteria (including a check that no marketing language slipped in)
    - If needed, the writer revises — up to `--max-revisions` rounds
 5. **Writes** the final markdown file into the relevant source directory (e.g. `README_internals.md`, `sys/vm/README_vm.md`)
 
@@ -256,14 +256,16 @@ prompt can stay small and focused.
 
 ### Reviewer rubric
 
-The reviewer grades on 7 criteria:
+The reviewer grades on 9 criteria:
 1. **Completeness** — all key questions answered
 2. **Accuracy** — no hallucinated structs/functions/paths
 3. **Source Coverage** — expected files actually discussed (not just listed)
-4. **Mermaid Diagram** — valid syntax, meaningful content
+4. **Mermaid Diagram** — valid syntax, meaningful content (auto-PASS if the chapter opted out of `Flow / Diagram`)
 5. **Accessibility** — explains WHY, not just WHAT
 6. **Structure** — every section the chapter declared in `sections:` is present and substantive
 7. **No marketing language** — no "comprehensive", "robust", "seamless", "leverage", "elegant", etc. The reviewer quotes the offending sentence.
+8. **Rationale** — every non-obvious mechanism (shadow chains, UMA kegs, witness, turnstiles, …) gets at least one sentence explaining WHY the design exists, not just what it looks like.
+9. **Comparison Quality** — when the chapter has a `## Comparison` section, every contrastive statement names a concrete difference. Tautologies (*"FreeBSD uses X while Linux also uses X"*), unsupported cross-OS claims, and vague "Linux handles this differently" forms are FAIL. Auto-PASS for chapters that opted out of `Comparison`.
 
 The strict gate (in `_review_passes`) only approves a chapter when `grade == "PASS"` AND `issues[]` is empty AND every criterion passes. This prevents the failure mode where the model returns `grade=PASS` while individual criteria still say `FAIL`.
 
@@ -284,7 +286,7 @@ Each chapter has:
 - `sections` — *(optional)* which template sections this chapter should produce. Defaults to the full set: `Quick Summary`, `Architecture`, `Key Data Structures`, `Deep Dive`, `Flow / Diagram`, `Advanced Notes`, `Comparison`, `See Also`. A tree-overview chapter, for example, can drop `Key Data Structures` and `Deep Dive` because there's no specific subsystem to feature. The catalog of valid section names lives in `_SECTION_CATALOG` in `generate-doc.py`.
 - `scope_guard` — *(optional)* free-text hard rule injected into the writer prompt under `## Scope Guard`. Use this when section selection alone isn't enough to keep the writer on-topic. The tree-overview chapter uses it to forbid pulling subsystem internals (vm_page, struct proc, etc.) from referenced source directories.
 
-Current chapters (24), grouped by subsystem family:
+Current chapters (25), grouped by subsystem family:
 
 **Boot & kernel core**
 1. FreeBSD Source Tree Overview
@@ -310,6 +312,7 @@ Current chapters (24), grouped by subsystem family:
 15. VNET — Virtual Network Stacks
 16. pf — OpenBSD-derived Packet Filter
 17. ipfw and dummynet — FreeBSD's Native Firewall
+25. netgraph — Graph-based Networking Framework
 
 **Devices & interrupts**
 18. Device Driver Framework
@@ -344,6 +347,7 @@ Each chapter produces a markdown file in the FreeBSD source tree:
 | `sys/kern/` | `README_capsicum.md`, `README_locking.md` (in addition to others above) |
 | `sys/netpfil/pf/` | `README.md` |
 | `sys/netpfil/ipfw/` | `README.md` |
+| `sys/netgraph/` | `README.md` |
 | `sys/cddl/dev/dtrace/` | `README.md` |
 | `sys/amd64/vmm/` | `README.md` |
 | `sys/cam/` | `README.md` |
@@ -406,7 +410,7 @@ Every generated file ends with a **provenance footer** recording the LLM model i
 DaemonDocs/
 ├── README.md              ← you are here
 ├── generate-doc.py        ← single self-contained script
-├── chapters.yaml          ← 13 chapter definitions
+├── chapters.yaml          ← 25 chapter definitions
 ├── requirements.txt       ← Python dependencies
 └── .index/                ← cached corpus + TF-IDF index (gitignored)
     ├── books_corpus.txt

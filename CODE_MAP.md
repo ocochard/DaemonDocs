@@ -101,7 +101,7 @@ pattern.
 | Want to... | Edit | Pattern to follow |
 |---|---|---|
 | Add a writer rule (e.g. forbid a phrasing) | `build_chapter_prompt` | The existing **Rules:** block, then the **Quote, don't paraphrase** block. Each rule names the failure mode + names the right instinct + gives a concrete example. |
-| Add a reviewer rubric criterion | `build_review_prompt` | Add to the numbered rubric AND to the JSON output schema (`"criteria": { ... }`) AND to the gate. The gate is `_review_passes`, which iterates `criteria.values()` — adding a key there is automatic. The fail-counter `_criteria_fail_count` hard-codes the count `8` for the "broken JSON" worst-case; bump it if you add criteria. Also bump the `8 - fail_count`/`/8` print formatting in `run_chapter`'s review loop and rollback log, and the `best_fails = 9` initializer (one more than the max possible). |
+| Add a reviewer rubric criterion | `build_review_prompt` | Add to the numbered rubric AND to the JSON output schema (`"criteria": { ... }`) AND to the gate. The gate is `_review_passes`, which iterates `criteria.values()` — adding a key there is automatic. The fail-counter `_criteria_fail_count` hard-codes the current count (`9`) for the "broken JSON" worst-case; bump it if you add criteria. Also bump the `N - fail_count`/`/N` print formatting in `run_chapter`'s review loop and rollback log, and the `best_fails = N+1` initializer (one more than the max possible). If the criterion is conditional (only fires when a certain section is present), gate it on `"Section Name" in sections` and emit a `PASS: not required` JSON line in the off branch — see the `wants_diagram` (Mermaid) and `wants_comparison` (Comparison Quality) gates as templates. |
 | Inject ground truth into the reviewer | `build_review_prompt` | Pre-validate before the prompt is rendered, build a `verified_FOO_block` string, interpolate it alongside the existing `verified_block` / `symbol_block` / `macro_block`. The Accuracy criterion and the **No hedges** block reference these blocks by name — update both when adding a new ground-truth category. |
 | Inject ground truth into the writer | `_build_symbol_catalog` (called by `build_chapter_prompt`) | Pre-extract real symbol names from the chapter's `source_files` + bounded `source_dirs` sample, render an `## Authoritative Symbol Catalog` block. Caps live in `_CATALOG_MAX_*` and `_CATALOG_FILES_PER_DIR` — keep them tight; this is prompt-cost, not fact-check-cost. To add a new symbol kind, extend `_dirmap_extract_names` (which is shared with `directory_map`). |
 | Add a new section type (output template) | `_SECTION_CATALOG` | Each entry has `template_body`, `rubric_body`. Per-chapter section list comes from `_chapter_sections(chapter)` reading `sections:` in `chapters.yaml`. |
@@ -161,14 +161,16 @@ pattern.
 
 ## Execution topology — where the script runs
 
-`generate-doc.py` ALWAYS runs from `framework` (fw1, the primary
-host). That host owns the repo, the FreeBSD source tree, the books
-corpus, and one llama-server. `framework2` (192.168.100.136) is
-ONLY an additional llama-server endpoint — no repo, no source
-tree, no script. Parallelism is two `generate-doc.py` processes
-*on fw1*, each pointed at a different `OPENAI_BASE_URL` (one
-local, one fw2). The hostname `framework2` does not resolve from
-fw1; use the IP from `~/.ssh/config`.
+`generate-doc.py` runs on a single primary host that owns the repo,
+the FreeBSD source tree (`$FREEBSD_SRC`), the books corpus
+(`$BOOKS_DIR`), and at least one llama-server endpoint. Additional
+llama-server endpoints (separate hosts on the LAN) are reachable via
+their `OPENAI_BASE_URL` and used purely as compute — they do NOT need
+the repo, the source tree, or a copy of the script. Parallelism is N
+`generate-doc.py` processes on the primary host, each pointed at a
+different `OPENAI_BASE_URL`. Resolve remote endpoint hosts by IP or
+via `~/.ssh/config` aliases as appropriate; the script itself only
+cares about the `OPENAI_BASE_URL` env var.
 
 ---
 
