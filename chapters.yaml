@@ -169,7 +169,26 @@ chapters:
       - "How does FreeBSD organize virtual address spaces?"
       - "What is the relationship between vm_map, vm_object, and vm_page?"
       - "How does the pmap layer abstract hardware page tables?"
-    mermaid: class
+    # The Deep Dive walks through page-fault handling — a sequence of
+    # events between CPU, vm_fault, the pager, and the pmap layer — so a
+    # sequence diagram tells that story better than the class diagram.
+    # The class structure (vm_map → vm_map_entry → vm_object → vm_page) is
+    # already conveyed by the Key Data Structures section's struct quotes.
+    mermaid: sequence
+    # Glossary is opt-in per chapter (not in _DEFAULT_SECTIONS). VM uses
+    # heavy jargon — TLB shootdown, PML4, copy-on-write, slab, shadow
+    # chain — that students need defined up front, before the Architecture
+    # section starts using the terms.
+    sections:
+      - "Quick Summary"
+      - "Glossary"
+      - "Architecture"
+      - "Key Data Structures"
+      - "Deep Dive"
+      - "Flow / Diagram"
+      - "Advanced Notes"
+      - "Comparison"
+      - "See Also"
 
   - title: "Process Management — Scheduling and Lifecycle"
     family: "memory-process"

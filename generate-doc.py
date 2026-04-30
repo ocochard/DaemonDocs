@@ -1808,6 +1808,21 @@ _SECTION_CATALOG = {
         ),
         "rubric_body": "3-4 paragraphs, no code (beginners)",
     },
+    "Glossary": {
+        # Opt-in per chapter (not in _DEFAULT_SECTIONS). Best placed early
+        # in the section list — defining terms AFTER the Architecture
+        # section has already used them defeats the point.
+        "template_body": (
+            "(3-8 single-line definitions of terms used in this chapter\n"
+            "that a junior developer wouldn't already know — e.g. TLB\n"
+            "shootdown, PML4, copy-on-write, slab, shadow chain, NUMA\n"
+            "domain. One sentence per term, in the form `**term** —\n"
+            "definition.`. Skip terms a working C programmer already\n"
+            "knows (pointer, struct, mutex). Cover only terms that\n"
+            "actually appear later in this chapter.)"
+        ),
+        "rubric_body": "3-8 one-line definitions of jargon used in chapter",
+    },
     "Architecture": {
         "template_body": "(technical explanation with specific source file references)",
         "rubric_body": "technical explanation with source references",
@@ -2294,6 +2309,27 @@ def build_chapter_prompt(chapter: dict) -> str:
         (as a generic adjective; the section title is fine). If a sentence
         relies on one of these words to be impressive, the sentence is
         empty — replace it with a concrete fact or delete it.
+
+        **Explain WHY a non-obvious structure exists, not just what it
+        is.** When you introduce a non-trivial data structure or mechanism
+        the FIRST time it appears in the chapter — shadow chains, inactive
+        queues, UMA kegs vs zones, pagedaemon thresholds, witness, turnstiles,
+        copy-on-write, slab caches, NUMA domains, etc. — give one sentence
+        on the engineering problem it solves. The reader needs the *reason*
+        before the *mechanism* will stick.
+        - WRONG: "A shadow chain is a linked list of vm_objects."
+          (Tells the reader what it looks like, not why it exists.)
+        - RIGHT: "Shadow chains let fork() share pages copy-on-write — the
+          child gets a new vm_object whose shadow points at the parent's,
+          so only pages the child actually modifies need to be duplicated."
+          (Names the problem — fork() is expensive if pages are eagerly
+          copied — and the trade-off the design buys.)
+        This rule applies to *non-obvious* structures only. A `struct
+        proc` doesn't need a "why processes exist" sentence; a `vm_map`'s
+        red-black tree doesn't need a "why O(log n) is fast" sentence.
+        Apply it where a junior reader would reasonably ask "but why is
+        it built that way?" — typically once per major mechanism, not
+        once per struct.
     """).lstrip()
 
 
@@ -2602,6 +2638,22 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            sophisticated. Quote the offending sentence(s) in the issue
            text so the writer can find and remove them.
 
+        8. **Rationale** — When the draft introduces a non-obvious data
+           structure or mechanism (shadow chains, inactive queues, UMA
+           kegs vs zones, copy-on-write, slab caches, witness, turnstiles,
+           NUMA domains, pagedaemon thresholds, etc.), does it explain
+           WHY the design exists — what engineering problem it solves —
+           and not just what it looks like? PASS if every non-obvious
+           mechanism gets at least one sentence of rationale on its first
+           introduction. FAIL if a major mechanism is described purely
+           structurally ("X is a linked list of Y") with no reason for
+           the design choice. Quote the offending paragraph(s) in the
+           issue text so the writer can find and expand them. Trivial /
+           obvious structures (a struct that just groups related fields,
+           a red-black tree where O(log n) is self-evident) do NOT need
+           rationale — apply this only where a junior reader would
+           reasonably ask "but why is it built that way?"
+
         ## Draft to Review
 
         {draft}
@@ -2618,7 +2670,8 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
             "source_coverage": "PASS/FAIL: reason",
 {mermaid_json_line}            "accessibility": "PASS/FAIL: reason",
             "structure": "PASS/FAIL: reason",
-            "no_marketing": "PASS/FAIL: reason (quote any offending sentences)"
+            "no_marketing": "PASS/FAIL: reason (quote any offending sentences)",
+            "rationale": "PASS/FAIL: reason (quote the paragraph if FAIL)"
           }},
           "issues": [
             "Specific issue 1 with actionable fix",
@@ -3050,7 +3103,7 @@ def _review_passes(review_json: Optional[dict]) -> bool:
     History: an earlier version accepted on grade==PASS *or* empty issues,
     which silently approved drafts where individual criteria said FAIL.
     The over-correction was to also require empty issues — but that ran
-    into a second failure mode where the reviewer marks all 7 criteria
+    into a second failure mode where the reviewer marks all 8 criteria
     PASS and still pads `issues` with stylistic nits, forcing another
     revision round (and risking regressions where the writer reintroduces
     bugs we already fixed).
@@ -3085,10 +3138,10 @@ def _criteria_fail_count(criteria: object) -> int:
     null or list values. Treat anything non-string as a failure (safer
     default for the summary line).
     """
-    # 7 criteria total: completeness, accuracy, source_coverage,
-    # mermaid_diagram, accessibility, structure, no_marketing.
+    # 8 criteria total: completeness, accuracy, source_coverage,
+    # mermaid_diagram, accessibility, structure, no_marketing, rationale.
     if not isinstance(criteria, dict):
-        return 7
+        return 8
     fails = 0
     for v in criteria.values():
         if not isinstance(v, str) or v.startswith("FAIL"):
@@ -3274,15 +3327,15 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         # last (worse) draft. Instead we keep the draft from the round
         # with the fewest FAIL criteria; ties go to the *later* round
         # (later drafts have had more issues addressed even if criteria
-        # count is unchanged). best_fails starts at 8 — strictly worse
-        # than any real review (max possible is 7) — so the very first
+        # count is unchanged). best_fails starts at 9 — strictly worse
+        # than any real review (max possible is 8) — so the very first
         # graded draft always wins on first comparison.
         warnings: List[str] = []
         revision = 0
         approved = False
         parse_retry_used = False
         best_draft = draft
-        best_fails = 8
+        best_fails = 9
         best_round = 0
         last_fails: Optional[int] = None  # fail_count of the most recent graded round
 
@@ -3315,7 +3368,7 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             criteria = review_json.get("criteria", {}) or {}
 
             fail_count = _criteria_fail_count(criteria)
-            print(f"         grade={grade}  ({7 - fail_count}/7 criteria pass)")
+            print(f"         grade={grade}  ({8 - fail_count}/8 criteria pass)")
             # Print every issue and every praise — truncating these hides
             # the diagnostic information needed to figure out why the
             # reviewer didn't approve. The log is verbose by design.
@@ -3383,13 +3436,13 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 and last_fails > best_fails
             ):
                 print(f"  [rollback] revision {revision} regressed "
-                      f"({7 - last_fails}/7) — using revision {best_round} "
-                      f"({7 - best_fails}/7) instead")
+                      f"({8 - last_fails}/8) — using revision {best_round} "
+                      f"({8 - best_fails}/8) instead")
                 draft = best_draft
                 warnings.append(
                     f"revisions regressed; kept revision {best_round} "
-                    f"({7 - best_fails}/7 criteria) over revision {revision} "
-                    f"({7 - last_fails}/7)"
+                    f"({8 - best_fails}/8 criteria) over revision {revision} "
+                    f"({8 - last_fails}/8)"
                 )
 
         # ---- Fact-checking pass ----
