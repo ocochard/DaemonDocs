@@ -830,3 +830,59 @@ chapters:
       - "How does an ECB connect a probe to an action, and how do aggregations produce summary statistics without per-event userspace traffic?"
       - "What is the role of fasttrap, and how does it instrument userspace processes?"
     mermaid: class
+
+  - title: "netgraph — Graph-based Networking Framework"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "VNET — Virtual Network Stacks"
+    output_file: "sys/netgraph/README.md"
+    source_dirs:
+      - "sys/netgraph"
+    # Keep source_files focused on the framework itself (ng_base.c is
+    # the canonical entry point, netgraph.h is the KPI). The 70+ shipped
+    # node modules under sys/netgraph/ are out of scope per scope_guard
+    # — the writer can name a few in passing but should not catalog them.
+    source_files:
+      - "sys/netgraph/ng_base.c"
+      - "sys/netgraph/netgraph.h"
+      - "sys/netgraph/ng_message.h"
+      - "sys/netgraph/ng_parse.h"
+      - "sys/netgraph/ng_parse.c"
+    # netgraph is a *framework*, not a subsystem of sys/net or netpfil.
+    # Without this guard the writer drifts into either (a) re-explaining
+    # mbufs and the IP input path (which belongs to ch14 Network Stack)
+    # or (b) cataloging every ng_*.c node in the directory (which the
+    # directory_map tool already handles on demand).
+    scope_guard: >
+      This chapter is about the netgraph *framework* (nodes, hooks,
+      messages, the KPI in netgraph.h, how data and control flow through
+      the graph), not about individual netgraph node implementations.
+      Do NOT walk through ng_ether.c, ng_bridge.c, ng_pppoe.c, ng_bpf.c,
+      or any other specific node file in detail — name them at most as
+      one-line examples of what kinds of nodes ship in the tree, then
+      move on. Do NOT re-explain mbufs, the IP input/output path, or
+      the ifnet layer — those belong to the Network Stack chapter; link
+      to it when you need to reference how netgraph receives or injects
+      packets there. Focus on what a netgraph author needs to know:
+      ng_type, hooks, the rcvdata/rcvmsg/disconnect/shutdown lifecycle,
+      message typing via ng_parse, and how userland (ngctl, libnetgraph)
+      talks to the graph.
+    focus: >
+      Document FreeBSD's netgraph framework: a graph of typed nodes
+      connected by hooks, communicating by passing data items (mbufs)
+      and control messages along edges. Cover the node lifecycle
+      (constructor, newhook, rcvdata, rcvmsg, disconnect, shutdown),
+      the typed-message system in ng_parse.h, how ng_base.c dispatches
+      data and control between nodes, and how userland uses ngctl(8) /
+      libnetgraph to introspect and reconfigure a running graph. Frame
+      netgraph against netpfil/pfil_hooks (chapter 16/17) — the two
+      coexist but solve different problems: pfil is a fixed sequence of
+      filtering hooks at well-known points in the IP path; netgraph is
+      a user-composable graph for protocol stacks, tunnels, and shaping.
+    key_questions:
+      - "What is a netgraph node type, and what does the KPI in netgraph.h require an author to provide (ng_type, NGM_*, hooks, methods)?"
+      - "How does data flow through the graph: when a node calls NG_FWD_* / NG_SEND_DATA, what happens inside ng_base.c?"
+      - "What is the typed-message system in ng_parse, and why does netgraph use it instead of raw byte buffers for control messages?"
+      - "How does userland (ngctl(8), libnetgraph) attach to the kernel graph, and how does ng_socket bridge socket I/O to graph messages?"
+    mermaid: flowchart

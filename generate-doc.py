@@ -4574,19 +4574,18 @@ def _add_see_also_links(content: str, title: str, title_map: dict,
         return content
 
     # ---- Strip any prior auto-generated list items in this section ----
-    # Build the set of relative paths that point at a chapter README,
-    # computed from this file's vantage point. A list-item with one of
-    # those targets was inserted by a previous run.
-    auto_targets: set[str] = set()
-    for ch_title, ch_file in title_map.items():
-        if ch_file == current_file:
-            continue
-        rel_dir = os.path.dirname(ch_file) or "."
-        if rel_dir == ".":
-            auto_targets.add(os.path.basename(ch_file))
-        else:
-            depth = len(rel_dir.split("/")) + 1
-            auto_targets.add("../" * depth + ch_file)
+    # We treat a list-item as auto-generated if its link target resolves
+    # (when joined with this file's directory and normalized) to another
+    # chapter's README. This catches both correctly-built links from the
+    # current code AND legacy broken links from earlier versions that
+    # over-counted depth (e.g. `../../../sys/vm/README_bcache.md` from a
+    # file in `sys/kern/` — wrong path, but still recognizably aimed at
+    # a chapter README).
+    current_dir = os.path.dirname(current_file) or "."
+    chapter_files: set[str] = {
+        ch_file for ch_file in title_map.values() if ch_file != current_file
+    }
+    chapter_basenames: set[str] = {os.path.basename(f) for f in chapter_files}
 
     # Section spans from after the header line to the next `## ` heading
     # or end of file. Operate line-by-line within that span.
@@ -4607,8 +4606,22 @@ def _add_see_also_links(content: str, title: str, title_map: dict,
     kept_lines = []
     for line in section_body.split("\n"):
         m = auto_link_re.match(line)
-        if m and m.group(1) in auto_targets:
-            continue  # drop a prior auto-inserted link
+        if m:
+            target = m.group(1).strip()
+            # Treat as auto-inserted if (a) basename matches a chapter
+            # README filename AND (b) the target's normalized form points
+            # at one of the known chapter files. Resolving `current_dir +
+            # target` and normalizing collapses both correct and
+            # over-deep relative paths to the same canonical form.
+            tgt_base = os.path.basename(target)
+            if tgt_base in chapter_basenames:
+                joined = os.path.normpath(os.path.join(current_dir, target))
+                # Strip any leading "../" left over from over-deep paths
+                # that climb above the repo root.
+                while joined.startswith("../"):
+                    joined = joined[3:]
+                if joined in chapter_files:
+                    continue  # drop a prior auto-inserted link (any depth)
         kept_lines.append(line)
     # Collapse runs of >1 blank lines that the strip may have left behind.
     cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(kept_lines))
@@ -4618,18 +4631,15 @@ def _add_see_also_links(content: str, title: str, title_map: dict,
         return content
 
     # ---- Build fresh cross-links ----
+    # Path is computed relative to the directory containing `current_file`,
+    # so e.g. sys/kern/README_locking.md → sys/vm/README_bcache.md
+    # becomes "../vm/README_bcache.md", not "../../../sys/vm/...".
     links = []
     for rel_title in related:
         rel_file = title_map.get(rel_title)
         if rel_file and rel_file != current_file:
-            rel_dir = os.path.dirname(rel_file) or "."
-            if rel_dir == ".":
-                links.append(f"[{rel_title}]({os.path.basename(rel_file)})")
-            else:
-                parts = rel_dir.split("/")
-                depth = len(parts) + 1
-                prefix = "../" * depth
-                links.append(f"[{rel_title}]({prefix}{rel_file})")
+            rel_path = os.path.relpath(rel_file, start=current_dir)
+            links.append(f"[{rel_title}]({rel_path})")
 
     if not links:
         return content
