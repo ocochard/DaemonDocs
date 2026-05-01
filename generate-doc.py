@@ -3145,7 +3145,16 @@ def create_writer_agent(index: TfidfIndex):
         # exactly the drift mode the prompt warns against. Keeping the
         # sandbox honest is more reliable than relying on the prompt.
         additional_authorized_imports=["re", "json"],
-        max_steps=40,
+        # 40 was too low for wide-scope networking chapters: the IP Layer
+        # chapter (10 source files across sys/netinet, sys/netinet6,
+        # sys/net/route) hit max_steps in *both* the draft and fact-fix
+        # phases on 2026-05-01, shipping with `⚠ UNVERIFIED DRAFT` and a
+        # leaked `final_answer(...)` literal at the top of the output.
+        # The mbuf chapter hit max_steps in draft *and* errored in
+        # revision 1. Bumped to 80 — same agent instance is reused for
+        # draft / revise / fact-fix, so wide chapters need headroom for
+        # all three.
+        max_steps=80,
     )
 
 
