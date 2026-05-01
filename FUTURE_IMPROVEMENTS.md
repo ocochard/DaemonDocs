@@ -998,6 +998,94 @@ comparison bullet (book reference or non-FreeBSD source path)"* —
 remains infeasible without a non-FreeBSD source corpus and is
 unlikely to ship.
 
+### Struct-snippet faithfulness — code blocks can disagree with prose, nothing checks the layout
+
+Observed on `sys/sys/README_mbuf.md` (chapter 26, generated 2026-05-01,
+shipped CLEAN with reviewer 9/9 PASS). The chapter's prose correctly
+describes the mbuf chain semantics, the `M_PKTHDR` / `M_EXT` /
+`M_EXTPG` discriminant, the ref-counted cluster mechanism via `m_ext`,
+and the `m_tag` linked list. But the rendered ` ```c struct mbuf {...}``` `
+block is wildly wrong:
+
+```c
+/* What the chapter shipped */
+struct mbuf {
+    union {
+        struct  pkthdr pkthdr;  /* M_PKTHDR set */
+        char    *mext;          /* M_EXT set */
+    } m_hdr;
+};
+```
+
+vs. the real `sys/sys/mbuf.h:329`, which has:
+
+- Two leading chain-pointer unions (`m_next`/`m_slist`/`m_stailq` and
+  `m_nextpkt`/`m_slistpkt`/`m_stailqpkt`) — the *defining* feature of
+  an mbuf, completely absent from the snippet.
+- The bookkeeping fields `m_data`, `m_len`, and the `m_type:8 / m_flags:24`
+  bitfield — also absent.
+- A 4-way trailing union covering `M_PKTHDR` (`struct pkthdr`),
+  `M_EXTPG` (multi-page TLS bookkeeping: `m_epg_npgs`, `m_epg_tls`,
+  `m_epg_so`, …), `M_EXT` (`struct m_ext` — *not* a bare `char *`),
+  and inline payload — collapsed in the chapter to a 2-arm union with
+  the wrong types.
+- The bogus outer name `} m_hdr;` (no such member exists in the real
+  struct; the trailing union is anonymous).
+
+**Why this slipped through:**
+
+- **Fact-check verifies symbol existence, not layout fidelity.**
+  `_verify_structs` confirms `struct mbuf` exists in the tree.
+  `_verify_struct_fields` only flags fields the writer cited that
+  *don't* exist — the inverse error (omitting all the real fields and
+  inventing a wrong outer shape) is silent.
+- **Reviewer reads the prose.** The prose is correct. The reviewer's
+  Accuracy criterion is satisfied because the *narrative* matches the
+  source. Nothing currently looks for prose↔code-block consistency.
+- **Writer paraphrased from training-data memory** rather than quoting
+  what `read_freebsd_source` would return. The "quote-don't-paraphrase"
+  rule in the writer prompt exists but is advisory; for the largest
+  structs the writer is likely to abbreviate "for clarity" and end up
+  with something that looks plausible but isn't load-bearing.
+
+This is a pure-LLM-confabulation failure mode that the existing
+defenses don't reach. It's most dangerous on structs that are
+**well-known but have evolved** — `struct mbuf`, `struct buf`,
+`struct vnode`, `struct proc`, `struct pcb` — where the writer's
+training-data prior is strong enough to override the actual source.
+
+**Possible fixes (none picked yet):**
+
+1. **Real-struct injection diff.** For every ` ```c struct NAME { ... }``` `
+   block in the draft, find the actual definition in the source tree
+   (we already have `resolve_c_definition` for this), compute a
+   coarse-grained diff (member-name set, basic shape), and feed
+   *both* to the reviewer with a new criterion: "does the code block
+   match the source layout, or is the gap explained as an excerpt?"
+   The reviewer doesn't need byte-for-byte equality — chapters
+   legitimately abbreviate — but it needs to flag missing top-level
+   fields like `m_next` / `m_data`.
+2. **Structural shape verifier.** Extract the field-name set from
+   each emitted struct block, intersect with the field-name set from
+   the in-tree definition, and demote to UNVERIFIED when the
+   intersection is below some threshold *and* the chapter doesn't
+   explicitly mark the block as "abbreviated" / "simplified". This
+   needs no LLM call, only the existing struct-extraction regex.
+3. **Force quote-only mode for big-rock structs.** A per-chapter
+   knob in `chapters.yaml` (say `verbatim_structs: [mbuf, m_ext, pkthdr]`)
+   that adds a hard rule to the writer prompt: these structs MUST be
+   pasted verbatim from `read_freebsd_source`, no abbreviation.
+   Cheaper than (1) but only protects the structs we anticipate.
+
+Option (2) is the cheapest by far and would have caught the mbuf
+case (the rendered block has 1 field name in common with the real
+definition: `pkthdr` — and even that is wrong as a member name).
+It also has zero false-positive risk for chapters that don't
+include code blocks at all. Worth prototyping next.
+
+**Status:** open. Filed 2026-05-01 after ch26 mbuf shipped clean
+with the wrong struct.
+
 ---
 
 ## What "improve coverage" can mean
