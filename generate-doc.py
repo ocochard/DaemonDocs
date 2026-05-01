@@ -4392,11 +4392,14 @@ def _batched_grep_present(symbols: List[str], pattern_template: str,
     if not output:
         return set()
 
-    # Stage 2: validate the shape per symbol with Python re.
+    # Stage 2: validate the shape per symbol with Python re. MULTILINE
+    # so `^NAME\s*\(` patterns (K&R-style function defs with the name
+    # at column 0) match per-line in the multi-line grep output, not
+    # just at byte 0.
     matched = set()
     for s in symbols:
         py_pattern = pattern_template.format(alt=re.escape(s))
-        if re.search(py_pattern, output):
+        if re.search(py_pattern, output, re.MULTILINE):
             matched.add(s)
     return matched
 
@@ -4457,25 +4460,59 @@ def _verify_functions(funcs: List[str], src_root: str) -> List[str]:
     Returns a list of function names that could not be found.
     Backed by `_FACT_CHECK_CACHE` so re-runs within a session are free.
     """
-    # Match common return-type prefixes followed by NAME(. The pattern is
-    # used by the Python re re-scan (not by grep), so we use the
-    # non-capturing form for the type-token alternation — only the symbol
-    # name needs a capture (none of which the caller actually consumes).
-    # `\s+` and `\*?` widen coverage to pointer-returning functions like
-    # `void *malloc(` that the previous per-symbol regex missed.
-    type_tokens = (
-        r"(?:void|int|static|struct|enum|uint|char|u_int|u_char|error_t)"
+    # The Python re re-scan needs to confirm "this line really is a
+    # function definition shape" for the symbol. Earlier versions
+    # enumerated return-type tokens (void|int|struct|enum|...) and
+    # required them directly adjacent to the name, which falsely
+    # rejected everything written K&R-style across multiple words:
+    #
+    #   struct inpcb *
+    #   in_pcblookup_hash(...)
+    #   {
+    #
+    # Here `struct inpcb *` is two words plus a star; the old
+    # `(?:struct|...)\s+\*?\s*NAME` pattern wanted `struct *NAME` and
+    # missed the real definition. Same root cause that caused
+    # _dirmap_extract_names to under-count symbols. The shape we
+    # actually want is: at least one identifier-token chunk (the
+    # return type / qualifiers), then NAME, then `(`. The grep stage
+    # already restricted to lines containing the symbol, so the
+    # Python pass just needs to confirm we're looking at a defn-shape
+    # line and not a call site or struct field.
+    pattern = (
+        r"(?:"
+        # Single-line return-type form: `void *foo(`, `static int foo(`,
+        # `struct inpcb *foo(` — at least one identifier-token before
+        # NAME. The grep stage filters call sites; this just confirms
+        # we're seeing a defn-shape and not a struct-field reference.
+        r"(?:[A-Za-z_]\w*\s*\**\s+)+\*?\s*({alt})\s*\("
+        r"|"
+        # K&R-style with name at column 0 — return type lives on the
+        # previous line:
+        #     struct inpcb *
+        #     in_pcblookup_hash(struct in_addr, u_short, ...)
+        # This is how a lot of FreeBSD network code is written. The
+        # shape grep accepts these via the `^NAME\s*\(` alternative,
+        # and we accept them here too.
+        r"^({alt})\s*\("
+        r")"
     )
-    pattern = type_tokens + r"\s+\*?\s*({alt})\s*\("
-    # `shape_grep` keeps lines that look like a function signature:
-    # an identifier followed (optionally through `*` and spaces) by `(`.
-    # That filters out includes/comments/string literals but accepts
-    # both `void malloc(` and `void *malloc(`. The Python re re-scan
-    # then tightens this to a type-token + name shape.
+    # `shape_grep` keeps lines that look like a function signature.
+    # Two alternatives:
+    #   1. `ID *? ID(` — covers `void malloc(` / `void *malloc(`-style
+    #      single-line defs and prevents call sites (`malloc(...)`)
+    #      from leaking through.
+    #   2. `^ID(` — covers K&R-style defs where the name sits at
+    #      column 0 because the return type is on the previous line.
+    #      Without this, `tcp_newtcpcb(struct inpcb *, ...)` lines are
+    #      filtered out and the symbol is wrongly reported missing.
     return _verify_with_cache(
         "func", funcs, src_root,
         pattern_template=pattern,
-        shape_grep=r"[A-Za-z_][A-Za-z0-9_]* *\*? *[A-Za-z_][A-Za-z0-9_]*\(",
+        shape_grep=(
+            r"[A-Za-z_][A-Za-z0-9_]* *\*? *[A-Za-z_][A-Za-z0-9_]*\("
+            r"|^[A-Za-z_][A-Za-z0-9_]*\("
+        ),
     )
 
 
