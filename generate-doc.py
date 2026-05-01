@@ -86,6 +86,21 @@ MODEL_CONFIG = {
     "model_id": os.environ.get("OPENAI_MODEL", "qwen36-coder"),
     "api_base": os.environ.get("OPENAI_BASE_URL", "http://localhost:8080/v1"),
     "api_key": os.environ.get("OPENAI_API_KEY", "none"),
+    # Hard ceiling on any single HTTP call to the LLM endpoint. Without
+    # this, a wedged llama-server connection (server idle, TCP still
+    # ESTABLISHED, no bytes flowing) wedges the chapter forever — the
+    # python `openai` SDK has no inactivity timeout by default. Observed
+    # 2026-05-01 on ch8: writer mid-step, llama-server at 0% CPU, log
+    # file frozen for 6+ minutes with no recovery in sight.
+    #
+    # 600s is generous — a single chapter generation step usually
+    # completes in 30–120s; the longest legitimate calls we've seen are
+    # ~3 min. 600s gives 5× headroom while still bounding the worst
+    # case. On timeout the SDK raises `APITimeoutError`, which the
+    # existing try/except in run_chapter (around _run_agent) catches
+    # and breaks the review loop — chapter writes UNVERIFIED instead
+    # of stalling.
+    "timeout": float(os.environ.get("DAEMONDOCS_LLM_TIMEOUT", "600")),
 }
 
 # Resolved at startup by resolve_model_provenance(); cached for the run.
@@ -3098,6 +3113,9 @@ def create_writer_agent(index: TfidfIndex):
         model_id=MODEL_CONFIG["model_id"],
         api_base=MODEL_CONFIG["api_base"],
         api_key=MODEL_CONFIG["api_key"],
+        # client_kwargs is forwarded to openai.OpenAI(); `timeout` here
+        # bounds the read timeout per HTTP call. See MODEL_CONFIG above.
+        client_kwargs={"timeout": MODEL_CONFIG["timeout"]},
         temperature=0.6,
         top_p=0.95,
     )
@@ -3130,6 +3148,7 @@ def create_reviewer_agent(index: TfidfIndex):
         model_id=MODEL_CONFIG["model_id"],
         api_base=MODEL_CONFIG["api_base"],
         api_key=MODEL_CONFIG["api_key"],
+        client_kwargs={"timeout": MODEL_CONFIG["timeout"]},
         temperature=0.6,
         top_p=0.95,
     )

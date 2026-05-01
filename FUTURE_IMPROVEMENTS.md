@@ -196,6 +196,70 @@ quotes — not yet shipped. Land if (1) alone proves insufficient.
 
 ---
 
+### [DONE] LLM HTTP calls have no inactivity timeout; a wedged endpoint stalls the chapter indefinitely
+
+Observed 2026-05-01 on the first ch8 re-run after the JSONDecodeError
+fix. Pattern:
+
+- Writer mid-step (had just issued a `read_freebsd_source` call).
+- Log file frozen at a fixed mtime for 6+ minutes.
+- Python process state `S` (sleeping). CPU time well below wall-clock
+  time — process was idle, not stuck-busy.
+- llama-server at 0.0% CPU, `/health` returning `{"status":"ok"}`.
+- Two python→llama TCP connections still ESTABLISHED.
+
+Neither side was making progress, neither side was going to time out.
+The python `openai` SDK has no inactivity timeout by default — it
+will wait on a half-open connection forever. We had to kill the
+chapter manually.
+
+**Why this matters:** even with the JSONDecodeError fix, a single
+wedged HTTP call can lose a chapter. The previous overnight run had
+4–5 chapters that ran 2+ hours; we cannot tell from logs alone
+whether any of them were partially stalled (just slow generation
+vs. wedged-then-recovered). The lack of a timeout means a transient
+network or server hiccup turns into a permanent stall.
+
+**Possible fixes** (in order of cost / impact):
+
+1. **Set `client_kwargs={"timeout": N}` on `OpenAIServerModel`.**
+   smolagents forwards `client_kwargs` to `openai.OpenAI()`, which
+   accepts a `timeout` parameter. On timeout the SDK raises
+   `APITimeoutError`; `run_chapter` already wraps each `_run_agent`
+   call in `try/except Exception`, so the existing recovery path
+   kicks in and the chapter writes UNVERIFIED instead of stalling.
+   600s gives ~5× headroom over typical step duration (30–120s)
+   while bounding the worst case.
+2. **Per-call timeout passed via the agent**. More invasive — would
+   need smolagents support for per-completion timeout. Not currently
+   available in the API. Skip.
+3. **External watchdog** that kills the python process if the log
+   stops growing for N minutes. Heavier ops infrastructure; only
+   worth it if (1) proves insufficient (e.g. the SDK doesn't enforce
+   read-timeout reliably).
+
+**What shipped (2026-05-01):**
+
+- Added `"timeout"` key to `MODEL_CONFIG` (default 600s, override via
+  `DAEMONDOCS_LLM_TIMEOUT` env var).
+- Both `create_writer_agent` and `create_reviewer_agent` now pass
+  `client_kwargs={"timeout": MODEL_CONFIG["timeout"]}` to
+  `OpenAIServerModel`.
+- The OpenAI SDK enforces this as a read timeout on every HTTP call
+  — wedged streams now raise `APITimeoutError` after 10 min of
+  silence, the existing try/except in `run_chapter` catches it,
+  the review loop breaks and the best draft so far is written
+  UNVERIFIED. No code change needed in `run_chapter` because the
+  failure path was already there for general agent exceptions.
+
+**Reproduction:** the original stall was on
+`/tmp/regen-queue/fw1-ch8.log` after 07:48:47 — log mtime frozen,
+process state `S`, CPU time 6m05s vs 14m21s wall-clock, llama-server
+idle at 0% CPU but `/health` ok. Two ESTABLISHED TCP connections to
+:8080 with no traffic.
+
+---
+
 ### [OPEN] Queueing strategy assumes endpoints are equal speed; largest-first is wrong when one endpoint is much slower
 
 Observed in the 2026-04-30 → 2026-05-01 overnight run (25 chapters,
