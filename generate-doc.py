@@ -3807,6 +3807,218 @@ def _sanitize_mermaid_blocks(text: str) -> str:
     return _MERMAID_BLOCK_RE.sub(_sub, text)
 
 
+# Markdown link in a list-item line: `- [label](target)` (allows leading
+# whitespace, optional bullet `*` or `-`). Used by the link sanitizer to
+# decide whether a line is a *removable* list item versus an inline link
+# in prose. We never drop inline-prose links (would mangle the sentence);
+# we only rewrite them. List items with a broken link are dropped if no
+# unique rewrite target exists.
+_LIST_ITEM_LINK_RE = re.compile(
+    r"^(\s*[-*]\s+)\[([^\]]+)\]\(([^)\s]+)\)(.*)$"
+)
+# Inline markdown link anywhere in the line.
+_INLINE_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+
+
+def _sanitize_chapter_links(
+    content: str, current_file: str, all_chapter_files: "set[str]",
+) -> Tuple[str, int, int]:
+    """Fix or drop broken `*.md` links pointing at chapter READMEs.
+
+    `current_file` is the chapter's path relative to SRC_ROOT (e.g.
+    ``sys/kern/README_locking.md``); `all_chapter_files` is the set of
+    all chapter README paths relative to SRC_ROOT.
+
+    For every markdown link `[label](target.md[#anchor])`:
+      1. Resolve `target` relative to `os.path.dirname(current_file)`.
+      2. If it lands on a real chapter file → leave alone.
+      3. Else, look up chapter files whose basename matches the target's
+         basename. If exactly one such chapter exists → rewrite the link
+         to point there (correct relative path from current_file's dir,
+         preserving any `#anchor`). If zero or many exist:
+            - List-item links: drop the entire list-item line.
+            - Inline-prose links: leave alone (we won't mangle prose).
+
+    Background: legacy navigation code emitted See Also links as if every
+    chapter lived directly under `sys/`, so e.g. a link from
+    `sys/kern/README_locking.md` to the buffer-cache chapter was written
+    as ``vm/README_bcache.md`` (resolves to `sys/kern/vm/...`, which does
+    not exist). The fixed `_add_see_also_links` only catches a subset of
+    these stale links; this sanitizer is the deterministic floor that
+    repairs (or removes) the rest. Idempotent: a clean document is left
+    untouched.
+
+    Returns ``(new_content, rewritten, dropped)``.
+    """
+    rewritten = 0
+    dropped = 0
+
+    chapter_files = set(all_chapter_files)
+    chapter_files.discard(current_file)
+    # basename -> set of chapter paths with that basename
+    by_basename: Dict[str, set] = {}
+    # last-two-path-components -> set of chapter paths (e.g. "vm/README.md")
+    # The writer's broken link almost always carries the *correct*
+    # parent dir hint (e.g. `vm/README.md`) but the wrong number of `..`
+    # in front. Disambiguating by the last 2 components rescues
+    # `README.md` collisions where pure basename matching would have to
+    # drop the line.
+    by_tail2: Dict[str, set] = {}
+    for f in chapter_files:
+        by_basename.setdefault(os.path.basename(f), set()).add(f)
+        parts = f.split("/")
+        if len(parts) >= 2:
+            by_tail2.setdefault("/".join(parts[-2:]), set()).add(f)
+
+    current_dir = os.path.dirname(current_file)
+
+    def _is_chapter_target(target: str) -> bool:
+        """True if `target` resolves to an existing chapter file."""
+        tgt = target.split("#", 1)[0]
+        if not tgt.endswith(".md"):
+            return False
+        joined = os.path.normpath(os.path.join(current_dir, tgt))
+        return joined in chapter_files or os.path.isfile(
+            os.path.join(SRC_ROOT, joined)
+        )
+
+    def _unique_rewrite(target: str) -> Optional[str]:
+        """Return a corrected target if the link uniquely identifies a
+        chapter; else None.
+
+        Matches in two passes: first by the trailing two path components
+        (e.g. `vm/README.md` — picks the one chapter with that suffix),
+        then by basename alone. The two-component pass is what saves
+        every `vm/README.md` style link in the corpus where bare basename
+        matching collides across chapters.
+        """
+        tgt, _, anchor = target.partition("#")
+        if not tgt.endswith(".md"):
+            return None
+        anchor_suffix = f"#{anchor}" if anchor else ""
+        # Normalise: strip leading `./` and any leading `../`. The legacy
+        # bug's whole signature is "wrong number of `..`"; collapsing them
+        # lets us match the intended tail.
+        tail = tgt
+        while tail.startswith("./"):
+            tail = tail[2:]
+        while tail.startswith("../"):
+            tail = tail[3:]
+        # Try last-two-components match first.
+        parts = tail.split("/")
+        if len(parts) >= 2:
+            key2 = "/".join(parts[-2:])
+            cands2 = by_tail2.get(key2, set())
+            if len(cands2) == 1:
+                (real,) = cands2
+                new_rel = os.path.relpath(
+                    real, start=current_dir if current_dir else "."
+                )
+                return new_rel + anchor_suffix
+        # Fall back to bare basename.
+        cands1 = by_basename.get(os.path.basename(tgt), set())
+        if len(cands1) == 1:
+            (real,) = cands1
+            new_rel = os.path.relpath(
+                real, start=current_dir if current_dir else "."
+            )
+            return new_rel + anchor_suffix
+        return None
+
+    out_lines: List[str] = []
+    for line in content.split("\n"):
+        m = _LIST_ITEM_LINK_RE.match(line)
+        if m:
+            prefix, label, target, suffix = (
+                m.group(1), m.group(2), m.group(3), m.group(4),
+            )
+            # Skip non-relative or non-.md targets.
+            tgt_for_check = target.split("#", 1)[0]
+            if (target.startswith(("http://", "https://", "#", "mailto:"))
+                    or not tgt_for_check.endswith(".md")):
+                out_lines.append(line)
+                continue
+            if _is_chapter_target(target):
+                out_lines.append(line)
+                continue
+            # Broken — try unique rewrite, else drop the list item.
+            fix = _unique_rewrite(target)
+            if fix is not None:
+                out_lines.append(f"{prefix}[{label}]({fix}){suffix}")
+                rewritten += 1
+            else:
+                dropped += 1
+            continue
+
+        # Inline-prose links: rewrite if unique, else leave alone.
+        def _sub_inline(mm: "re.Match") -> str:
+            nonlocal rewritten
+            label, target = mm.group(1), mm.group(2)
+            if (target.startswith(("http://", "https://", "#", "mailto:"))
+                    or not target.split("#", 1)[0].endswith(".md")):
+                return mm.group(0)
+            if _is_chapter_target(target):
+                return mm.group(0)
+            fix = _unique_rewrite(target)
+            if fix is None:
+                return mm.group(0)
+            rewritten += 1
+            return f"[{label}]({fix})"
+
+        out_lines.append(_INLINE_LINK_RE.sub(_sub_inline, line))
+
+    new_content = "\n".join(out_lines)
+    # Dedupe exact-duplicate list-item links inside the See Also section.
+    # Rewriting two stylistically different broken links (e.g.
+    # ``kern/README_process.md`` and ``README_process.md`` from
+    # `sys/kern/README_jail.md`) normalises both to the same target,
+    # so the section ends up with a doubled entry. Drop the second
+    # occurrence; the See Also section should never repeat a link.
+    new_content, deduped = _dedupe_see_also_section(new_content)
+    dropped += deduped
+    if dropped:
+        # Collapse the blank-line runs that dropping list items can leave
+        # behind, but keep paragraph separation.
+        new_content = re.sub(r"\n{3,}", "\n\n", new_content)
+    return new_content, rewritten, dropped
+
+
+def _dedupe_see_also_section(content: str) -> Tuple[str, int]:
+    """Drop exact-duplicate ``- [label](target)`` lines inside the See
+    Also section. Returns ``(new_content, dropped_count)``.
+
+    Scope is intentionally narrow (See Also only) so unrelated lists in
+    the body are left untouched. Match key is ``(label, target)`` — only
+    *exact* dupes count as redundant; two links with different labels to
+    the same target stay.
+    """
+    sa = content.find("\n## See Also")
+    if sa == -1:
+        return content, 0
+    body_start = content.find("\n", sa + len("\n## See Also"))
+    if body_start == -1:
+        return content, 0
+    body_start += 1
+    next_h2 = re.search(r"(?m)^## ", content[body_start:])
+    body_end = body_start + next_h2.start() if next_h2 else len(content)
+
+    seen: set = set()
+    dropped = 0
+    out: List[str] = []
+    for line in content[body_start:body_end].split("\n"):
+        m = _LIST_ITEM_LINK_RE.match(line)
+        if m:
+            key = (m.group(2), m.group(3))
+            if key in seen:
+                dropped += 1
+                continue
+            seen.add(key)
+        out.append(line)
+    if dropped == 0:
+        return content, 0
+    return content[:body_start] + "\n".join(out) + content[body_end:], dropped
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """Extract a JSON object from LLM output (may have prose around it).
 
@@ -5072,6 +5284,22 @@ def build_navigation(chapters: List[dict]) -> dict:
         content = _add_see_also_links(
             content, title, title_map, output_file, chapter_rels
         )
+
+        # Repair broken cross-chapter `.md` links. Catches legacy stale
+        # paths baked into existing READMEs (the post-mortem in
+        # FUTURE_IMPROVEMENTS.md "See Also block: wrong relative-path
+        # depth" only fixed *fresh* link insertion; existing files kept
+        # the wrong paths) AND any future writer drift. Rewrites when a
+        # target's basename uniquely identifies a chapter, drops the
+        # list-item otherwise. Idempotent.
+        content, _ln_rewrote, _ln_dropped = _sanitize_chapter_links(
+            content, output_file, set(title_map.values()),
+        )
+        if _ln_rewrote or _ln_dropped:
+            print(
+                f"  [links] {output_file}: rewrote {_ln_rewrote}, "
+                f"dropped {_ln_dropped} broken .md link(s)"
+            )
 
         updated[output_file] = content
 

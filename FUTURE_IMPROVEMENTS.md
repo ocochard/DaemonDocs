@@ -238,6 +238,70 @@ and refuses to render. Test harness: `test_mermaid_sanitizer.py`
 
 ---
 
+### [DONE — shipped 2026-05-01] Broken `.md` cross-chapter links survived the See-Also fix; sanitizer added
+
+Observed on `sys/kern/README_locking.md` (2026-05-01): the See
+Also section pointed at `vm/README_bcache.md`, which from
+`sys/kern/` resolves to `sys/kern/vm/README_bcache.md` — a path
+that does not exist. The real chapter is `sys/vm/README_bcache.md`.
+A corpus-wide audit found **22 broken `.md` links** across 6
+chapters, all the same legacy "as-if-living-at-sys/" shape.
+
+The earlier post-mortem ("See Also block: wrong relative-path
+depth", shipped 2026-04-30) fixed *fresh* link generation in
+`_add_see_also_links` but only the strip-before-insert filter
+was supposed to clean up legacy links. That filter checks
+``os.path.normpath(current_dir + target)`` against the chapter
+file set: a stale link like `vm/README_bcache.md` from
+`sys/kern/` joins to `sys/kern/vm/README_bcache.md`, which is
+**not** a chapter file, so the filter kept it.
+
+**What shipped:** a deterministic post-process sanitizer
+`_sanitize_chapter_links(content, current_file, chapter_files)`
+in `generate-doc.py`, source-ordered right after
+`_sanitize_mermaid_blocks` in the **Orchestrator** banner.
+Same robustness-floor pattern as the mermaid sanitizer:
+
+1. For every `[label](*.md[#anchor])` link, resolve the target
+   against the file's directory.
+2. If it lands on a real chapter file → leave alone.
+3. Else, look for a unique chapter file matching by:
+   (a) trailing two path components (e.g. `vm/README.md`
+   uniquely identifies `sys/vm/README.md`), then
+   (b) bare basename. If a unique match exists → rewrite to the
+   correct relative path, preserving any `#anchor`.
+4. No unique match: drop the entire list-item line. Inline-prose
+   links are left alone (deleting just the link would mangle the
+   sentence).
+
+A second pass dedupes exact-duplicate `- [label](target)` lines
+inside the See Also section; rewriting two stylistically
+different broken links to the same target left doubled entries
+that `_add_see_also_links` strip didn't catch.
+
+Wired into `build_navigation` (right after
+`_add_see_also_links`) so it runs every nav rebuild AND every
+fresh chapter run. The 6 dirty corpus files were patched in
+place: 19 links rewritten, 11 list-items dropped (3 pointed at
+chapters that don't exist; 8 were post-rewrite duplicates).
+Final state: **25/25 chapters** clean for both mermaid and link
+sanitizers, zero broken `.md` links anywhere in the corpus.
+
+**Why the tail-2 disambiguator matters:** the corpus has many
+`README.md` files (one per per-directory chapter). Pure basename
+matching for `vm/README.md` from `sys/kern/` would find 5
+candidates and have to drop the line. Tail-2 narrows that to one
+(`sys/vm/README.md`) and rescues the link. Bare `README.md`
+without a parent hint stays ambiguous and gets dropped — correct
+behaviour; we won't guess.
+
+Test harness: `test_link_sanitizer.py` (18 sub-checks: the
+real-corpus bug, idempotence, ambiguous targets, anchor
+preservation, inline-prose-vs-list-item handling, dedup, and
+end-to-end against the actual on-disk corpus).
+
+---
+
 ### [DONE] Reviewer emits JSON with unescaped inner quotes; `_extract_json` raises and kills the chapter
 
 Observed on the buffer cache chapter (`sys/vm/README_bcache.md`,
