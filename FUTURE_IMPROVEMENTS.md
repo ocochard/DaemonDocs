@@ -196,6 +196,81 @@ quotes — not yet shipped. Land if (1) alone proves insufficient.
 
 ---
 
+### [OPEN] Queueing strategy assumes endpoints are equal speed; largest-first is wrong when one endpoint is much slower
+
+Observed in the 2026-04-30 → 2026-05-01 overnight run (25 chapters,
+3 endpoints, largest-first queue). Per-endpoint stats parsed from
+runner logs:
+
+| Endpoint | Chapters | Total | Avg/ch | Min | Max |
+|---|---|---|---|---|---|
+| fw1 (localhost) | 10 | 631 min | **63 min** | 18 | 131 |
+| fw2 (LAN, similar GPU) | 10 | 607 min | **61 min** | 19 | 120 |
+| mac (LAN, slower GPU) | 4 (+1 crash) | 556 min | **139 min** | 110 | 167 |
+
+Three findings:
+
+1. **fw1 and fw2 are statistically tied.** Same average within
+   noise, same chapter count, same workload. Treat them as
+   interchangeable.
+2. **mac is ~2.2× slower per chapter, uniformly.** Its *fastest*
+   chapter (110 min) is nearly twice the median for fw1/fw2. Not
+   tail latency — the endpoint is just slower across the board.
+3. **Largest-first ordering routes the worst work to the worst
+   endpoint.** The runners pop from a shared queue head-first;
+   whichever endpoint becomes free claims the next-largest pending
+   chapter. mac happened to be free when ch17 (110 min on mac),
+   ch13 (112 min), ch7 (167 min), ch2 (167 min) came up — all
+   long chapters. If those had landed on fw1/fw2, they'd have
+   taken ~half as long.
+
+**Why this matters:** the run finished at 06:39, ~10h31m after
+launch. mac contributed 4 chapters in roughly the time fw1 and
+fw2 each contributed 10. Dropping mac entirely would yield ~13h
+wall-clock on fw1+fw2 alone (25 chapters / 2 endpoints × 63 min
+≈ 13h) — only ~25% slower, despite removing one of three
+workers. mac's *positive* contribution to throughput is small;
+its *risk* of becoming a long-tail limiter is large.
+
+**Possible fixes** (in order of cost / impact):
+
+1. **Smallest-first for the slow endpoint.** Have mac's runner
+   pop from the *tail* of the queue while fw1/fw2 pop from the
+   head. Largest-first is still correct for the fast endpoints
+   (avoids long stragglers), but mac should pick up the short
+   chapters that wouldn't dominate its slot anyway. Change
+   isolated to `runner.sh` (or queue-launcher script that splits
+   by label).
+2. **Per-endpoint speed annotation in the queue.** Tag each
+   chapter with an estimated cost (small/medium/large) and have
+   each runner claim from a tier appropriate to its speed.
+   Heavier infrastructure than (1); only worth it if endpoint
+   count grows beyond 3.
+3. **Drop mac for the next overnight.** Use only fw1+fw2. Wall
+   clock goes from ~10.5h to ~13h, but the run becomes more
+   predictable and the failure surface shrinks. Worth doing once
+   while investigating whether mac's slowness is fixable at the
+   model-server level (smaller GPU? different `n_ctx`? CPU
+   offload?).
+4. **Investigate mac at the endpoint level.** 2.2× is a large
+   gap; some of it may be config (model size, quantization,
+   `n_threads`). If mac can be brought to within ~30% of fw1/fw2,
+   re-introduce it with strategy (1).
+
+**How to apply:** ship (1) before the next full-corpus run — it's
+a one-line `sed` change to `runner.sh` (use `tail -1` instead of
+`head -1` for the mac launcher's pop), no code change in
+`generate-doc.py`. Pair with (4) when you have time to look at
+the llama-server config on mac. Defer (2) until there's a third
+fast endpoint to justify the bookkeeping.
+
+**Reproduction:** parse `/tmp/regen-queue/{fw1,fw2,mac}.log`
+timestamps; the per-endpoint averages above came from a Python
+script over the runner-emitted "starting chapter X" /
+"chapter X finished" lines.
+
+---
+
 ### [PARTIALLY MITIGATED] Writer hallucinates heavily on the initial draft (chapter-dependent)
 
 Observed on the buffer cache chapter (`sys/vm/README_bcache.md`,
