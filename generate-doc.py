@@ -2153,7 +2153,15 @@ def build_chapter_prompt(chapter: dict) -> str:
             "flowchart": (
                 "    - Mermaid flowchart: show the data flow or component hierarchy\n"
                 "      Use: ```mermaid\\nflowchart TD\\n  A[Component] --> B[Subcomponent]\n"
-                "      ```"
+                "      ```\n"
+                "      IMPORTANT — node ids and subgraph ids share one namespace.\n"
+                "      Do NOT reuse a node id as a subgraph id. Mermaid then tries\n"
+                "      to make the node a child of a subgraph with the same name\n"
+                "      and refuses to render with: \"Setting <X> as parent of <X>\n"
+                "      would create a cycle\". If you want a subgraph that visually\n"
+                "      groups the `Userland` node, name the subgraph `UserlandGroup`\n"
+                "      (or any unused id) and let the title carry the human-readable\n"
+                "      label: `subgraph UserlandGroup [\"Userland\"]`."
             ),
             "class": (
                 "    - Mermaid class diagram: show key structs and their relationships\n"
@@ -3574,6 +3582,18 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         else:
             print("         all claims verified — no issues found")
 
+        # ---- Mermaid sanitizer ----
+        # Catches subgraph/node id collisions that make Mermaid refuse
+        # to render with a "would create a cycle" error. Idempotent and
+        # cheap; runs unconditionally so a writer that ignores the
+        # corresponding prompt rule still ships a renderable diagram.
+        # See _sanitize_mermaid_flowchart for the post-mortem.
+        sanitized = _sanitize_mermaid_blocks(draft)
+        if sanitized != draft:
+            print("  [mermaid] rewrote subgraph id(s) to break "
+                  "node-id collision")
+            draft = sanitized
+
         # ---- Final output ----
         if not draft.startswith(f"# {title}"):
             draft = f"# {title}\n\n" + draft
@@ -3635,6 +3655,156 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                     print(f"  restored previous {output_path} from backup")
                 except OSError as e:
                     print(f"  ✗ could not restore backup: {e}")
+
+
+# --- Mermaid post-process sanitizer ---------------------------------------
+#
+# Writers occasionally emit a flowchart whose `subgraph NAME` line uses an
+# id that already exists as a node in the same diagram. Mermaid then
+# tries to make the node a child of a subgraph with the same id and
+# refuses to render with:
+#     "Setting <NAME> as parent of <NAME> would create a cycle"
+# (Observed on `sys/netgraph/README.md` 2026-05-01 — `Userland` was both
+# a node *and* a subgraph wrapping that node.)
+#
+# Like the JSONDecodeError fallback in `_extract_json`, this is a
+# robustness floor: a deterministic post-process that fixes the diagram
+# regardless of whether the writer follows prompt rules. The
+# accompanying writer-prompt rule (in `build_chapter_prompt`'s
+# flowchart hint) reduces the rate; this sanitizer guarantees the
+# rendered output is valid even when the rule is ignored.
+
+# Match a fenced mermaid code block. We capture the inner content and
+# the leading/trailing fence so we can rewrite the block in place
+# without disturbing surrounding markdown.
+_MERMAID_BLOCK_RE = re.compile(
+    r"(```mermaid\s*\n)(.*?)(\n```)", re.DOTALL,
+)
+
+# Detect a flowchart-family diagram. `graph TD` is the legacy alias.
+_FLOWCHART_HEADER_RE = re.compile(
+    r"^\s*(?:flowchart|graph)\b", re.MULTILINE,
+)
+
+# Subgraph header. Mermaid accepts:
+#   subgraph id
+#   subgraph id["Title"]
+#   subgraph id [Title]
+#   subgraph id Title with spaces
+# The id is the first whitespace-separated token after `subgraph`,
+# stripped of any trailing `[...]` shape.
+_SUBGRAPH_HEADER_RE = re.compile(
+    r"^(\s*)subgraph\s+([^\s\[\]\(\){}]+)(.*)$", re.MULTILINE,
+)
+
+# A standalone identifier used as a node or edge endpoint. We collect
+# these by scanning every non-`subgraph` and non-`end` line for tokens
+# that look like ids. An id is an alphanumeric/underscore run not
+# starting with a digit. We deliberately do NOT try to fully parse
+# mermaid syntax — we just need a superset of the node id set so that
+# any subgraph id that ALSO appears as a node is detected.
+_ID_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def _sanitize_mermaid_flowchart(block_body: str) -> str:
+    """Rename subgraph ids that collide with node ids.
+
+    Returns the rewritten block body. The colliding subgraph id gains a
+    `_grp` suffix (or `_grp2`, `_grp3`, ... if `_grp` itself collides).
+    Only the subgraph header line is changed — references inside the
+    subgraph body that name the colliding id refer to the *node*, which
+    is exactly what the writer meant in every observed case
+    (subgraph used as a visual grouping wrapper, not as a referenced
+    container).
+
+    Non-flowchart diagrams pass through unchanged.
+    """
+    if not _FLOWCHART_HEADER_RE.search(block_body):
+        return block_body
+
+    # First pass: collect subgraph ids and "everything else" ids.
+    subgraph_ids: List[Tuple[int, str]] = []  # (line_idx, id)
+    other_ids: set = set()
+
+    lines = block_body.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Skip the header line and `end` markers.
+        if not stripped or stripped == "end":
+            continue
+        m = _SUBGRAPH_HEADER_RE.match(line)
+        if m:
+            subgraph_ids.append((i, m.group(2)))
+            continue
+        # Skip the `flowchart TD` / `graph LR` header line.
+        if re.match(r"^\s*(?:flowchart|graph)\b", line):
+            continue
+        # Strip bracketed/parenthesised label contents so labels with
+        # the same text as a colliding id (e.g. `Foo["Foo (extra)"]`)
+        # don't pollute the node-id set with words from the title.
+        scrub = re.sub(r"\[[^\]]*\]", " ", line)
+        scrub = re.sub(r"\([^)]*\)", " ", scrub)
+        scrub = re.sub(r"\{[^}]*\}", " ", scrub)
+        for tok in _ID_TOKEN_RE.findall(scrub):
+            other_ids.add(tok)
+
+    # Mermaid keywords that aren't real node ids — we'd never collide
+    # with them on purpose, but the token scan picks them up.
+    _MERMAID_KEYWORDS = {
+        "flowchart", "graph", "subgraph", "end", "TD", "TB", "BT",
+        "LR", "RL", "direction", "click", "class", "classDef",
+        "linkStyle", "style",
+    }
+    other_ids -= _MERMAID_KEYWORDS
+
+    # Find collisions and pick a fresh name for each.
+    used_ids = other_ids | {sid for _, sid in subgraph_ids}
+    rename: Dict[str, str] = {}
+    for _, sid in subgraph_ids:
+        if sid not in other_ids or sid in rename:
+            continue
+        candidate = f"{sid}_grp"
+        n = 2
+        while candidate in used_ids:
+            candidate = f"{sid}_grp{n}"
+            n += 1
+        rename[sid] = candidate
+        used_ids.add(candidate)
+
+    if not rename:
+        return block_body
+
+    # Rewrite each colliding subgraph header in place. Other lines
+    # (including any references to the original id inside the subgraph
+    # body) are intentionally left alone — those references resolve to
+    # the node, which is what the writer meant.
+    for i, sid in subgraph_ids:
+        if sid not in rename:
+            continue
+        new_id = rename[sid]
+        m = _SUBGRAPH_HEADER_RE.match(lines[i])
+        if not m:
+            continue
+        leading, _id, rest = m.group(1), m.group(2), m.group(3)
+        # Preserve any trailing ` ["Title"]` or ` Title text`. If the
+        # original had no title, fall back to the original id as the
+        # display title so the visual grouping label doesn't change.
+        trailing = rest if rest.strip() else f' ["{sid}"]'
+        lines[i] = f"{leading}subgraph {new_id}{trailing}"
+
+    return "\n".join(lines)
+
+
+def _sanitize_mermaid_blocks(text: str) -> str:
+    """Apply `_sanitize_mermaid_flowchart` to every fenced mermaid block.
+
+    No-op on documents without any mermaid blocks. Idempotent — running
+    it twice on the same draft produces identical output.
+    """
+    def _sub(m: "re.Match") -> str:
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        return head + _sanitize_mermaid_flowchart(body) + tail
+    return _MERMAID_BLOCK_RE.sub(_sub, text)
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -4239,6 +4409,225 @@ def _verify_malloc_tags(tags: List[str], src_root: str) -> List[str]:
     )
 
 
+# --- Struct-body field verification ---------------------------------------
+#
+# Writers paraphrase struct definitions from training-data memory: they
+# describe `struct sysinit` as `{ int si_sub; int si_order; sysinit_func_t
+# si_func; ... }` when the real definition in `sys/sys/kernel.h` is
+# `{ enum sysinit_sub_id subsystem; enum sysinit_elem_order order;
+# STAILQ_ENTRY(sysinit) next; sysinit_cfunc_t func; const void *udata; }`.
+# Symbol-existence checks pass (`struct sysinit` exists), so the
+# fabrication slips through. This pass parses each `struct NAME { ... }`
+# code block in the draft, finds the real definition in the tree, and
+# flags any claimed field name that doesn't appear in the real struct.
+#
+# Best-effort by design: if the real struct can't be parsed (nested
+# enums, unusual macros), we return an empty real-field set and skip
+# verification rather than risk false positives. Missing-struct cases
+# are already caught by `_verify_structs`.
+
+# Match a markdown fenced code block whose contents include a struct
+# definition. We capture everything between the fences so we can scan
+# multiple struct definitions in one block.
+_FENCED_BLOCK_RE = re.compile(r"```[a-zA-Z]*\n(.*?)```", re.DOTALL)
+
+# Within a code block, find one `struct NAME { ... };` definition.
+# Use a non-greedy body match — code blocks may contain multiple structs,
+# and nested braces are handled at the parse step (we strip nested
+# `{...}` regions before tokenizing fields).
+_STRUCT_DEF_RE = re.compile(
+    r"struct\s+([a-zA-Z_]\w*)\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
+    re.DOTALL,
+)
+
+
+def _strip_c_comments(text: str) -> str:
+    """Strip /* ... */ and // ... comments from C source."""
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", " ", text)
+    return text
+
+
+def _parse_struct_fields(body: str) -> List[str]:
+    """Extract field names from a struct body.
+
+    Best-effort: returns the last identifier on each `;`-terminated
+    declarator. Strips comments, parenthesised macro arguments
+    (`STAILQ_ENTRY(foo) next` → `STAILQ_ENTRY next` so `next` wins),
+    nested `{...}` regions (so an inline `enum { ... } p_state` reads
+    as `p_state`), bitfield widths, array shapes, and leading `*`s.
+
+    Empty list on parse trouble — callers must treat that as
+    "verification unavailable," not as "no real fields."
+    """
+    text = _strip_c_comments(body)
+
+    # Strip nested {...} regions iteratively. An inline enum or
+    # anonymous struct body would otherwise corrupt the declarator
+    # split (commas inside the inner body, terminating `;` inside,
+    # etc.). Replace with a single space so the surrounding identifier
+    # ("} p_state" → " p_state") survives.
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r"\{[^{}]*\}", " ", text)
+
+    # Strip parenthesised macro arguments — `STAILQ_ENTRY(sysinit)`,
+    # `LIST_HEAD(, proc)`, `TAILQ_HEAD(, thread)`. The macro identifier
+    # itself is now adjacent to the field name; the field name is the
+    # last token on the declarator, so the macro identifier won't win.
+    text = re.sub(r"\([^()]*\)", " ", text)
+
+    fields: List[str] = []
+    for decl in text.split(";"):
+        decl = decl.strip()
+        if not decl:
+            continue
+        # Bitfields: `int foo : 3` — keep only the side before `:`.
+        decl = decl.split(":", 1)[0].strip()
+        if not decl:
+            continue
+        # Drop array shapes: `char buf[BUFSIZ]` → `char buf`. The
+        # leading identifier+`[` survives as `buf`.
+        decl = re.sub(r"\[[^\]]*\]", "", decl)
+        # Last whitespace-separated token, with leading `*` stripped.
+        tokens = decl.split()
+        if not tokens:
+            continue
+        last = tokens[-1].lstrip("*").rstrip(",")
+        # Field names are C identifiers — guard against parse residue.
+        if re.fullmatch(r"[A-Za-z_]\w*", last):
+            fields.append(last)
+    return fields
+
+
+def _extract_struct_bodies(text: str) -> List[Tuple[str, List[str]]]:
+    """Find `struct NAME { ... }` claims in fenced code blocks.
+
+    Returns a list of `(struct_name, [claimed_field_names])` tuples.
+    Only claims inside fenced code blocks count — inline mentions of
+    `struct sysinit` in prose are not field-list claims and shouldn't
+    be flagged.
+    """
+    claims: List[Tuple[str, List[str]]] = []
+    seen: set = set()
+    for block in _FENCED_BLOCK_RE.finditer(text):
+        for m in _STRUCT_DEF_RE.finditer(block.group(1)):
+            name = m.group(1)
+            body = m.group(2)
+            # An empty body or a body whose only content is `...`
+            # placeholder is the writer eliding fields, not claiming
+            # any — skip.
+            stripped = _strip_c_comments(body).strip().strip(".").strip()
+            if not stripped:
+                continue
+            fields = _parse_struct_fields(body)
+            if not fields:
+                continue
+            # Dedup on (name, sorted-field-set) so a struct shown twice
+            # in the same draft is only reported once.
+            key = (name, tuple(sorted(set(fields))))
+            if key in seen:
+                continue
+            seen.add(key)
+            claims.append((name, fields))
+    return claims
+
+
+# Cache the *real* field set per (src_root, struct_name) so multiple
+# claims of the same struct across revision rounds don't re-grep the
+# tree. Stored as frozenset; an empty frozenset means "looked but
+# couldn't parse" and disables verification for that struct.
+_STRUCT_FIELDS_CACHE: Dict[Tuple[str, str], frozenset] = {}
+
+
+def _real_struct_fields(struct_name: str, src_root: str) -> frozenset:
+    """Locate `struct NAME { ... }` in `sys/` and return its field names.
+
+    Empty frozenset on any of: definition not found, parse failure,
+    or grep timeout. Callers must treat empty as "verification
+    unavailable" rather than "no fields exist."
+    """
+    cache_key = (src_root, struct_name)
+    if cache_key in _STRUCT_FIELDS_CACHE:
+        return _STRUCT_FIELDS_CACHE[cache_key]
+
+    sys_root = os.path.join(src_root, "sys")
+    if not os.path.isdir(sys_root):
+        _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
+        return frozenset()
+
+    # Find files containing `struct NAME {` — definition shape.
+    # `grep -lF` returns filenames only; we then read the candidate
+    # file and parse its real struct body. There may be multiple
+    # candidates (forward decls, kernel-vs-userland headers); we
+    # take the first whose body parses non-empty.
+    pattern = f"struct {struct_name} {{"
+    cmd = (
+        f"grep -rlF --include='*.c' --include='*.h' "
+        f"{shlex.quote(pattern)} {shlex.quote(sys_root)}/ 2>/dev/null"
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            errors="replace", timeout=_GREP_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
+        return frozenset()
+
+    candidates = [
+        line for line in result.stdout.splitlines() if line.strip()
+    ]
+    # Prefer headers — they hold real definitions; .c files often have
+    # forward declarations or local-only structs we don't want.
+    candidates.sort(key=lambda p: (not p.endswith(".h"), p))
+
+    body_re = re.compile(
+        r"struct\s+" + re.escape(struct_name)
+        + r"\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
+        re.DOTALL,
+    )
+    for candidate in candidates[:8]:
+        try:
+            with open(candidate, "r", encoding="utf-8",
+                      errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        m = body_re.search(content)
+        if not m:
+            continue
+        fields = _parse_struct_fields(m.group(1))
+        if fields:
+            real = frozenset(fields)
+            _STRUCT_FIELDS_CACHE[cache_key] = real
+            return real
+
+    _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
+    return frozenset()
+
+
+def _verify_struct_bodies(claims: List[Tuple[str, List[str]]],
+                          src_root: str) -> List[str]:
+    """For each `(struct, claimed_fields)`, flag fields not in the real struct.
+
+    Returns a list of `"struct NAME: bogus_field1, bogus_field2"` strings,
+    one per struct that has any unknown field. Structs whose real
+    definition couldn't be located or parsed are silently skipped —
+    `_verify_structs` already reports the "struct not in tree" case.
+    """
+    issues = []
+    for name, claimed in claims:
+        real = _real_struct_fields(name, src_root)
+        if not real:
+            continue  # verification unavailable — don't flag
+        bogus = [f for f in dict.fromkeys(claimed) if f not in real]
+        if bogus:
+            issues.append(f"struct {name}: {', '.join(bogus)}")
+    return issues
+
+
 def fact_check_draft(draft: str, src_root: str) -> dict:
     """Run structured fact-checking on a draft chapter.
 
@@ -4246,6 +4635,7 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
         - 'file_paths_not_found': list of missing paths
         - 'file_paths_corrected': list of "wrong → right" pairs
         - 'structs_not_found': list of missing struct names
+        - 'struct_fields_bogus': list of "struct N: f1, f2" strings
         - 'funcs_not_found': list of missing function names
         - 'kernel_options_not_found': list of unverifiable kernel-config options
         - 'dtrace_probes_not_found': list of unverifiable DTrace SDT probes
@@ -4259,6 +4649,7 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
     fact_text = _strip_comparison_section(draft)
     file_paths = _extract_file_paths(fact_text)
     structs = _extract_struct_names(fact_text)
+    struct_body_claims = _extract_struct_bodies(fact_text)
     funcs = _extract_function_names(fact_text)
     kernel_options = _extract_kernel_options(fact_text)
     dtrace_probes = _extract_dtrace_probes(fact_text)
@@ -4269,6 +4660,16 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
     paths_missing = [x for x in paths_missing if ' → ' not in x]
 
     structs_missing = _verify_structs(structs, src_root)
+    # Only verify field bodies for structs whose name *does* exist in
+    # the tree — `_verify_structs` already flags unknown struct names,
+    # and trying to parse a real definition for a non-existent struct
+    # would always come back empty (silent skip) anyway.
+    structs_missing_set = set(structs_missing)
+    body_claims_filtered = [
+        (name, fields) for name, fields in struct_body_claims
+        if name not in structs_missing_set
+    ]
+    struct_fields_bogus = _verify_struct_bodies(body_claims_filtered, src_root)
     funcs_missing = _verify_functions(funcs, src_root)
     kernel_options_missing = _verify_kernel_options(kernel_options, src_root)
     dtrace_probes_missing = _verify_dtrace_probes(dtrace_probes, src_root)
@@ -4278,12 +4679,14 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
         'file_paths_not_found': paths_missing,
         'file_paths_corrected': paths_corrected,
         'structs_not_found': structs_missing,
+        'struct_fields_bogus': struct_fields_bogus,
         'funcs_not_found': funcs_missing,
         'kernel_options_not_found': kernel_options_missing,
         'dtrace_probes_not_found': dtrace_probes_missing,
         'malloc_tags_not_found': malloc_tags_missing,
         'total_issues': (len(paths_missing) + len(paths_corrected) +
-                         len(structs_missing) + len(funcs_missing) +
+                         len(structs_missing) + len(struct_fields_bogus) +
+                         len(funcs_missing) +
                          len(kernel_options_missing) +
                          len(dtrace_probes_missing) +
                          len(malloc_tags_missing)),
@@ -4310,6 +4713,22 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
             f"Structs not found in source tree: "
             f"{', '.join(facts['structs_not_found'])}. "
             f"Remove or correct these with real definitions from header files."
+        )
+    if facts.get('struct_fields_bogus'):
+        # Each entry is `"struct NAME: f1, f2"` — the named fields do
+        # not exist in the real struct. Tell the writer to read the
+        # defining header verbatim rather than paraphrase from memory;
+        # the original `struct sysinit` post-mortem (see
+        # FUTURE_IMPROVEMENTS.md) is the canonical example of why this
+        # check exists.
+        issues.append(
+            "Struct field names that do not exist in the real struct: "
+            + "; ".join(facts['struct_fields_bogus'])
+            + ". The struct itself is real but the fields you listed are "
+            "not. Read the defining header with `read_freebsd_source` and "
+            "quote the real field list verbatim — do not paraphrase. You "
+            "may elide fields with `/* ... */` but must not rename or "
+            "retype the ones you keep."
         )
     if facts['funcs_not_found']:
         issues.append(

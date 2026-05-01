@@ -17,7 +17,7 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
-### [TOP PRIORITY — OPEN] Struct field names and function-call mechanics not grounded in source; fact-check doesn't reach into struct bodies
+### [DONE — fix 1 shipped 2026-05-01] Struct field names and function-call mechanics not grounded in source; fact-check doesn't reach into struct bodies
 
 Observed on the kernel-core chapter (`sys/README.md`, regenerated
 2026-04-30, fw1-ch3.log). The writer described `struct sysinit` two
@@ -116,6 +116,125 @@ field names; the new version additionally fabricates the `qsort`
 call. Ground truth is `sys/sys/kernel.h:struct sysinit` (5 fields:
 `subsystem`, `order`, `next`, `func`, `udata`) and
 `sys/kern/init_main.c:203` (`STAILQ_MERGESORT`, not `qsort`).
+
+**What shipped (2026-05-01):** fix (1) — strict struct-body
+fact-check. New helpers in the **Fact-checking** banner of
+`generate-doc.py`:
+
+- `_extract_struct_bodies(text)` finds `struct NAME { ... };`
+  blocks inside fenced code blocks (inline-prose mentions are
+  skipped) and parses the field list with
+  `_parse_struct_fields`. The parser strips C comments, nested
+  `{...}` regions (so an inline `enum { ... } p_state` reads as
+  `p_state`), parenthesised macro arguments (so
+  `STAILQ_ENTRY(sysinit) next` reads as `next`), bitfield widths,
+  array shapes, and leading `*`s.
+- `_real_struct_fields(name, src_root)` greps `sys/` for
+  `struct NAME {`, reads the first matching header, and re-uses
+  the same parser on the real body. Cached in
+  `_STRUCT_FIELDS_CACHE` keyed by `(src_root, struct_name)`. An
+  empty result means "verification unavailable" — silent skip,
+  not "no fields" — to keep false positives at zero.
+- `_verify_struct_bodies(claims, src_root)` cross-checks each
+  claim against the real field set; structs whose name is
+  already flagged by `_verify_structs` are skipped (don't
+  double-report).
+- Wired into `fact_check_draft` as a new `struct_fields_bogus`
+  result key and into `_build_fact_check_prompt` with a writer
+  instruction to read the defining header verbatim instead of
+  paraphrasing.
+
+Validated on the actual framework `sys/README.md` (the original
+post-mortem fixture): the hallucinated body
+`{ void (*func)(void *); void *data; int si_sub; int si_order;
+const char *name; }` now FAILs fact-check with
+`struct sysinit: void, data, si_sub, si_order, name` while a
+verbatim-correct claim passes clean. Test harness:
+`test_struct_factcheck.py`.
+
+Fixes (2)–(4) — verbatim-quote enforcement, catalog-injected
+field lists, and function-call shape verification — remain on
+hold. Land them only if (1) proves insufficient on subsequent
+runs.
+
+---
+
+### [DONE — shipped 2026-05-01] Mermaid flowchart: subgraph id collides with a node id, refuses to render with "would create a cycle"
+
+Observed on the netgraph chapter (`sys/netgraph/README.md`,
+2026-05-01). The diagram declared a `Userland` *node* and then
+wrapped that same node in a `subgraph Userland`:
+
+```mermaid
+flowchart TD
+    Userland["Userland (ngctl / libnetgraph)"] -->|...| NgSocket[...]
+    ...
+    subgraph Userland
+        Userland
+    end
+```
+
+Mermaid sees `subgraph Userland` and the `Userland` node living
+inside it, tries to make the node a child of a subgraph with the
+same id, and refuses to render with:
+
+> Setting Userland as parent of Userland would create a cycle
+
+Node ids and subgraph ids share one namespace in mermaid
+flowcharts; this is the same shape of trap as the prior C-syntax
+leak in classDiagram bodies (commit `1860fd6`), but for a
+different diagram type and a different parsing rule.
+
+**Why the existing prompt rules missed it:** the writer-prompt
+flowchart hint covered diagram-shape basics but said nothing
+about the node/subgraph namespace. The reviewer's Mermaid
+criterion is a tool-less check ("correct keywords, no missing
+brackets, proper arrows") and can't actually run the renderer to
+catch a semantic clash.
+
+**Possible fixes** (in order of cost / impact):
+
+1. **Deterministic post-process sanitizer** that detects a
+   subgraph id which also appears as a node id and renames the
+   subgraph (e.g. `Userland` → `Userland_grp`), preserving the
+   original id as the visible title. Robustness floor: catches
+   every regression on every regen, regardless of model
+   compliance. Same shape as the JSONDecodeError fallback in
+   `_extract_json`.
+2. **Writer-prompt rule** explaining that node ids and subgraph
+   ids share a namespace, with the canonical fix
+   (`subgraph UserlandGroup ["Userland"]`). Reduces the rate but
+   the model can ignore it under pressure.
+3. **Tool-using reviewer that actually invokes the mermaid CLI**
+   to render the diagram and surface render errors. Heaviest;
+   requires installing `mmdc` and a headless browser on every
+   endpoint. Skip until (1)+(2) prove insufficient.
+
+**What shipped (2026-05-01):** fixes (1) AND (2) together.
+
+- New `_sanitize_mermaid_flowchart(block_body)` and
+  `_sanitize_mermaid_blocks(text)` helpers in `generate-doc.py`,
+  source-ordered just before `_extract_json` in the
+  **Orchestrator** banner. Detect collisions by collecting
+  `subgraph <id>` lines and a superset of node ids from the
+  rest of the diagram, then rename only the colliding
+  subgraph header. Idempotent; non-flowchart mermaid blocks
+  pass through unchanged. Wired into `run_chapter` between the
+  fact-fix step and the H1 prepend.
+- Writer-prompt flowchart hint in `build_chapter_prompt`
+  extended with the namespace rule and the
+  `subgraph UserlandGroup ["Userland"]` example.
+- The currently-broken `sys/netgraph/README.md` on framework
+  was patched in place by running the new sanitizer against
+  the file. Future regens of any chapter exhibiting this shape
+  will be cleaned automatically.
+
+**Reproduction:** open the original file in any Mermaid renderer
+(GitHub web view, mermaid live editor); the diagram displays
+"Setting Userland as parent of Userland would create a cycle"
+and refuses to render. Test harness: `test_mermaid_sanitizer.py`
+(16 sub-checks, includes an end-to-end test against the actual
+`sys/netgraph/README.md`).
 
 ---
 
@@ -854,18 +973,18 @@ networking depth — ch15 names them but doesn't explain them. The IP
 chapter consolidates v4+v6 around the FIB/nhop rewrite, which is the
 genuinely novel architectural change worth documenting.
 
-**How to apply — gated on struct-body fact-check landing first.**
-Networking chapters are exactly where the `struct sysinit`-style
-hallucination (top-priority entry above) hurts most: `struct mbuf`,
-`struct ip`, `struct tcphdr`, `struct tcpcb`, `struct inpcb` are dense,
-frequently cited, and stable across decades of training-data history
-— the worst-case combination for the writer to paraphrase from memory
-instead of quoting. A reader who copy-pastes a fabricated `struct mbuf`
-and then can't compile against `sys/sys/mbuf.h` is the failure these
-chapters most need to avoid. Add these three only after the
-struct-body fact-check (or equivalent grounding fix) is in place, so
-field-level fabrications fail the chapter rather than ship as
-authoritative-looking code blocks.
+**How to apply — gate lifted 2026-05-01.** Networking chapters are
+exactly where the `struct sysinit`-style hallucination hurts most:
+`struct mbuf`, `struct ip`, `struct tcphdr`, `struct tcpcb`,
+`struct inpcb` are dense, frequently cited, and stable across decades
+of training-data history — the worst-case combination for the writer
+to paraphrase from memory instead of quoting. A reader who
+copy-pastes a fabricated `struct mbuf` and then can't compile against
+`sys/sys/mbuf.h` is the failure these chapters most need to avoid.
+The struct-body fact-check (DONE entry above) now flags exactly that
+shape, so adding these three is unblocked. Run them once each and
+inspect the per-chapter banner for any `struct_fields_bogus` issues
+before declaring success.
 
 UDP does **not** get its own chapter — it's small enough to fit as a
 section inside the Transport Protocols chapter alongside the inpcb
