@@ -1300,12 +1300,36 @@ def _dirmap_extract_names(content: str) -> Tuple[List[str], List[str]]:
     skip = {'if', 'else', 'while', 'for', 'switch', 'return',
             'struct', 'union', 'enum', 'typedef', 'define',
             'sizeof', 'do'}
-    for m in re.finditer(
-        r'^\s*(?:static\s+|inline\s+|extern\s+|__inline\s+)*'
-        r'[\w\s\*]+?\s+\*?(\w+)\s*\([^)]*\)\s*\{',
-        content,
-        re.MULTILINE,
-    ):
+    # Match function definitions starting at column 0. The previous
+    # single-line regex required the return type and name on the same
+    # line, which missed FreeBSD's K&R-ish style:
+    #     static enum mlx5_dev_event
+    #     dcbx_subevent(u8 subtype)
+    #     {
+    # plus multi-line arg lists like:
+    #     bool
+    #     in_pcbrele(struct inpcb *inp,
+    #                struct inpcbinfo *pcbinfo)
+    #     {
+    # The new regex consumes one or more identifier-token chunks
+    # (covering "static", "enum mlx5_dev_event", "struct mlx5_eqe *",
+    # qualifiers, etc.), then captures the function name, then an arg
+    # list that may span lines (no { or ; inside), then optional GCC
+    # attributes, then the opening {. Side benefit: the OLD regex
+    # falsely matched control-flow keywords like `if`/`for`/`switch`/
+    # `TAILQ_FOREACH` because their `(...)` shape looked like a defn;
+    # NEW excludes them by structure (the chunk before the name must
+    # itself be an identifier-token, which `if (` doesn't satisfy).
+    func_def_re = re.compile(
+        r"^"
+        r"(?:[A-Za-z_]\w*\s*\**\s+)+"      # return type + qualifiers
+        r"\*?\s*([A-Za-z_]\w*)\s*"          # function name
+        r"\([^{;]*?\)\s*"                   # arg list (may span lines)
+        r"(?:__\w+(?:\s*\([^)]*\))?\s*)*"   # optional GCC attributes
+        r"\{",
+        re.MULTILINE | re.DOTALL,
+    )
+    for m in func_def_re.finditer(content):
         name = m.group(1)
         if name in skip or name in seen_funcs:
             continue
@@ -1547,16 +1571,24 @@ def _extract_struct_defs(content: str, file_path: str) -> List[str]:
 
 
 def _extract_func_sigs(content: str, file_path: str) -> List[str]:
-    """Extract function signatures from C source code."""
+    """Extract function signatures from C source code.
+
+    See _dirmap_extract_names for the multi-line regex rationale —
+    same bug, same fix, anchored at column 0 so we don't pick up
+    inline calls inside other function bodies.
+    """
     sigs = []
-    # Match: type func_name(args) { or static type func_name(args) {
-    for m in re.finditer(
-        r'(?:static\s+|inline\s+|extern\s+)*'
-        r'[\w\s\*]+\s+(\w+)\s*\([^)]*\)\s*\{',
-        content
-    ):
+    func_def_re = re.compile(
+        r"^"
+        r"(?:[A-Za-z_]\w*\s*\**\s+)+"      # return type + qualifiers
+        r"\*?\s*([A-Za-z_]\w*)\s*"          # function name
+        r"\([^{;]*?\)\s*"                   # arg list (may span lines)
+        r"(?:__\w+(?:\s*\([^)]*\))?\s*)*"   # optional GCC attributes
+        r"\{",
+        re.MULTILINE | re.DOTALL,
+    )
+    for m in func_def_re.finditer(content):
         name = m.group(1)
-        # Skip common non-function keywords
         if name in ('if', 'else', 'while', 'for', 'switch', 'return',
                     'struct', 'union', 'enum', 'typedef', 'define'):
             continue
