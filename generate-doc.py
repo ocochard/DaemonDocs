@@ -3619,7 +3619,22 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
 
 
 def _extract_json(text: str) -> Optional[dict]:
-    """Extract a JSON object from LLM output (may have prose around it)."""
+    """Extract a JSON object from LLM output (may have prose around it).
+
+    Returns None on any parse failure — never raises. Two failure modes
+    we have actually observed:
+      1. The text contains no JSON-looking block at all.
+      2. The text contains a brace-balanced block, but the block has
+         unescaped inner double quotes inside string values
+         (e.g. `"completeness": "PASS: ... "background processing" ..."`)
+         which break `json.loads`.
+    The caller (run_chapter) already has a parse-retry-once path for
+    None, so returning None here turns a hard crash into a single
+    benign retry. Raising would kill the whole chapter mid-loop and
+    discard any in-progress draft — see FUTURE_IMPROVEMENTS.md
+    "Reviewer emits JSON with unescaped inner quotes" for the
+    post-mortem.
+    """
     # Try the full text first
     try:
         return json.loads(text.strip())
@@ -3638,7 +3653,10 @@ def _extract_json(text: str) -> Optional[dict]:
         elif c == '}':
             depth -= 1
             if depth == 0 and start is not None:
-                return json.loads(text[start:i+1])
+                try:
+                    return json.loads(text[start:i+1])
+                except (json.JSONDecodeError, ValueError):
+                    return None
     return None
 
 

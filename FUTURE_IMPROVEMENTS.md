@@ -119,6 +119,83 @@ call. Ground truth is `sys/sys/kernel.h:struct sysinit` (5 fields:
 
 ---
 
+### [DONE] Reviewer emits JSON with unescaped inner quotes; `_extract_json` raises and kills the chapter
+
+Observed on the buffer cache chapter (`sys/vm/README_bcache.md`,
+mac-ch8.log, 2026-05-01 00:32). Reviewer was mid-revision-loop with
+sensible criteria scores (most PASS, two real FAILs to fix). Its
+reply contained string values like:
+
+```
+"completeness": "PASS: ... discussion of "background processing" and ..."
+```
+
+The unescaped inner double quotes close the string early, the next
+comma is no longer inside a string, and `json.loads` raises
+`JSONDecodeError: Expecting ',' delimiter`. `_extract_json` lets the
+exception propagate; `run_chapter` doesn't catch it; `main` exits
+rc=1. **The chapter is lost** — no file written, the in-progress
+draft is discarded, the runner moves on to the next queue entry.
+
+Crucially, ch8 was on track to converge: `comparison_quality: PASS`,
+`rationale: PASS`, only `accuracy: FAIL` (real `struct buflists`
+issue) and `no_marketing: FAIL` ("integrates tightly"). The
+revision loop would likely have produced an acceptable draft. The
+crash threw away that progress for a syntactic reason.
+
+**Why this matters:** unlike the struct-grounding issue, this is
+not a quality problem — it's a robustness problem. Any chapter
+whose reviewer happens to use quoted phrases inside criterion
+strings can be killed mid-loop with no fallback. The best-draft
+tracking elsewhere in the pipeline doesn't help here because
+`_extract_json` raises *before* the criteria are read into
+`best_draft`.
+
+**Possible fixes** (in order of cost / impact):
+
+1. **Catch `JSONDecodeError` in `run_chapter` and fall back to the
+   last successfully-parsed review.** If round 2 parses clean and
+   round 3 raises, treat round 3 as "no signal" and write the
+   round-2-best draft with UNVERIFIED banner. Cheapest, no prompt
+   change, no parsing heuristics. Implementation: wrap the
+   `_extract_json(review_raw)` call in try/except, set `review_json
+   = None` on failure, skip the criteria-update path, continue the
+   loop.
+2. **Sanitize before parsing.** Run a pre-pass that escapes inner
+   quotes inside string values. Easy to get wrong (regex on JSON is
+   notoriously fragile), but catches more than just this case.
+3. **Tighten the reviewer prompt.** Add: "Inside any string value,
+   use single quotes or backticks for inline phrases — never inner
+   double quotes." Cheap, but reviewers occasionally ignore prompt
+   rules under pressure (we've seen this before with the "no
+   hedging" rule).
+
+**How to apply:** ship (1) immediately as a robustness floor — it
+costs nothing and prevents the lost-chapter outcome regardless of
+what the reviewer does. Pair with (3) to reduce frequency. Skip
+(2) — too brittle.
+
+**Reproduction:** see mac-ch8.log around line tail-60. The
+JSONDecodeError points to "line 5 column 88" — the inner quotes
+inside the `completeness` value.
+
+**What shipped (2026-05-01):** fix (1) landed in `_extract_json`.
+The brace-matched-substring path now wraps `json.loads` in
+try/except and returns `None` on `JSONDecodeError`/`ValueError`
+instead of raising. The caller in `run_chapter` (line ~3417)
+already had a parse-retry-once path for `None`, so a malformed
+reviewer reply now triggers one retry and (if it still fails)
+breaks the loop with the chapter UNVERIFIED — instead of
+propagating to `main` and exiting rc=1 with no file written.
+Behavior change is contained: the function used to raise on the
+recovery path and returns None on the first-attempt path; it now
+returns None on both. The single caller already handles None.
+
+Fix (3) — tightening the reviewer prompt to forbid inner double
+quotes — not yet shipped. Land if (1) alone proves insufficient.
+
+---
+
 ### [PARTIALLY MITIGATED] Writer hallucinates heavily on the initial draft (chapter-dependent)
 
 Observed on the buffer cache chapter (`sys/vm/README_bcache.md`,
