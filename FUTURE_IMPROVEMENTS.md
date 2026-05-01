@@ -443,7 +443,7 @@ idle at 0% CPU but `/health` ok. Two ESTABLISHED TCP connections to
 
 ---
 
-### [OPEN] Queueing strategy assumes endpoints are equal speed; largest-first is wrong when one endpoint is much slower
+### [DONE — shipped 2026-05-01] Queueing strategy assumes endpoints are equal speed; largest-first is wrong when one endpoint is much slower
 
 Observed in the 2026-04-30 → 2026-05-01 overnight run (25 chapters,
 3 endpoints, largest-first queue). Per-endpoint stats parsed from
@@ -511,10 +511,46 @@ a one-line `sed` change to `runner.sh` (use `tail -1` instead of
 the llama-server config on mac. Defer (2) until there's a third
 fast endpoint to justify the bookkeeping.
 
+**What shipped (2026-05-01):** option (1).
+
+`runner.sh` now takes a third positional arg `pop_end` —
+`head` (default, fast endpoints) or `tail` (slow endpoint).
+Implementation lives at `framework:/tmp/regen-queue/runner.sh`.
+The pop is still a single `lockf`-serialised `sh -c` block; the
+sed address is passed as a positional `$1` to the inner shell so
+we never embed a literal `$` inside a double-quoted sed
+expression. The first draft did, and BSD sh expanded `"$d"` to
+the empty string — the queue's last line became undeletable and
+the slow runner looped forever on the final chapter. The
+positional-arg form sidesteps that quoting trap entirely.
+
+A companion `start-runners.sh` (in the same directory) records
+the convention: fw1/fw2 launch with `head`, mac with `tail`.
+Each runner runs under `daemon(8)` so an SSH disconnect doesn't
+kill it (consistent with the project memory on FreeBSD
+fire-and-forget background jobs).
+
+End-to-end test on a 1..20 synthetic queue (2 concurrent runners,
+one head + one tail): 20 unique chapters popped, 0 duplicates,
+fast got 1..10 in order, slow got 20..11 in order.
+
+Backward-compatible: existing invocations of `runner.sh LABEL URL`
+without a third arg still work and behave identically (default
+`head`).
+
 **Reproduction:** parse `/tmp/regen-queue/{fw1,fw2,mac}.log`
 timestamps; the per-endpoint averages above came from a Python
 script over the runner-emitted "starting chapter X" /
 "chapter X finished" lines.
+
+**Open follow-ups (deferred, not shipped here):**
+- (2) per-chapter cost annotations in the queue — defer until a
+  third fast endpoint exists.
+- (3) drop mac entirely — moot now that (1) prevents long-tail
+  domination.
+- (4) investigate mac's llama-server config (model size,
+  quantization, `n_threads`) to close the 2.2× gap. Worth doing
+  before the next full-corpus run.
 
 ---
 
@@ -1139,12 +1175,24 @@ well not exist for that task.
 
 Two cheap improvements that compound the value of any new chapters:
 
-### A. Walk-up-the-tree links
+### A. [DONE] Walk-up-the-tree links
 
-Every leaf README should link to its **ancestor** READMEs ("subsystem
-context: …"). The current navigation block shows siblings, not
-ancestors. A reader at `sys/vm/README_bcache.md` should immediately see
-links to `sys/vm/README.md` and `sys/README.md`.
+Every leaf README links to its **ancestor** READMEs as a closest-first
+breadcrumb in the auto-generated nav sidebar. A reader at
+`sys/vm/README_bcache.md` sees:
+
+> **Up:** [Virtual Memory Subsystem — vm_page, UMA, and Pagers](README.md) ▸
+> [Kernel Core — Structure and Entry Point](../README.md) ▸
+> [Source Tree — Layout and Conventions](../../README_internals.md)
+
+Implementation: `_build_ancestor_chain(current_file, all_files)` in
+`generate-doc.py` returns ancestor chapter files closest-first using
+two rules — same-directory plain `README.md` (e.g. `sys/vm/README.md`
+is an ancestor of `sys/vm/README_bcache.md`) plus any chapter whose
+output_file lives in a strict-prefix directory of the current file's
+directory. `build_navigation` joins them into the `Up:` line of the
+sidebar with `os.path.relpath` for correct relative paths. Verified
+live across the corpus on framework.
 
 ### B. Per-directory pointer files
 
@@ -1180,8 +1228,10 @@ surface is small and topics are self-contained.
   writer can orient inside a directory in one tool call instead of
   reading every file individually. Documented in `CODE_MAP.md` and the
   README's "five agent tools" section.
-- **Walk-up-the-tree links in `build_navigation`** — *still open.*
-  Sibling links exist; ancestor links do not.
+- **Walk-up-the-tree links in `build_navigation`** — *done.*
+  `_build_ancestor_chain` + the `Up:` breadcrumb in the sidebar.
+  Verified across the corpus 2026-05-01. See "Walk-up-the-tree
+  links" entry above.
 - **Per-directory pointer-file generator** — *still open.* Drop a
   one-line pointer `→ See ../README.md` in directories without their
   own chapter.

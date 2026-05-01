@@ -914,3 +914,279 @@ chapters:
       - "Flow / Diagram"
       - "Advanced Notes"
       - "See Also"
+
+  - title: "mbuf — Network Buffer Allocation and Chaining"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP"
+      - "IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop"
+      - "NIC Drivers — from if_vr to iflib to if_cxgbe"
+    output_file: "sys/sys/README_mbuf.md"
+    source_dirs:
+      - "sys/sys"
+      - "sys/kern"
+    # mbuf.h holds the struct + KPI macros (M_GET, M_PREPEND, M_COPY*),
+    # uipc_mbuf.c is the allocator + chain primitives, uipc_mbuf2.c has
+    # the m_tag implementation. subr_mbpool.c does NOT exist in this
+    # tree — earlier drafts of FUTURE_IMPROVEMENTS.md listed it by
+    # mistake; do not re-add it.
+    source_files:
+      - "sys/sys/mbuf.h"
+      - "sys/kern/uipc_mbuf.c"
+      - "sys/kern/uipc_mbuf2.c"
+    # Without this guard the writer drifts into (a) the netisr/ifnet
+    # path (Network Stack chapter), (b) the socket-buffer queueing
+    # discipline in uipc_sockbuf.c (also Network Stack), or (c) the
+    # IP/TCP code that *consumes* mbufs (Transport / IP Layer chapters).
+    # We want the chapter focused on the buffer abstraction itself:
+    # the struct, the allocator, the chain invariants, and the m_tag
+    # extension mechanism — everything a driver author or protocol
+    # author needs to know to *handle* mbufs correctly.
+    scope_guard: >
+      This chapter is about the mbuf data structure and its
+      allocator/chain primitives, not about the network stack that
+      consumes mbufs. Do NOT re-explain netisr, the ifnet input
+      path, socket buffers (sbappend/sbreserve), or the IP/TCP code
+      that reads mbuf payloads — link to the Network Stack,
+      Transport Protocols, and IP Layer chapters when you need to
+      reference how mbufs flow through them. Focus on: the struct
+      mbuf layout (m_hdr, pkthdr, m_ext), the difference between
+      m_next (segments of one packet) and m_nextpkt (multiple
+      packets in a queue), the allocator entry points
+      (m_get/m_getcl/m_gethdr/m_getjcl) and the UMA zones behind
+      them, the cluster/jumbo-cluster ext storage, m_pullup /
+      m_copydata / m_adj invariants, and the m_tag extension
+      mechanism for attaching out-of-band metadata to a packet.
+      Treat exhaustion behavior (M_NOWAIT failures, the mbuf
+      reclaim path) as in scope; treat protocol-specific tag
+      consumers (pf state, ipsec SAs) as out of scope — name them
+      at most as one-line examples.
+    focus: >
+      Document FreeBSD's mbuf, the variable-size buffer that every
+      packet rides in. Cover the struct layout (header mbuf vs
+      regular mbuf, pkthdr fields, the m_ext indirection for
+      cluster-backed payloads), the chain invariants (m_next chains
+      segments of one packet, m_nextpkt chains packets in a queue),
+      the allocator KPI (m_get, m_getcl, m_gethdr, m_getjcl,
+      m_pullup, m_copydata, m_adj, m_freem), the UMA zones
+      (zone_mbuf, zone_pack, zone_jumbop, zone_jumbo9, zone_jumbo16)
+      and how M_EXT clusters are reference-counted, the m_tag
+      mechanism for attaching protocol-specific metadata, and the
+      exhaustion behavior under load (M_NOWAIT vs M_WAITOK,
+      mb_reclaim). The chapter is the prerequisite the rest of the
+      network stack reads against — protocol code assumes the reader
+      already understands mbuf chain invariants.
+    key_questions:
+      - "What is the difference between an mbuf header (M_PKTHDR) and a regular mbuf, and what does pkthdr carry that the rest of the chain does not?"
+      - "What is the difference between m_next and m_nextpkt, and why does the network stack need both?"
+      - "How does M_EXT and m_ext let a small mbuf header point at a much larger cluster, and how is the cluster's lifetime managed (refcount, ext_free)?"
+      - "What does m_pullup actually do, and when must protocol code call it before reading a header that may straddle a chain boundary?"
+      - "What is m_tag, and how does it let subsystems (pf, ipsec, lro) attach per-packet metadata without enlarging struct mbuf for everyone?"
+      - "What happens when the mbuf zone is exhausted — how do M_NOWAIT callers fail gracefully, and what is mb_reclaim?"
+    mermaid: class
+    sections:
+      - "Quick Summary"
+      - "Architecture"
+      - "Key Data Structures"
+      - "Deep Dive"
+      - "Flow / Diagram"
+      - "Comparison"
+      - "Advanced Notes"
+      - "See Also"
+
+  - title: "Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop"
+      - "mbuf — Network Buffer Allocation and Chaining"
+      - "VNET — Virtual Network Stacks"
+    output_file: "sys/netinet/README_transport.md"
+    source_dirs:
+      - "sys/netinet"
+      - "sys/netinet/cc"
+      - "sys/netinet/tcp_stacks"
+    # The PCB pair (inpcb + tcpcb) is the spine: in_pcb.c manages the
+    # hash tables and binding, tcp_subr.c builds the tcpcb, tcp_input.c
+    # is the state machine, tcp_output.c emits segments, tcp_timer.c
+    # drives retransmit/keepalive/persist/2MSL, tcp_syncache.c handles
+    # the half-open table and SYN cookies. udp_usrreq.c is small enough
+    # to live here too — UDP shares the inpcb hash and the same socket
+    # binding code. cc/cc.c + cc.h define the pluggable congestion
+    # control KPI; the modular TCP stacks (rack, bbr) plug in via
+    # tcp_function_block.
+    source_files:
+      - "sys/netinet/in_pcb.c"
+      - "sys/netinet/in_pcb.h"
+      - "sys/netinet/tcp_input.c"
+      - "sys/netinet/tcp_output.c"
+      - "sys/netinet/tcp_subr.c"
+      - "sys/netinet/tcp_syncache.c"
+      - "sys/netinet/tcp_timer.c"
+      - "sys/netinet/tcp_var.h"
+      - "sys/netinet/udp_usrreq.c"
+      - "sys/netinet/udp_var.h"
+      - "sys/netinet/cc/cc.c"
+      - "sys/netinet/cc/cc.h"
+    # Without this guard the writer drifts into (a) re-explaining the
+    # IP forwarding path, fib lookups, or v4/v6 differences (IP Layer
+    # chapter), (b) re-deriving mbuf chain handling (mbuf chapter),
+    # or (c) cataloging every cc_*.c module and every tcp_stacks/*
+    # file. The 70+ KLOC of rack.c and bbr.c is out of scope — name
+    # them as the two production alternative stacks and link to their
+    # papers, do not walk through their code.
+    scope_guard: >
+      This chapter is about the L4 control plane: how struct inpcb
+      and struct tcpcb manage connection state, how the TCP state
+      machine drives segments through tcp_input/tcp_output, how
+      timers and the syncache/SYN-cookies path work, and how UDP
+      uses the same inpcb infrastructure with almost no state of
+      its own. Do NOT re-explain IP forwarding, the fib/nhop
+      rewrite, or v4-vs-v6 differences in the input path — those
+      belong to the IP Layer chapter; link to it for "where does
+      tcp_input get called from". Do NOT re-explain mbuf chains,
+      m_pullup, or pkthdr — link to the mbuf chapter. Do NOT walk
+      through each congestion-control module under cc/ or each
+      modular stack under tcp_stacks/ — describe the *KPI* (struct
+      cc_algo, struct tcp_function_block) and name CUBIC, NewReno,
+      DCTCP, RACK, BBR as one-line examples of what plugs in.
+    focus: >
+      Document FreeBSD's L4 implementation. Open with the inpcb /
+      tcpcb pair: inpcb is the protocol-independent (v4/v6, TCP/UDP)
+      socket-to-network binding with the global hash tables that
+      demux incoming packets to a connection; tcpcb hangs off inpcb
+      and holds all TCP-specific state (sequence space, RTT
+      estimators, congestion window, timers). Walk the TCP state
+      machine through tcp_input.c — header validation, the syncache
+      / SYN-cookies fast path for SYN floods, the established-state
+      receive processing, ACK handling, fast retransmit and SACK.
+      Cover tcp_output.c on the send side: when does the stack send
+      (Nagle, delayed ACK, push), how does the segmenter pick a
+      length (MSS, TSO offload). Cover tcp_timer.c — retransmit,
+      persist, keepalive, 2MSL, and how callouts drive them. Then
+      pluggable congestion control: the cc_algo KPI in cc/cc.h, how
+      net.inet.tcp.cc.algorithm picks a module, and the production
+      alternatives (CUBIC default, NewReno, DCTCP, HTCP, CDG).
+      Modular TCP stacks: tcp_function_block lets RACK and BBR
+      replace the entire input/output state machine, not just the
+      congestion controller. Close with UDP — how udp_usrreq.c
+      reuses the inpcb hash with no additional per-connection
+      state.
+    key_questions:
+      - "What does the inpcb hash look up, and how does it demux an incoming TCP/UDP packet to a socket without a per-connection hop table?"
+      - "What state lives in struct tcpcb that does not live in struct inpcb, and why is the split useful (UDP, raw IP, divert all reuse inpcb)?"
+      - "How does tcp_input.c walk the state machine — what does it do differently in LISTEN, SYN_RECEIVED, ESTABLISHED, and FIN_WAIT_*?"
+      - "What is the syncache, and how does it let a listening socket survive a SYN flood without allocating a tcpcb per half-open connection?"
+      - "What does tcp_output.c decide each time it is called — when does the stack actually emit a segment vs. waiting?"
+      - "What does the cc_algo KPI require a congestion control module to provide, and how does the stack call into it on each ACK / loss / retransmit?"
+      - "What does tcp_function_block let RACK and BBR replace, and why is that scope wider than just plugging in via cc_algo?"
+      - "Why is UDP so much smaller than TCP — what does udp_usrreq.c do that is not already in in_pcb.c?"
+    mermaid: state
+    sections:
+      - "Quick Summary"
+      - "Architecture"
+      - "Key Data Structures"
+      - "Deep Dive"
+      - "Flow / Diagram"
+      - "Comparison"
+      - "Advanced Notes"
+      - "See Also"
+
+  - title: "IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP"
+      - "mbuf — Network Buffer Allocation and Chaining"
+      - "pf — OpenBSD-derived Packet Filter"
+      - "VNET — Virtual Network Stacks"
+    output_file: "sys/netinet/README_ip.md"
+    source_dirs:
+      - "sys/netinet"
+      - "sys/netinet6"
+      - "sys/net/route"
+    # IPv4 + IPv6 in one chapter: splitting them hides the v4-vs-v6
+    # contrast that is half the point. ip_input.c / ip_output.c plus
+    # ip6_input.c / ip6_output.c are the four entry points; ip.h /
+    # ip_var.h / ip6.h hold the struct definitions. The fib/nhop
+    # rewrite (sys/net/route/) is the central architectural story
+    # — nhop.c + nhop.h define the next-hop object, fib_algo.c
+    # plugs in different routing-table backends.
+    source_files:
+      - "sys/netinet/ip_input.c"
+      - "sys/netinet/ip_output.c"
+      - "sys/netinet/ip.h"
+      - "sys/netinet/ip_var.h"
+      - "sys/netinet6/ip6_input.c"
+      - "sys/netinet6/ip6_output.c"
+      - "sys/netinet6/ip6.h"
+      - "sys/net/route/nhop.c"
+      - "sys/net/route/nhop.h"
+      - "sys/net/route/fib_algo.c"
+    # Without this guard the writer drifts into (a) the L4 protocols
+    # that ip_input dispatches to (Transport Protocols chapter), (b)
+    # mbuf handling (mbuf chapter), (c) the pf/ipfw filtering hooks
+    # (their own chapters), or (d) cataloging every option in ip.h.
+    # The chapter's job is the v4/v6 forwarding path, fragmentation,
+    # TTL/hop-limit handling, and the nhop/fib architecture that
+    # replaced the old radix-tree route cache.
+    scope_guard: >
+      This chapter is about the L3 forwarding plane: ip_input /
+      ip_output (and their v6 twins), the fib/nhop architecture
+      that replaced the pre-12.x rtentry-based forwarding cache,
+      fragmentation and reassembly, and the v4-vs-v6 contrasts
+      that show what was redesigned in IPv6. Do NOT re-explain
+      TCP/UDP or how protocols hang off ip_protox — link to the
+      Transport Protocols chapter for what happens after
+      ip_input dispatches. Do NOT re-explain mbuf chains, m_pullup,
+      or pkthdr.csum_flags — link to the mbuf chapter. Do NOT
+      walk through pf or ipfw rule processing — pfil_hooks is the
+      seam, name it and move on. Do NOT re-derive every option /
+      flag bit in ip.h — pick the load-bearing ones (header
+      length, fragment offset, TTL, protocol). Treat the
+      v4-vs-v6 architectural contrast as a first-class topic, not
+      as a footnote.
+    focus: >
+      Document FreeBSD's IP layer for both v4 and v6. Open with
+      the input path: ip_input.c verifies header + checksum,
+      runs pfil hooks, decides forward-vs-local, calls
+      ip_forward (which does the fib lookup and rewrites the
+      header) or hands the packet to the protocol via
+      ip_protox[]. Output path: ip_output.c is called by L4 with
+      a partially-filled header, fills in source/TTL/ID, runs
+      pfil hooks, looks up the next hop, and pushes the mbuf
+      down to the ifnet. Cover fragmentation and reassembly:
+      ip_fragment on the send side, ip_reass on the receive side,
+      and the IPv6 design decision to forbid in-network
+      fragmentation. The fib/nhop story is the central
+      architectural change: pre-12.x FreeBSD used struct rtentry
+      with embedded next-hop info and per-CPU caching; the
+      rewrite split that into a route table + an immutable nhop
+      object that can be looked up lock-free on the fast path,
+      with fib_algo.c letting the lookup data structure
+      (radix, dxr, bsearch4) be chosen at runtime. v6 differences:
+      bigger addresses, no in-network fragmentation, neighbor
+      discovery vs ARP, scope IDs for link-local, and the
+      separate sys/netinet6/ tree. Close on what hangs off the
+      L3 entry points: pfil hooks (pf, ipfw, ipsec), per-protocol
+      input handlers, and the netisr dispatch boundary.
+    key_questions:
+      - "What does ip_input.c do between receiving an mbuf from netisr and either forwarding it or handing it to the protocol layer?"
+      - "What is the role of the ip_protox[] dispatch table, and how does adding a new IP protocol (e.g., SCTP) plug into it?"
+      - "What does ip_output.c expect its caller to have already filled in vs. what does it fill in itself (source address, TTL, ID, checksum)?"
+      - "What does the fib/nhop rewrite buy over the old rtentry approach — what is locked vs lock-free on the fast path, and what does fib_algo.c let you swap?"
+      - "How does ip_reass put fragmented packets back together, and what protections (timeouts, queue limits) prevent fragmentation-DoS?"
+      - "What did IPv6 redesign vs. IPv4 — addresses, fragmentation, neighbor discovery vs ARP, scope IDs — and which of those forced separate v6 input/output functions vs. shared code?"
+      - "How do pfil_hooks let pf, ipfw, and ipsec interpose on the IP path without each having to patch ip_input/ip_output?"
+    mermaid: flowchart
+    sections:
+      - "Quick Summary"
+      - "Architecture"
+      - "Key Data Structures"
+      - "Deep Dive"
+      - "Flow / Diagram"
+      - "Comparison"
+      - "Advanced Notes"
+      - "See Also"
+
