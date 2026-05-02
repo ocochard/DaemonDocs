@@ -4599,14 +4599,31 @@ def _verify_structs(structs: List[str], src_root: str,
     chapter passes `["stand"]` so `EFI_MEMORY_DESCRIPTOR`, `preloaded_file`,
     etc. verify against the bootloader tree instead of being flagged.
     """
-    # Match "struct NAME {" — the canonical struct definition shape.
-    # `pattern_template` is for Python re; `shape_grep` is the BSD-grep
-    # filter that keeps only candidate definition lines so the 1 MB cap
-    # holds them.
+    # Match the canonical struct definition shape. Two alternatives,
+    # both of which appear in real FreeBSD code:
+    #
+    #   1. Same-line brace:  `struct NAME {`
+    #   2. K&R-style brace on next line:
+    #          struct NAME
+    #          {
+    #      `bootstrap.h:230` — `struct preloaded_file\n{` — is the
+    #      example that motivated this. Without the K&R alternative,
+    #      `_verify_structs` reports real `stand/` structs as missing
+    #      and the reviewer downgrades accuracy on chapters that
+    #      legitimately discuss them.
+    #
+    # `pattern_template` is for Python re (per-symbol re-scan over the
+    # grep output); `shape_grep` is the BSD-grep filter that keeps
+    # only candidate-definition lines so the 1 MB cap holds them.
+    # Forward decls (`struct foo;`) and pointer uses (`struct foo *p`)
+    # are intentionally NOT matched by either alternative.
     return _verify_with_cache(
         "struct", structs, src_root,
-        pattern_template=r"struct\s+({alt})\s*\{{",
-        shape_grep=r"^struct [A-Za-z_][A-Za-z0-9_]* *\{",
+        pattern_template=r"struct\s+({alt})(?:\s*\{{|\s*$)",
+        shape_grep=(
+            r"^struct [A-Za-z_][A-Za-z0-9_]* *\{|"
+            r"^struct [A-Za-z_][A-Za-z0-9_]* *$"
+        ),
         extra_search_dirs=extra_search_dirs,
     )
 

@@ -1128,12 +1128,16 @@ What's still open:
   incorrectly). What's still open: (a) bodies with *some* real fields
   (e.g. 2 of 28) but mostly fabricated names — the threshold is currently
   "zero overlap" because choosing K is hard; raising K creates false
-  positives on legitimate elided drafts. (b) The K&R-style brace-on-next-
-  line definition (`struct foo\n{`) is found by `_real_struct_fields`
-  (its grep was relaxed to drop the `{`) but is NOT found by the
-  reviewer-side `_verify_structs` shape-grep — that still uses
-  `^struct NAME *\{`. 1199 sys/ structs use K&R style; flagging real
-  K&R-defined structs as missing is a separate bug to fix.
+  positives on legitimate elided drafts. (b) ~~The K&R-style brace-on-
+  next-line definition (`struct foo\n{`) is found by `_real_struct_fields`
+  but not by the reviewer-side `_verify_structs`.~~ **Fixed same day**
+  (2026-05-02): the shape-grep and Python pattern in `_verify_structs`
+  were extended to accept either `^struct NAME *\{` (same-line brace)
+  or `^struct NAME *$` (K&R brace on next line). Discovered when ch2
+  test run failed accuracy on the real `struct preloaded_file` (K&R
+  brace in `stand/common/bootstrap.h:230`). Forward declarations and
+  pointer uses are still rejected. Regression test added to
+  `test_hallucination_factcheck.py` (Test 11b).
 - **Comparison-section claims.** `_strip_comparison_section` deliberately
   exempts that section. ch2's NetBSD/Linux/macOS comparison rows still
   ship without verification.
