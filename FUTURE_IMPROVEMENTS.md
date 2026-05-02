@@ -998,7 +998,7 @@ comparison bullet (book reference or non-FreeBSD source path)"* —
 remains infeasible without a non-FreeBSD source corpus and is
 unlikely to ship.
 
-### Struct-snippet faithfulness — code blocks can disagree with prose, nothing checks the layout
+### [PARTIALLY DONE — shipped 2026-05-02] Struct-snippet faithfulness — code blocks can disagree with prose, nothing checks the layout
 
 Observed on `sys/sys/README_mbuf.md` (chapter 26, generated 2026-05-01,
 shipped CLEAN with reviewer 9/9 PASS). The chapter's prose correctly
@@ -1083,8 +1083,80 @@ definition: `pkthdr` — and even that is wrong as a member name).
 It also has zero false-positive risk for chapters that don't
 include code blocks at all. Worth prototyping next.
 
-**Status:** open. Filed 2026-05-01 after ch26 mbuf shipped clean
-with the wrong struct.
+**Status (2026-05-02): partially shipped.** Triggered by ch2
+(stand/efi/loader/README.md, K8 regen) which shipped UNVERIFIED with
+fabricated `bi_efi_memmap`, `bi_efi_memmap_size`, `bi_modlist` fields
+on `struct bootinfo` and a fabricated `bi_construct()` function body.
+What's now caught (`generate-doc.py` 2026-05-02):
+
+- `_extract_struct_field_claims` + `_verify_struct_field_claims`:
+  member-access expressions (`var->field`, `var.field`) where `var`
+  is bound to a struct by an in-block `struct NAME *var` declaration,
+  AND prose `STRUCTNAME->FIELD` paraphrases where `STRUCTNAME` is the
+  type being used as a variable. Wired into `fact_check_draft` as
+  `struct_field_refs_bogus`. ch2's three bogus fields all surface.
+- `_extract_fenced_function_defs`: function definitions inside fenced
+  ```c blocks (a return-type chunk, NAME(...), `{` body opener at line
+  start). Unioned into `_extract_function_names` so existing
+  `_verify_functions` flags fabricated bodies. Catches `bi_construct`.
+- `_extract_struct_names` extended: also matches ``\`NAME\` structure``
+  in prose. Catches `bi_module` (chapter referenced "a `bi_module`
+  structure" with no `struct` keyword).
+- `_FILE_EXT_DENYLIST`: rejects `bootinfo.c`-shaped path tokens that
+  would otherwise be misread as `var.field`. Tested.
+
+What's still open:
+
+- **Original mbuf failure mode — DONE-with-caveats (2026-05-02).** Option (2)
+  from the post-mortem is now implemented. `_verify_struct_bodies` returns
+  a second list `struct_bodies_abridged`: any fenced ` ```c struct NAME { ... } ```
+  block whose claimed-field set has *zero overlap* with the real top-level
+  fields (and whose real definition has ≥4 fields, and which is not marked
+  abridged) is flagged. Abridgement markers recognized: `...`, `\u2026`,
+  and comments containing `elided`/`omitted`/`truncated`/`simplified`/
+  `abridged`/`abbreviated`/`for brevity`/`other fields`/`additional fields`/
+  `more fields`/`rest of`. Wired into `fact_check_draft` and the fact-fix
+  prompt (`_build_fact_check_prompt`), so the writer is told specifically:
+  "your body has zero overlap with the real definition, quote the real
+  field names verbatim or use `/* ... */` to elide." Two parser bugs were
+  fixed as prerequisites: `_real_struct_fields` now ranks candidates
+  (canonical kernel-header dirs first) AND picks max-fields across the
+  top 32 candidates — previously a 2-field test stub would beat the real
+  28-field `sys/sys/mbuf.h`; and `_parse_struct_fields` now recurses into
+  anonymous `union { ... };` / `struct { ... };` bodies (mbuf has 3+
+  levels of nested anonymous unions, which the old regex flattened
+  incorrectly). What's still open: (a) bodies with *some* real fields
+  (e.g. 2 of 28) but mostly fabricated names — the threshold is currently
+  "zero overlap" because choosing K is hard; raising K creates false
+  positives on legitimate elided drafts. (b) The K&R-style brace-on-next-
+  line definition (`struct foo\n{`) is found by `_real_struct_fields`
+  (its grep was relaxed to drop the `{`) but is NOT found by the
+  reviewer-side `_verify_structs` shape-grep — that still uses
+  `^struct NAME *\{`. 1199 sys/ structs use K&R style; flagging real
+  K&R-defined structs as missing is a separate bug to fix.
+- **Comparison-section claims.** `_strip_comparison_section` deliberately
+  exempts that section. ch2's NetBSD/Linux/macOS comparison rows still
+  ship without verification.
+- **Verifier scope `sys/` only — DONE-with-caveats (2026-05-02).** Per-
+  chapter `extra_search_dirs:` knob added. ch2 (Boot Process) sets
+  `extra_search_dirs: ["stand"]` so `preloaded_file`, `file_metadata`,
+  `elf64_exec`, `EFI_MEMORY_DESCRIPTOR` etc. now verify against
+  `~/freebsd-src/stand/`. `_resolve_search_roots(src_root, extra_dirs)`
+  always includes `<src>/sys` and appends each existing extra; the cache
+  key embeds a sorted-tuple suffix so widening one chapter's roots does
+  NOT poison the sys-only cache for others. All four major verifiers
+  (`_verify_structs`, `_verify_functions`, `_real_struct_fields`,
+  `_verify_with_cache`) thread the kwarg through. `fact_check_draft` and
+  `build_review_prompt` both read `chapter.get("extra_search_dirs")`.
+  What's still open: only ch2 currently opts in; other chapters that
+  reach into `lib/`, `usr.bin/`, `usr.sbin/` will still false-flag
+  userland-only symbols until they're given the knob.
+- **Reviewer didn't penalize hallucination.** ch2 scored 8/9 from the
+  reviewer, then the fact-fix loop landed with the hallucinations
+  intact. The new verifier output now feeds the fact-fix prompt with
+  specific bogus names — the writer should patch them out — but the
+  reviewer's Accuracy criterion still doesn't gate on prose-vs-source
+  field-name consistency. Separate work.
 
 ---
 

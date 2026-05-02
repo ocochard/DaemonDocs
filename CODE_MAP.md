@@ -105,7 +105,9 @@ pattern.
 | Inject ground truth into the reviewer | `build_review_prompt` | Pre-validate before the prompt is rendered, build a `verified_FOO_block` string, interpolate it alongside the existing `verified_block` / `symbol_block` / `macro_block`. The Accuracy criterion and the **No hedges** block reference these blocks by name — update both when adding a new ground-truth category. |
 | Inject ground truth into the writer | `_build_symbol_catalog` (called by `build_chapter_prompt`) | Pre-extract real symbol names from the chapter's `source_files` + bounded `source_dirs` sample, render an `## Authoritative Symbol Catalog` block. Caps live in `_CATALOG_MAX_*` and `_CATALOG_FILES_PER_DIR` — keep them tight; this is prompt-cost, not fact-check-cost. To add a new symbol kind, extend `_dirmap_extract_names` (which is shared with `directory_map`). |
 | Add a new section type (output template) | `_SECTION_CATALOG` | Each entry has `template_body`, `rubric_body`. Per-chapter section list comes from `_chapter_sections(chapter)` reading `sections:` in `chapters.yaml`. |
-| Add a new fact-check verifier | Banner **Fact-checking** | Pair: `_extract_FOO(text) -> List` and `_verify_FOO(items, src_root) -> List[missing]`. Use `_verify_with_cache` if the verifier is a grep over `sys/` (free re-runs via `_FACT_CHECK_CACHE`). Wire into `fact_check_draft` and `_build_fact_check_prompt`. Existing examples: structs, functions, kernel options, DTrace probes, MALLOC_DEFINE tags. |
+| Add a new fact-check verifier | Banner **Fact-checking** | Pair: `_extract_FOO(text) -> List` and `_verify_FOO(items, src_root, extra_search_dirs=None) -> List[missing]`. Use `_verify_with_cache` if the verifier is a grep over `sys/` (free re-runs via `_FACT_CHECK_CACHE`). Wire into `fact_check_draft` and `_build_fact_check_prompt`. Existing examples: structs, functions, kernel options, DTrace probes, MALLOC_DEFINE tags. |
+| Verify symbols outside `sys/` (e.g. `stand/`) | `chapters.yaml` `extra_search_dirs:` | Per-chapter list of additional grep roots, joined to `~/freebsd-src`. `_resolve_search_roots` always includes `<src>/sys` and appends each existing extra. The cache key embeds a sorted-tuple suffix so widening roots for one chapter does NOT poison the sys-only cache for others. Use this when a chapter's subject (boot loader, userland tool) lives outside `sys/`. |
+| Catch struct bodies hallucinated wholesale | `_verify_struct_bodies` returns `(bogus, abridged)` | The bogus-field check (per-field grep) misses bodies where every claimed field is fabricated together. The overlap-threshold layer flags any non-abridged body whose claimed-field set has zero overlap with the real top-level fields (≥4 real fields). `_struct_body_is_abridged` recognizes `...`, `\u2026`, and comments containing `elided`/`omitted`/`for brevity`/etc — writers can opt out by elision. Wired into `fact_check_draft` as `struct_bodies_abridged`. |
 | Change sampler params | `create_writer_agent` / `create_reviewer_agent` | Pass kwargs to `OpenAIServerModel(...)`. They land on every API call via `self.kwargs` in smolagents' `Model._prepare_completion_kwargs`. |
 | Add a new chapter | `chapters.yaml` only | Schema is documented in the YAML's header comment. `output_file` must NOT collide with an upstream-shipped FreeBSD file; if it does, use a sibling name (see chapter 1's `README_internals.md` rationale). Set `family:` (one of the 7 tags) so the new chapter shows up in the right family-mate "Related" sidebars by default; add `related:` only if family-mates aren't right. |
 | Change which chapters appear as "Related" in a sidebar | `chapters.yaml` (`related:` field) | The chapter relationship map is derived from `chapters.yaml` by `_build_chapter_rels` — `related:` wins, family-mates are the fallback. Do NOT reintroduce a hand-maintained `CHAPTER_RELS` dict in `generate-doc.py` — that duplication was the bug fixed by this design (rename in YAML, dict goes silently stale). |
@@ -134,7 +136,29 @@ pattern.
 - **`_extract_function_names` requires `()` evidence** — bare
   backticked identifiers are skipped because they're dominated
   by struct fields, type names, sysctls, and parameter names.
-  Grepping all of those wastes fact-fix steps.
+  Grepping all of those wastes fact-fix steps. It also unions in
+  `_extract_fenced_function_defs` results so a fabricated function
+  *body* in a ` ```c ` block (`static int bi_construct(void) { ... }`)
+  is flagged the same way as a backticked call.
+- **Three layers of struct-field verification, distinct shapes:**
+  (1) `_extract_struct_bodies` + `_verify_struct_bodies` — claims
+  inside a literal `struct NAME { ... }` block; (2) `_extract_struct_field_claims`
+  + `_verify_struct_field_claims` — member-access expressions
+  (`var->field`, `var.field`) where `var` is bound to a struct via
+  an in-block `struct NAME *var` declaration, plus prose forms like
+  `STRUCTNAME->FIELD` (the writer using the struct name as if it
+  were a variable, e.g. `bootinfo->bi_efi_memmap`); (3) the
+  `_FILE_EXT_DENYLIST` (`c`, `h`, `S`, `py`, …) excludes the
+  `path/file.c`-shaped collisions where a backticked file path
+  is misread as `var.field`. ch2 (Boot Process, 2026-05-02) shipped
+  with all three escape hatches simultaneously open and motivated
+  the layered design.
+- **`_extract_struct_names` matches both `struct NAME` and
+  ``\`NAME\` structure``** — backticked-prose form catches the
+  writer naming a fictional type without the `struct` keyword
+  ("a `bi_module` structure"). Bare-prose "data structure" / "tree
+  structure" is rejected because it lacks the backticks; the
+  writer's backticks are the load-bearing signal.
 - **`_FACT_CHECK_CACHE` is process-global, keyed by
   `(kind, src_root, symbol)`** — same symbol verified once per
   run regardless of which chapter or revision round asked for it.
@@ -161,16 +185,19 @@ pattern.
 
 ## Execution topology — where the script runs
 
-`generate-doc.py` runs on a single primary host that owns the repo,
-the FreeBSD source tree (`$FREEBSD_SRC`), the books corpus
-(`$BOOKS_DIR`), and at least one llama-server endpoint. Additional
-llama-server endpoints (separate hosts on the LAN) are reachable via
-their `OPENAI_BASE_URL` and used purely as compute — they do NOT need
-the repo, the source tree, or a copy of the script. Parallelism is N
-`generate-doc.py` processes on the primary host, each pointed at a
-different `OPENAI_BASE_URL`. Resolve remote endpoint hosts by IP or
-via `~/.ssh/config` aliases as appropriate; the script itself only
-cares about the `OPENAI_BASE_URL` env var.
+`generate-doc.py` runs on `bigone` (this host). The repo,
+`$FREEBSD_SRC` (`~/freebsd-src`), `$BOOKS_DIR` (`~/books`), and
+`~/freebsd-doc` all live here. The LLM endpoints are separate hosts
+on the LAN, reached purely via `OPENAI_BASE_URL` — they do NOT have
+the repo, the source tree, or a copy of the script. Do not SSH into
+them to launch jobs. Current endpoints:
+
+- `framework`  → `http://192.168.100.7:8080/v1`
+- `framework2` → `http://192.168.100.136:8080/v1`
+
+Parallelism is N `generate-doc.py` processes on `bigone`, each
+pointed at a different `OPENAI_BASE_URL`. The script itself only
+cares about the env var.
 
 ---
 

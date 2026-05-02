@@ -17,6 +17,16 @@
 #   output_file  — where to write (relative to FreeBSD src root)
 #   source_dirs  — directories the agent should explore
 #   source_files — specific files the agent should examine
+#   extra_search_dirs — optional list of directories (relative to the
+#                  FreeBSD src root) to add to the fact-check grep root
+#                  in addition to `sys/`. Use for chapters whose subject
+#                  legitimately lives outside the kernel proper — the
+#                  Boot Process chapter (stand/efi/loader) is the
+#                  canonical case: without it, real symbols like
+#                  `EFI_MEMORY_DESCRIPTOR`, `preloaded_file`,
+#                  `elf64_exec` get flagged as missing because
+#                  `_verify_structs`/`_verify_functions` only search
+#                  `sys/` by default.
 #   focus        — what aspect to emphasize
 #   key_questions — questions the chapter must answer
 #   mermaid      — what diagram to include (sequence / flowchart / class / state)
@@ -105,6 +115,13 @@ chapters:
       - "stand/efi/loader/arch/amd64/elf64_freebsd.c"
       - "stand/efi/loader/arch/arm64/exec.c"
       - "stand/efi/loader/bootinfo.c"
+    # The bootloader lives under stand/, not sys/. Without this, real
+    # symbols (EFI_MEMORY_DESCRIPTOR, preloaded_file, elf64_exec,
+    # bi_load, file_metadata) get falsely flagged as missing by the
+    # fact-check pass and the fact-fix loop tells the writer to
+    # "remove or correct" symbols that are actually correct.
+    extra_search_dirs:
+      - "stand"
     focus: >
       Document how loader.efi loads the kernel, passes the EFI memory map,
       and hands off control. Compare x86_64 and ARM64 boot metadata mechanisms.

@@ -2490,8 +2490,11 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
     fact_text = _strip_comparison_section(draft)
     claimed_structs = _extract_struct_names(fact_text)
     claimed_funcs = _extract_function_names(fact_text)
-    missing_structs = set(_verify_structs(claimed_structs, SRC_ROOT))
-    missing_funcs = set(_verify_functions(claimed_funcs, SRC_ROOT))
+    extra_dirs = chapter.get("extra_search_dirs")
+    missing_structs = set(_verify_structs(
+        claimed_structs, SRC_ROOT, extra_dirs))
+    missing_funcs = set(_verify_functions(
+        claimed_funcs, SRC_ROOT, extra_dirs))
     verified_structs = [s for s in claimed_structs if s not in missing_structs]
     verified_funcs = [f for f in claimed_funcs if f not in missing_funcs]
 
@@ -3579,7 +3582,10 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         # ---- Fact-checking pass ----
         print("  [fact-check] verifying paths, structs, funcs, options, "
               "dtrace probes ...")
-        facts = fact_check_draft(draft, SRC_ROOT)
+        facts = fact_check_draft(
+            draft, SRC_ROOT,
+            extra_search_dirs=chapter.get("extra_search_dirs"),
+        )
         fact_check_clean = facts['total_issues'] == 0
         fact_fix_failed = False
 
@@ -4244,12 +4250,35 @@ def _filter_known_noise(names: List[str]) -> List[str]:
 
 
 def _extract_struct_names(text: str) -> List[str]:
-    """Extract claimed struct names from markdown text."""
+    """Extract claimed struct names from markdown text.
+
+    Two forms are matched:
+
+    1. **Explicit `struct NAME`** — the canonical C form. Always counts.
+    2. **Backticked-identifier prose** like ``the `bi_module` structure``
+       or ``a `bootinfo` structure``. Bare prose ("the bi_module
+       structure") is NOT matched — too noisy with English compounds
+       like "a tree structure" / "this data structure". The backticks
+       are the writer's signal that the identifier is a real C name.
+
+    ch2 (Boot Process, 2026-05-02) referenced ``a `bi_module`
+    structure`` and ``the `bi_modlist` linked list`` for entities that
+    don't exist in the FreeBSD tree; the explicit-`struct`-only
+    extractor missed both.
+    """
     structs = []
-    # Match patterns like "struct vm_page", "struct vnode", "struct foo_bar"
+    # Form 1: `struct NAME`
     for m in re.finditer(r'\bstruct\s+([a-zA-Z_]\w*)\b', text):
         name = m.group(1)
-        # Skip common non-struct words
+        if name not in ('struct', 'structs', 'structname'):
+            structs.append(name)
+    # Form 2: `` `IDENT` structure`` (with the backticks). Identifier
+    # must be backticked — bare-word "data structure" / "tree
+    # structure" prose would otherwise dominate. Allow "structure",
+    # "structs" plural is not interesting (writer uses "structures"),
+    # but include singular and plural defensively.
+    for m in re.finditer(r'`([a-zA-Z_]\w*)`\s+(?:structure|structures)\b', text):
+        name = m.group(1)
         if name not in ('struct', 'structs', 'structname'):
             structs.append(name)
     return _filter_known_noise(list(set(structs)))
@@ -4264,6 +4293,14 @@ def _extract_function_names(text: str) -> List[str]:
     identifiers are skipped because they are dominated by struct
     fields, type names, sysctls, parameter names and macro tokens —
     grepping all of those wastes fact-fix steps.
+
+    Also includes function names *defined* inside fenced ```c code
+    blocks via `_extract_fenced_function_defs`. The writer sometimes
+    plants a fabricated function body as illustrative source ("here is
+    `bi_construct(void) { ... }`") — `_extract_function_names`'s
+    inline-only patterns miss those entirely, so we union both sets
+    before passing to `_verify_functions`. ch2 (Boot Process,
+    2026-05-02) shipped with `bi_construct()` for exactly this reason.
     """
     funcs = set()
     # Backtick-quoted function calls: `vm_page_insert()`
@@ -4280,7 +4317,65 @@ def _extract_function_names(text: str) -> List[str]:
     # "calls foo()" / "invokes foo()"
     for m in re.finditer(r'\b(?:calls?|invokes?|returns? from)\s+`?([a-zA-Z_]\w*)`?\s*\(\s*\)', text):
         funcs.add(m.group(1))
+    # Function definitions inside fenced ```c blocks.
+    funcs.update(_extract_fenced_function_defs(text))
     return _filter_known_noise(list(funcs))
+
+
+# Match a function definition inside a fenced C code block: a return-
+# type chunk, then NAME(...) followed by `{` (not `;`). Anchored to a
+# line start so member-access expressions like `bi->bi_efi_memmap = (void
+# *)(bi + 1);` can never be mistaken for definitions, and so call sites
+# inside larger expressions are skipped.
+#
+# Allows K&R style where the return type sits on the previous line:
+#     static int
+#     bi_construct(void)
+#     {
+# `(?:[A-Za-z_]\w*\s*\**\s+)+` matches one-or-more type/qualifier
+# tokens with optional `*`s; `\*?\s*` then absorbs a trailing pointer
+# next to the function name. The arg list `\([^;{]*?\)` may span lines
+# (DOTALL) but cannot contain `;` or `{`. A trailing `\s*\{` requires
+# the body-opening brace, which is what distinguishes a definition from
+# a prototype.
+_FENCED_FUNC_DEF_RE = re.compile(
+    r"^"
+    r"(?:[A-Za-z_]\w*\s*\**\s+)+"
+    r"\*?\s*([A-Za-z_]\w*)\s*"
+    r"\([^;{]*?\)\s*"
+    r"(?:__\w+(?:\s*\([^)]*\))?\s*)*"
+    r"\{",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _extract_fenced_function_defs(text: str) -> List[str]:
+    """Find function definitions inside fenced ```c code blocks.
+
+    Returns identifiers that look like the *defined* function (the one
+    whose body opens immediately after the signature). A code block
+    that only *calls* `foo()` does not produce a hit — the
+    body-opening `{` is what gates the match.
+
+    Why this exists: the writer can plant a fabricated function body
+    as illustrative source — `static int bi_construct(void) { ... }` —
+    and the inline-call extractors in `_extract_function_names` won't
+    touch it. ch2 shipped with `bi_construct()` (does not exist in the
+    tree) for precisely this reason.
+    """
+    found: set = set()
+    for block in _FENCED_BLOCK_RE.finditer(text):
+        body = block.group(1)
+        # Strip C comments so a name in `/* foo() */` doesn't promote
+        # to a definition claim.
+        body = _strip_c_comments(body)
+        for m in _FENCED_FUNC_DEF_RE.finditer(body):
+            name = m.group(1)
+            # `if`/`while`/`for`/`switch` etc. match the same shape;
+            # filter via the existing noise list which already covers
+            # C keywords.
+            found.add(name)
+    return _filter_known_noise(list(found))
 
 
 def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
@@ -4327,8 +4422,15 @@ _GREP_TIMEOUT_SEC = 8
 
 
 def _batched_grep_present(symbols: List[str], pattern_template: str,
-                          search_root: str, shape_grep: str) -> set:
-    """Run one grep over `search_root` looking for any of `symbols`.
+                          search_roots, shape_grep: str) -> set:
+    """Run one grep over `search_roots` looking for any of `symbols`.
+
+    `search_roots` is a string (single root) or a sequence of strings
+    (multiple roots, all OR'd in a single grep invocation). Multiple
+    roots are how chapters opt into searching outside `sys/` — a boot
+    chapter declares `extra_search_dirs: ["stand"]` so symbols that
+    legitimately live under `stand/efi/` (e.g. `EFI_MEMORY_DESCRIPTOR`,
+    `preloaded_file`) are not falsely flagged as missing.
 
     Two-stage pipeline:
       1. `grep -Fw` (fixed-strings, word-boundaried) for the candidate
@@ -4355,13 +4457,21 @@ def _batched_grep_present(symbols: List[str], pattern_template: str,
     if not symbols:
         return set()
 
+    if isinstance(search_roots, str):
+        roots = [search_roots]
+    else:
+        roots = [r for r in search_roots if r]
+    if not roots:
+        return set()
+
     # Stage 1: fast fixed-string grep for any of the symbols. `-w` keeps
     # us from matching substrings (e.g. `proc` inside `procfs`).
     # Stage 2: shape filter so the 1 MB cap holds candidate definitions.
     fixed_args = " ".join(f"-e {shlex.quote(s)}" for s in symbols)
+    roots_arg = " ".join(f"{shlex.quote(r)}/" for r in roots)
     cmd = (
         f"grep -rhwF --include='*.c' --include='*.h' {fixed_args} "
-        f"{shlex.quote(search_root)}/ 2>/dev/null | "
+        f"{roots_arg} 2>/dev/null | "
         f"grep -E {shlex.quote(shape_grep)} | "
         f"head -c 1048576"
     )
@@ -4404,19 +4514,59 @@ def _batched_grep_present(symbols: List[str], pattern_template: str,
     return matched
 
 
+def _resolve_search_roots(src_root: str,
+                          extra_search_dirs: Optional[List[str]] = None
+                          ) -> Tuple[List[str], str]:
+    """Build the list of grep roots and a stable cache-key suffix.
+
+    Always includes `<src_root>/sys`. Additionally includes each entry
+    in `extra_search_dirs`, joined with `src_root` if relative, taken
+    as-is if absolute. Non-existent roots are silently dropped (a
+    chapter opting into `stand` on a tree without `stand/` is a no-op,
+    not an error).
+
+    The suffix is the sorted-tuple of *extra* roots only (the `sys`
+    root is implicit), joined with `|`. It lands in the cache key so
+    `(struct, sys-only)` and `(struct, sys+stand)` don't alias.
+    """
+    roots = [os.path.join(src_root, "sys")]
+    extras: List[str] = []
+    for d in extra_search_dirs or []:
+        if not d:
+            continue
+        path = d if os.path.isabs(d) else os.path.join(src_root, d)
+        if os.path.isdir(path):
+            roots.append(path)
+            extras.append(path)
+    cache_suffix = "|".join(sorted(extras))
+    # Filter to roots that actually exist on disk.
+    roots = [r for r in roots if os.path.isdir(r)]
+    return roots, cache_suffix
+
+
 def _verify_with_cache(kind: str, symbols: List[str], src_root: str,
-                       pattern_template: str, shape_grep: str) -> List[str]:
+                       pattern_template: str, shape_grep: str,
+                       extra_search_dirs: Optional[List[str]] = None
+                       ) -> List[str]:
     """Common path for struct/function verification.
 
     Splits `symbols` into already-cached and uncached, runs one batched
     grep over the uncached set, updates the cache, then returns the list
     of symbols that are not present in the source tree.
+
+    `extra_search_dirs` widens the grep beyond `sys/` for chapters that
+    legitimately discuss code under `stand/`, `lib/`, `usr.bin/`, etc.
+    The cache key includes the extra dirs so a symbol verified under a
+    widened search isn't reused for a chapter using only `sys/`.
     """
-    search_root = os.path.join(src_root, "sys")
+    search_roots, cache_suffix = _resolve_search_roots(
+        src_root, extra_search_dirs,
+    )
+    cache_root = src_root + ("::" + cache_suffix if cache_suffix else "")
     uncached = []
     not_found = []
     for s in symbols:
-        cached = _FACT_CHECK_CACHE.get((kind, src_root, s))
+        cached = _FACT_CHECK_CACHE.get((kind, cache_root, s))
         if cached is True:
             continue
         if cached is False:
@@ -4426,22 +4576,28 @@ def _verify_with_cache(kind: str, symbols: List[str], src_root: str,
 
     if uncached:
         present = _batched_grep_present(
-            uncached, pattern_template, search_root, shape_grep,
+            uncached, pattern_template, search_roots, shape_grep,
         )
         for s in uncached:
             present_now = s in present
-            _FACT_CHECK_CACHE[(kind, src_root, s)] = present_now
+            _FACT_CHECK_CACHE[(kind, cache_root, s)] = present_now
             if not present_now:
                 not_found.append(s)
 
     return not_found
 
 
-def _verify_structs(structs: List[str], src_root: str) -> List[str]:
+def _verify_structs(structs: List[str], src_root: str,
+                    extra_search_dirs: Optional[List[str]] = None
+                    ) -> List[str]:
     """Verify that claimed struct names exist in the source tree.
 
     Returns a list of struct names that could not be found.
     Backed by `_FACT_CHECK_CACHE` so re-runs within a session are free.
+
+    `extra_search_dirs` is forwarded to `_verify_with_cache` — a boot
+    chapter passes `["stand"]` so `EFI_MEMORY_DESCRIPTOR`, `preloaded_file`,
+    etc. verify against the bootloader tree instead of being flagged.
     """
     # Match "struct NAME {" — the canonical struct definition shape.
     # `pattern_template` is for Python re; `shape_grep` is the BSD-grep
@@ -4451,14 +4607,21 @@ def _verify_structs(structs: List[str], src_root: str) -> List[str]:
         "struct", structs, src_root,
         pattern_template=r"struct\s+({alt})\s*\{{",
         shape_grep=r"^struct [A-Za-z_][A-Za-z0-9_]* *\{",
+        extra_search_dirs=extra_search_dirs,
     )
 
 
-def _verify_functions(funcs: List[str], src_root: str) -> List[str]:
+def _verify_functions(funcs: List[str], src_root: str,
+                      extra_search_dirs: Optional[List[str]] = None
+                      ) -> List[str]:
     """Verify that claimed function names exist in the source tree.
 
     Returns a list of function names that could not be found.
     Backed by `_FACT_CHECK_CACHE` so re-runs within a session are free.
+
+    `extra_search_dirs` widens the grep beyond `sys/`. ch2 (Boot
+    Process) needs `["stand"]` so `elf64_exec`, `bi_load`, and other
+    bootloader-internal functions are not falsely flagged as missing.
     """
     # The Python re re-scan needs to confirm "this line really is a
     # function definition shape" for the symbol. Earlier versions
@@ -4513,6 +4676,7 @@ def _verify_functions(funcs: List[str], src_root: str) -> List[str]:
             r"[A-Za-z_][A-Za-z0-9_]* *\*? *[A-Za-z_][A-Za-z0-9_]*\("
             r"|^[A-Za-z_][A-Za-z0-9_]*\("
         ),
+        extra_search_dirs=extra_search_dirs,
     )
 
 
@@ -4744,19 +4908,81 @@ def _parse_struct_fields(body: str) -> List[str]:
     Best-effort: returns the last identifier on each `;`-terminated
     declarator. Strips comments, parenthesised macro arguments
     (`STAILQ_ENTRY(foo) next` → `STAILQ_ENTRY next` so `next` wins),
-    nested `{...}` regions (so an inline `enum { ... } p_state` reads
-    as `p_state`), bitfield widths, array shapes, and leading `*`s.
+    bitfield widths, array shapes, and leading `*`s.
+
+    Anonymous nested aggregates (`union { ... };` and `struct { ... };`
+    with no trailing declarator) are recursed into so their inner
+    field names surface — `struct mbuf` would otherwise contribute zero
+    field names because every top-level chain pointer lives inside an
+    anonymous union. *Named* nested aggregates (`enum { FOO } p_state`,
+    `union { ... } u`) are still flattened to the trailing declarator.
 
     Empty list on parse trouble — callers must treat that as
     "verification unavailable," not as "no real fields."
     """
     text = _strip_c_comments(body)
 
-    # Strip nested {...} regions iteratively. An inline enum or
-    # anonymous struct body would otherwise corrupt the declarator
-    # split (commas inside the inner body, terminating `;` inside,
-    # etc.). Replace with a single space so the surrounding identifier
-    # ("} p_state" → " p_state") survives.
+    # Anonymous aggregate bodies: `union {...};` or `struct {...};` at a
+    # declaration position with NO trailing declarator. C allows these
+    # to contribute their inner field names directly to the enclosing
+    # struct. Without recursion, the parser strips the `{...}` region
+    # and emits the literal `union`/`struct` keyword as a field name —
+    # which is also wrong but in a quieter way. Recurse first, then let
+    # the rest of the parser handle named nested aggregates by stripping.
+    fields: List[str] = []
+
+    # Iteratively pull out `\b(union|struct)\s*\{...\}\s*;` blocks
+    # (anonymous, immediately terminated). Recursion depth is bounded
+    # by the brace-balancer's text-shrink invariant: each match removes
+    # at least the keyword + braces.
+    def _find_balanced_brace(s: str, open_idx: int) -> int:
+        depth = 0
+        for i in range(open_idx, len(s)):
+            if s[i] == "{":
+                depth += 1
+            elif s[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
+
+    anon_re = re.compile(r"\b(?:union|struct)\s*\{")
+    while True:
+        m = anon_re.search(text)
+        if not m:
+            break
+        open_idx = text.index("{", m.end() - 1)
+        close_idx = _find_balanced_brace(text, open_idx)
+        if close_idx < 0:
+            break
+        # Look at what follows the closing brace, skipping whitespace,
+        # to decide anonymous vs named.
+        after = text[close_idx + 1:].lstrip()
+        if after.startswith(";"):
+            # Anonymous: recurse, then remove the entire block from text.
+            inner_body = text[open_idx + 1:close_idx]
+            fields.extend(_parse_struct_fields(inner_body))
+            # Compute the matching `;` offset to consume it too.
+            semi_offset = text.find(";", close_idx + 1)
+            text = text[:m.start()] + " " + (
+                text[semi_offset + 1:] if semi_offset >= 0 else ""
+            )
+        else:
+            # Named (`union {...} u;` etc.) — break out so the generic
+            # `{...}` strip below collapses it to the trailing
+            # declarator. We must advance past this match to avoid
+            # re-finding it on the next loop iteration.
+            text = (
+                text[:m.start()] + " " + text[m.start() + len("union"):]
+                if text[m.start():m.start() + len("union")] == "union"
+                else text[:m.start()] + " " + text[m.start() + len("struct"):]
+            )
+
+    # Strip remaining nested {...} regions iteratively. An inline enum
+    # or named anonymous struct body would otherwise corrupt the
+    # declarator split (commas inside the inner body, terminating `;`
+    # inside, etc.). Replace with a single space so the surrounding
+    # identifier ("} p_state" → " p_state") survives.
     prev = None
     while prev != text:
         prev = text
@@ -4768,7 +4994,6 @@ def _parse_struct_fields(body: str) -> List[str]:
     # last token on the declarator, so the macro identifier won't win.
     text = re.sub(r"\([^()]*\)", " ", text)
 
-    fields: List[str] = []
     for decl in text.split(";"):
         decl = decl.strip()
         if not decl:
@@ -4786,20 +5011,30 @@ def _parse_struct_fields(body: str) -> List[str]:
             continue
         last = tokens[-1].lstrip("*").rstrip(",")
         # Field names are C identifiers — guard against parse residue.
-        if re.fullmatch(r"[A-Za-z_]\w*", last):
+        # Reject the `union`/`struct` keywords which are emitted when
+        # an anonymous block was recognised but couldn't be fully
+        # parsed (defence-in-depth against the recursion path).
+        if re.fullmatch(r"[A-Za-z_]\w*", last) and last not in {
+            "union", "struct"
+        }:
             fields.append(last)
     return fields
 
 
-def _extract_struct_bodies(text: str) -> List[Tuple[str, List[str]]]:
+def _extract_struct_bodies(
+    text: str,
+) -> List[Tuple[str, List[str], str]]:
     """Find `struct NAME { ... }` claims in fenced code blocks.
 
-    Returns a list of `(struct_name, [claimed_field_names])` tuples.
-    Only claims inside fenced code blocks count — inline mentions of
-    `struct sysinit` in prose are not field-list claims and shouldn't
-    be flagged.
+    Returns a list of `(struct_name, [claimed_field_names], body_text)`
+    tuples. Only claims inside fenced code blocks count — inline mentions
+    of `struct sysinit` in prose are not field-list claims and shouldn't
+    be flagged. The raw body text is returned alongside the parsed
+    field list so the overlap-threshold check can detect "abridged"
+    markers (`...`, `/* fields elided */`) which signal the writer
+    deliberately shortened the struct.
     """
-    claims: List[Tuple[str, List[str]]] = []
+    claims: List[Tuple[str, List[str], str]] = []
     seen: set = set()
     for block in _FENCED_BLOCK_RE.finditer(text):
         for m in _STRUCT_DEF_RE.finditer(block.group(1)):
@@ -4820,42 +5055,99 @@ def _extract_struct_bodies(text: str) -> List[Tuple[str, List[str]]]:
             if key in seen:
                 continue
             seen.add(key)
-            claims.append((name, fields))
+            claims.append((name, fields, body))
     return claims
 
 
-# Cache the *real* field set per (src_root, struct_name) so multiple
-# claims of the same struct across revision rounds don't re-grep the
-# tree. Stored as frozenset; an empty frozenset means "looked but
-# couldn't parse" and disables verification for that struct.
+def _struct_body_is_abridged(body: str) -> bool:
+    """True if the writer marked a struct body as deliberately shortened.
+
+    Recognises the conventions a writer uses to say "I'm only showing
+    the relevant fields":
+      - bare `...` / `…` ellipsis on its own line
+      - `/* ... */`, `/* … */`, `// ...` placeholder comments
+      - explicit phrasing in any comment: `elided`, `omitted`,
+        `truncated`, `simplified`, `abridged`, `abbreviated`,
+        `for brevity`, `other fields`, `additional fields`,
+        `more fields`
+
+    The signal is intentionally permissive — false negatives on this
+    check (treating a real abridged block as unmarked) lead to spurious
+    flags, which is worse than letting through a few unmarked
+    abridged blocks. The downstream check still requires zero overlap
+    before flagging.
+    """
+    # Bare ellipsis on its own line, or `…` U+2026 (Unicode horizontal
+    # ellipsis) anywhere. The Unicode form is a tell that the writer
+    # paraphrased and let the model emit a "smart" ellipsis.
+    if "\u2026" in body:
+        return True
+    if re.search(r"^\s*(?:\.\.\.|\.\.\.\s*;?)\s*$", body, re.MULTILINE):
+        return True
+    # Any comment containing the placeholder phrasing.
+    for cm in re.finditer(r"/\*(.*?)\*/|//([^\n]*)", body, re.DOTALL):
+        comment = (cm.group(1) or cm.group(2) or "").lower()
+        if not comment:
+            continue
+        if re.search(r"\.\.\.|\u2026", comment):
+            return True
+        for marker in (
+            "elided", "omitted", "truncated", "simplified", "abridged",
+            "abbreviated", "for brevity", "other fields",
+            "additional fields", "more fields", "rest of",
+        ):
+            if marker in comment:
+                return True
+    return False
+
+
+# Cache the *real* field set per (src_root+search-roots, struct_name).
+# Stored as frozenset; an empty frozenset means "looked but couldn't
+# parse" and disables verification for that struct. The cache key
+# encodes the widened search roots so a struct found under `stand/`
+# for ch2 doesn't poison a `sys/`-only chapter that uses the same name.
 _STRUCT_FIELDS_CACHE: Dict[Tuple[str, str], frozenset] = {}
 
 
-def _real_struct_fields(struct_name: str, src_root: str) -> frozenset:
-    """Locate `struct NAME { ... }` in `sys/` and return its field names.
+def _real_struct_fields(struct_name: str, src_root: str,
+                        extra_search_dirs: Optional[List[str]] = None
+                        ) -> frozenset:
+    """Locate `struct NAME { ... }` in the search tree and return its fields.
 
-    Empty frozenset on any of: definition not found, parse failure,
-    or grep timeout. Callers must treat empty as "verification
-    unavailable" rather than "no fields exist."
+    Searches `<src_root>/sys` plus any directories in `extra_search_dirs`
+    (relative paths joined to src_root, absolute paths used as-is, non-
+    existent paths skipped). Empty frozenset on any of: definition not
+    found, parse failure, or grep timeout. Callers must treat empty as
+    "verification unavailable" rather than "no fields exist."
     """
-    cache_key = (src_root, struct_name)
+    search_roots, cache_suffix = _resolve_search_roots(
+        src_root, extra_search_dirs,
+    )
+    cache_key = (
+        src_root + ("::" + cache_suffix if cache_suffix else ""),
+        struct_name,
+    )
     if cache_key in _STRUCT_FIELDS_CACHE:
         return _STRUCT_FIELDS_CACHE[cache_key]
 
-    sys_root = os.path.join(src_root, "sys")
-    if not os.path.isdir(sys_root):
+    if not search_roots:
         _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
         return frozenset()
 
-    # Find files containing `struct NAME {` — definition shape.
-    # `grep -lF` returns filenames only; we then read the candidate
-    # file and parse its real struct body. There may be multiple
-    # candidates (forward decls, kernel-vs-userland headers); we
-    # take the first whose body parses non-empty.
-    pattern = f"struct {struct_name} {{"
+    # Find files containing `struct NAME` — definition shape. We grep
+    # only for the prefix (without the opening brace) because K&R-style
+    # definitions write the brace on the next line (`struct foo\n{`),
+    # which a fixed-string single-line grep can't match. The brace-aware
+    # `_extract_struct_body` regex below handles both `struct NAME {`
+    # and `struct NAME\n{`. The looser grep returns more candidates
+    # (forward decls, function arguments) but `_extract_struct_body`
+    # filters them out — only files that actually contain the
+    # definition body parse non-None.
+    pattern = f"struct {struct_name}"
+    roots_arg = " ".join(f"{shlex.quote(r)}/" for r in search_roots)
     cmd = (
         f"grep -rlF --include='*.c' --include='*.h' "
-        f"{shlex.quote(pattern)} {shlex.quote(sys_root)}/ 2>/dev/null"
+        f"{shlex.quote(pattern)} {roots_arg} 2>/dev/null"
     )
     try:
         result = subprocess.run(
@@ -4869,63 +5161,324 @@ def _real_struct_fields(struct_name: str, src_root: str) -> frozenset:
     candidates = [
         line for line in result.stdout.splitlines() if line.strip()
     ]
-    # Prefer headers — they hold real definitions; .c files often have
-    # forward declarations or local-only structs we don't want.
-    candidates.sort(key=lambda p: (not p.endswith(".h"), p))
 
-    body_re = re.compile(
-        r"struct\s+" + re.escape(struct_name)
-        + r"\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
-        re.DOTALL,
-    )
-    for candidate in candidates[:8]:
+    # Sort candidates by likelihood of being the canonical definition.
+    # The `sys/sys/` and `sys/<arch>/include/` directories hold the
+    # primary kernel headers; deeper paths (e.g. `sys/netpfil/ipfw/test/`)
+    # often contain test stubs that mimic the real struct (a "fake mbuf"
+    # with two fields). Sorting on path-depth-first underlies a `*.h`-
+    # before-`*.c` preference; within `.h` files we prefer canonical
+    # locations over deeper tree paths.
+    def _candidate_priority(path: str) -> tuple:
+        rel = os.path.relpath(path, src_root) if path.startswith(
+            src_root) else path
+        # Tier 0: canonical primary kernel header dirs.
+        canonical = (
+            "sys/sys/" in path
+            or "/sys/sys/" in path
+            or "include/" in path and ("/sys/" in path or path.startswith(
+                "include/"))
+        )
+        is_h = path.endswith(".h")
+        depth = rel.count(os.sep)
+        return (
+            0 if canonical and is_h else (1 if is_h else 2),
+            depth,
+            path,
+        )
+
+    candidates.sort(key=_candidate_priority)
+
+    def _extract_struct_body(content: str, name: str) -> Optional[str]:
+        """Brace-balanced body extraction. Returns None if not found."""
+        # Match `struct NAME [\s\n]*{` then walk braces. Deep nesting
+        # (mbuf has 3+ levels in its trailing union-of-unions) breaks
+        # any pure-regex approach; use a hand-rolled balancer.
+        for m in re.finditer(
+            r"struct\s+" + re.escape(name) + r"\s*\{",
+            content,
+        ):
+            open_idx = m.end() - 1
+            depth = 0
+            for i in range(open_idx, len(content)):
+                c = content[i]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return content[open_idx + 1:i]
+            # Unbalanced — try the next match.
+        return None
+
+    # Parse every reasonable candidate and pick the one with the most
+    # fields. A test stub with 2 fields would otherwise short-circuit
+    # the loop and rob the real definition of its richer field set —
+    # which then defeats the overlap-threshold check below.
+    # The grep pattern is `struct NAME` (no brace), so we get many
+    # forward-decl/function-arg false candidates. Walk a generous slice
+    # — `_extract_struct_body` returns None on files that don't actually
+    # define the struct, so non-definition candidates cost only a file
+    # read. The first definition we find under the canonical sort is
+    # almost always right; we still pick max-fields across the slice to
+    # tolerate test-stub headers in the noise.
+    best_fields: List[str] = []
+    best_path: Optional[str] = None
+    for candidate in candidates[:32]:
         try:
             with open(candidate, "r", encoding="utf-8",
                       errors="replace") as f:
                 content = f.read()
         except OSError:
             continue
-        m = body_re.search(content)
-        if not m:
+        body = _extract_struct_body(content, struct_name)
+        if body is None:
             continue
-        fields = _parse_struct_fields(m.group(1))
-        if fields:
-            real = frozenset(fields)
-            _STRUCT_FIELDS_CACHE[cache_key] = real
-            return real
+        fields = _parse_struct_fields(body)
+        if len(fields) > len(best_fields):
+            best_fields = fields
+            best_path = candidate
+
+    if best_fields:
+        real = frozenset(best_fields)
+        _STRUCT_FIELDS_CACHE[cache_key] = real
+        return real
 
     _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
     return frozenset()
 
 
-def _verify_struct_bodies(claims: List[Tuple[str, List[str]]],
-                          src_root: str) -> List[str]:
-    """For each `(struct, claimed_fields)`, flag fields not in the real struct.
+def _verify_struct_bodies(
+    claims,
+    src_root: str,
+    extra_search_dirs: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str]]:
+    """Verify struct-body claims against the real definition.
 
-    Returns a list of `"struct NAME: bogus_field1, bogus_field2"` strings,
-    one per struct that has any unknown field. Structs whose real
-    definition couldn't be located or parsed are silently skipped —
-    `_verify_structs` already reports the "struct not in tree" case.
+    `claims` is a list of `(name, claimed_fields, body_text)` from
+    `_extract_struct_bodies`. (Older 2-tuple `(name, fields)` callers
+    are still tolerated — the body check is then skipped for that
+    entry.)
+
+    Returns a pair of lists:
+
+      - `bogus_fields_issues` — `"struct NAME: f1, f2"`, one per struct
+        that has at least one claimed field which doesn't exist in the
+        real struct. This is the original `_verify_struct_bodies`
+        output.
+      - `abridged_issues` — `"struct NAME (real has K fields, draft
+        listed M with 0 overlap)"`, one per struct whose draft body
+        has zero overlap with the real top-level fields AND the real
+        struct has at least 4 fields AND the draft body is NOT marked
+        abridged. Catches the original mbuf failure mode: a struct
+        body that lists 1-of-30 real fields (or none) and looks
+        plausible but isn't load-bearing.
+
+    Structs whose real definition couldn't be located or parsed are
+    silently skipped — `_verify_structs` already reports the "struct
+    not in tree" case.
     """
-    issues = []
-    for name, claimed in claims:
-        real = _real_struct_fields(name, src_root)
+    bogus_issues: List[str] = []
+    abridged_issues: List[str] = []
+    for entry in claims:
+        if len(entry) == 3:
+            name, claimed, body = entry
+        else:
+            name, claimed = entry
+            body = ""
+        real = _real_struct_fields(name, src_root, extra_search_dirs)
         if not real:
             continue  # verification unavailable — don't flag
         bogus = [f for f in dict.fromkeys(claimed) if f not in real]
         if bogus:
-            issues.append(f"struct {name}: {', '.join(bogus)}")
+            bogus_issues.append(f"struct {name}: {', '.join(bogus)}")
+
+        # Overlap-threshold check. The original failure mode (mbuf,
+        # 2026-05-01) was a draft body that named ~2 fields, none of
+        # which existed in the real struct: the bogus-field check
+        # reported them all, but a writer might equally invent 2
+        # "fields" that happen to alias real names elsewhere. The
+        # stronger signal is "the draft body has zero overlap with
+        # the real top-level field set" — which means the writer
+        # didn't read the source, just paraphrased from memory. Skip
+        # small structs (≤3 fields) where 0-overlap is too easy to
+        # hit by typo. Skip when the writer marked the body abridged.
+        if body and len(real) >= 4 and not _struct_body_is_abridged(body):
+            claimed_set = {f for f in claimed}
+            overlap = claimed_set & real
+            if not overlap:
+                abridged_issues.append(
+                    f"struct {name} (real definition has {len(real)} "
+                    f"top-level fields, draft body lists "
+                    f"{len(claimed_set)} with 0 overlap)"
+                )
+    return bogus_issues, abridged_issues
+
+
+# Match `struct NAME [*]VAR;` declarations inside C code. Captures the
+# struct name (group 1) and the variable name (group 2). The optional
+# `*` is absorbed without capture; `[const|volatile]` qualifiers are
+# tolerated between `struct` and the type. Trailing `=` (initialised
+# decl) and `;` (plain decl) both terminate the match.
+_STRUCT_VAR_DECL_RE = re.compile(
+    r"\bstruct\s+([A-Za-z_]\w*)\s+\**\s*([A-Za-z_]\w*)\s*(?:[;,=)]|$)",
+    re.MULTILINE,
+)
+
+# Match a member-access expression: VAR->FIELD or VAR.FIELD. The
+# trailing lookahead rejects struct-name shadows (`foo.bar.baz` —
+# we only want the immediate field); `\b` is enough.
+_MEMBER_ACCESS_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*)\b"
+)
+
+
+def _extract_struct_field_claims(
+    text: str,
+    known_structs: Optional[List[str]] = None,
+) -> List[Tuple[str, str]]:
+    """Find struct-field claims that aren't inside a `struct NAME {…}` block.
+
+    Two evidence shapes, both load-bearing on the ch2 (Boot Process,
+    2026-05-02) failure:
+
+    1. **Member access in fenced C blocks** (`bi->bi_efi_memmap`):
+       For each ```c``` block, scan for `struct NAME [*]VAR` declarations
+       to build a `var → struct_name` map, then walk every `VAR->FIELD`
+       and `VAR.FIELD` and emit `(struct_name, field)` for each VAR
+       that resolved to a known struct.
+
+    2. **Prose `STRUCTNAME->FIELD`** (`bootinfo->bi_efi_memmap`):
+       Anywhere outside fenced code, a `NAME->FIELD` expression where
+       `NAME` is the struct's *type* (not a variable) — this is the
+       writer paraphrasing "the bootinfo's bi_efi_memmap field" into
+       what looks like C syntax. We treat any `NAME` that appears in
+       the chapter's `_extract_struct_names` set as a struct-name
+       claim. False-positive risk is low: real C code doesn't use the
+       struct-name as a variable name.
+
+    Returns a deduplicated list of `(struct_name, field_name)` tuples.
+    Fields and structs are NOT verified here — that's `_verify_struct_field_claims`.
+    """
+    claims: set = set()
+    known = set(known_structs or [])
+
+    # Stage 1: walk fenced ```c```-tagged blocks. Other fence languages
+    # (mermaid, sh, ascii diagrams) don't have C semantics and can't
+    # contribute reliable struct/field declarations.
+    for block in _FENCED_BLOCK_RE.finditer(text):
+        body = block.group(1)
+        # Strip C comments first — variable names in `/* foo */` must
+        # not promote to declarations.
+        body = _strip_c_comments(body)
+        # Build var→struct map from declarations in this block. Local
+        # to the block: `struct foo *fp` declared in one snippet must
+        # not bind in a different snippet.
+        var_to_struct: Dict[str, str] = {}
+        for m in _STRUCT_VAR_DECL_RE.finditer(body):
+            struct_name, var = m.group(1), m.group(2)
+            # Skip when the "var" is a C keyword (defensive against
+            # parse residue); _STRUCT_VAR_DECL_RE's terminator set
+            # already filters most of these.
+            if var in {"const", "volatile", "static", "inline",
+                       "register", "auto", "extern"}:
+                continue
+            var_to_struct[var] = struct_name
+        # Walk member-access expressions and bind to struct.
+        for m in _MEMBER_ACCESS_RE.finditer(body):
+            var, field = m.group(1), m.group(2)
+            if var in var_to_struct:
+                claims.add((var_to_struct[var], field))
+
+    # Stage 2: prose `STRUCTNAME->FIELD` outside fenced code. The
+    # writer paraphrases "the bootinfo's bi_efi_memmap field" as
+    # `bootinfo->bi_efi_memmap` even though no variable named
+    # `bootinfo` exists — a tell that the field claim was written
+    # from memory.
+    if known:
+        # Strip fenced blocks so member-access in code (handled by
+        # Stage 1) doesn't double-trigger.
+        prose = _FENCED_BLOCK_RE.sub("", text)
+        for m in _MEMBER_ACCESS_RE.finditer(prose):
+            var, field = m.group(1), m.group(2)
+            if var not in known:
+                continue
+            # File-extension collision: `bootinfo.c`, `bootinfo.h`,
+            # `bootinfo.S` etc. look syntactically like `var.field`
+            # but are actually file paths. The writer routinely back-
+            # ticks paths (`stand/efi/loader/bootinfo.c`) and the path
+            # token gets caught by `_MEMBER_ACCESS_RE`. Reject any
+            # field that matches a common source-file extension.
+            if field in _FILE_EXT_DENYLIST:
+                continue
+            claims.add((var, field))
+
+    return sorted(claims)
+
+
+# Source/asset file extensions that appear as the suffix of a backticked
+# path like `stand/efi/loader/bootinfo.c` and are misread as a struct
+# member access by `_MEMBER_ACCESS_RE`. Listed here rather than tested
+# against `os.path.splitext` because the prose form may not be a real
+# file path (`bootinfo.c` mid-sentence) — we just need the lexical
+# signal that it's a path-like construct.
+_FILE_EXT_DENYLIST = frozenset({
+    "c", "h", "S", "s", "py", "sh", "md", "yaml", "yml", "txt", "conf",
+    "tex", "in", "am", "mk", "asm", "cc", "cpp", "hpp", "go", "rs",
+    "log", "out", "err", "json", "xml", "html", "rst",
+})
+
+
+def _verify_struct_field_claims(
+    claims: List[Tuple[str, str]],
+    src_root: str,
+    extra_search_dirs: Optional[List[str]] = None,
+) -> List[str]:
+    """For each `(struct, field)` claim, flag fields not in the real struct.
+
+    Returns `"struct NAME->field"` strings, one per bogus claim.
+    Skips structs whose real definition can't be located or parsed —
+    `_verify_structs` already reports the "struct not in tree" case,
+    and an unparseable struct would silently swallow every field
+    claim if we treated empty-real-set as "no fields exist."
+    """
+    issues = []
+    for struct_name, field in claims:
+        real = _real_struct_fields(struct_name, src_root, extra_search_dirs)
+        if not real:
+            continue  # verification unavailable — don't flag
+        if field not in real:
+            issues.append(f"struct {struct_name}->{field}")
     return issues
 
 
-def fact_check_draft(draft: str, src_root: str) -> dict:
+def fact_check_draft(draft: str, src_root: str,
+                     extra_search_dirs: Optional[List[str]] = None) -> dict:
     """Run structured fact-checking on a draft chapter.
+
+    `extra_search_dirs` widens struct/function verification beyond
+    `<src_root>/sys`. Each entry is a directory relative to `src_root`
+    (or absolute). Used by chapters whose subject is genuinely outside
+    `sys/` — e.g. ch2 (Boot Process) declares `["stand"]` so symbols
+    like `EFI_MEMORY_DESCRIPTOR`, `preloaded_file`, and `elf64_exec`
+    that live under `stand/` verify cleanly. Without it, the fact-fix
+    loop tells the writer to "remove or correct" symbols that are
+    actually correct.
 
     Returns a dict with:
         - 'file_paths_not_found': list of missing paths
         - 'file_paths_corrected': list of "wrong → right" pairs
         - 'structs_not_found': list of missing struct names
         - 'struct_fields_bogus': list of "struct N: f1, f2" strings
+          (claims inside `struct NAME { ... }` code blocks)
+        - 'struct_bodies_abridged': list of "struct N (real has K, draft
+          listed M with 0 overlap)" strings — a fenced `struct NAME {…}`
+          block whose field set has zero overlap with the real
+          definition's top-level fields, AND the body is not marked
+          abridged. This is the original mbuf failure mode.
+        - 'struct_field_refs_bogus': list of "struct N->f" strings
+          (member-access claims like `bi->bi_efi_memmap` outside a
+          `struct NAME { ... }` block)
         - 'funcs_not_found': list of missing function names
         - 'kernel_options_not_found': list of unverifiable kernel-config options
         - 'dtrace_probes_not_found': list of unverifiable DTrace SDT probes
@@ -4940,6 +5493,12 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
     file_paths = _extract_file_paths(fact_text)
     structs = _extract_struct_names(fact_text)
     struct_body_claims = _extract_struct_bodies(fact_text)
+    # Field-ref claims need the struct-name set to recognize prose
+    # `STRUCTNAME->FIELD` paraphrases (the writer using the type name
+    # as if it were a variable). Run after `_extract_struct_names`.
+    struct_field_ref_claims = _extract_struct_field_claims(
+        fact_text, known_structs=structs,
+    )
     funcs = _extract_function_names(fact_text)
     kernel_options = _extract_kernel_options(fact_text)
     dtrace_probes = _extract_dtrace_probes(fact_text)
@@ -4949,18 +5508,29 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
     paths_corrected = [x for x in paths_missing if ' → ' in x]
     paths_missing = [x for x in paths_missing if ' → ' not in x]
 
-    structs_missing = _verify_structs(structs, src_root)
+    structs_missing = _verify_structs(structs, src_root, extra_search_dirs)
     # Only verify field bodies for structs whose name *does* exist in
     # the tree — `_verify_structs` already flags unknown struct names,
     # and trying to parse a real definition for a non-existent struct
     # would always come back empty (silent skip) anyway.
     structs_missing_set = set(structs_missing)
     body_claims_filtered = [
-        (name, fields) for name, fields in struct_body_claims
+        (name, fields, body) for name, fields, body in struct_body_claims
         if name not in structs_missing_set
     ]
-    struct_fields_bogus = _verify_struct_bodies(body_claims_filtered, src_root)
-    funcs_missing = _verify_functions(funcs, src_root)
+    struct_fields_bogus, struct_bodies_abridged = _verify_struct_bodies(
+        body_claims_filtered, src_root, extra_search_dirs,
+    )
+    # Same filter for ref-claims: if `struct foo` is itself missing,
+    # don't double-report every field access against it.
+    field_ref_claims_filtered = [
+        (name, field) for name, field in struct_field_ref_claims
+        if name not in structs_missing_set
+    ]
+    struct_field_refs_bogus = _verify_struct_field_claims(
+        field_ref_claims_filtered, src_root, extra_search_dirs,
+    )
+    funcs_missing = _verify_functions(funcs, src_root, extra_search_dirs)
     kernel_options_missing = _verify_kernel_options(kernel_options, src_root)
     dtrace_probes_missing = _verify_dtrace_probes(dtrace_probes, src_root)
     malloc_tags_missing = _verify_malloc_tags(malloc_tags, src_root)
@@ -4970,12 +5540,16 @@ def fact_check_draft(draft: str, src_root: str) -> dict:
         'file_paths_corrected': paths_corrected,
         'structs_not_found': structs_missing,
         'struct_fields_bogus': struct_fields_bogus,
+        'struct_bodies_abridged': struct_bodies_abridged,
+        'struct_field_refs_bogus': struct_field_refs_bogus,
         'funcs_not_found': funcs_missing,
         'kernel_options_not_found': kernel_options_missing,
         'dtrace_probes_not_found': dtrace_probes_missing,
         'malloc_tags_not_found': malloc_tags_missing,
         'total_issues': (len(paths_missing) + len(paths_corrected) +
                          len(structs_missing) + len(struct_fields_bogus) +
+                         len(struct_bodies_abridged) +
+                         len(struct_field_refs_bogus) +
                          len(funcs_missing) +
                          len(kernel_options_missing) +
                          len(dtrace_probes_missing) +
@@ -5019,6 +5593,55 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
             "quote the real field list verbatim — do not paraphrase. You "
             "may elide fields with `/* ... */` but must not rename or "
             "retype the ones you keep."
+        )
+    if facts.get('struct_bodies_abridged'):
+        # Each entry is `"struct NAME (real definition has N top-level
+        # fields, draft body lists M with 0 overlap)"` — the struct
+        # itself exists, but the fenced ```c struct NAME { ... } ``` in
+        # the draft does not include any of its real top-level fields.
+        # That's the signature of paraphrasing the body from memory —
+        # the original `struct mbuf` failure mode (see
+        # FUTURE_IMPROVEMENTS.md, "Abridged-structs / overlap threshold"
+        # post-mortem). The body might have all-fabricated names that
+        # individually pass the bogus-field check (because they're
+        # plausible) but collectively bear no relation to the real
+        # struct.
+        issues.append(
+            "Struct bodies whose field set has zero overlap with the "
+            "real source definition: "
+            + "; ".join(facts['struct_bodies_abridged'])
+            + ". The struct exists, but the fenced ```c struct NAME "
+            "{ ... } ``` block you wrote does not include any of its "
+            "real top-level fields — that's the signature of "
+            "paraphrasing from memory. Open the defining header with "
+            "`read_freebsd_source` (or "
+            "`resolve_c_definition(symbol=\"struct NAME\")`) and quote "
+            "the real top-level field names verbatim. You may elide "
+            "fields with `/* ... */` (or write `/* fields elided */` "
+            "in a comment), but the named fields you keep MUST be ones "
+            "that exist in the real definition. Do NOT invent "
+            "plausible-sounding field names or rename real ones."
+        )
+    if facts.get('struct_field_refs_bogus'):
+        # Each entry is `"struct NAME->field"` — a member-access
+        # expression (in a code block) or a paraphrased
+        # `STRUCTNAME->FIELD` (in prose) that names a field which
+        # doesn't exist in the real struct. ch2 (Boot Process,
+        # 2026-05-02) shipped with `bi->bi_efi_memmap`,
+        # `bi->bi_efi_memmap_size`, `bootinfo->bi_modlist` even though
+        # `struct bootinfo` (sys/i386/include/bootinfo.h:48) has none
+        # of those fields. The fix is the same as for `struct_fields_bogus`:
+        # read the defining header before naming a field.
+        issues.append(
+            "Struct field references that name a non-existent field: "
+            + "; ".join(facts['struct_field_refs_bogus'])
+            + ". The struct exists but the field does not. Open the "
+            "defining header with `read_freebsd_source` (or call "
+            "`resolve_c_definition(symbol=\"struct NAME\")`) and verify "
+            "the real field name before referencing it. Either correct "
+            "the field name to a real one, or remove the sentence/line "
+            "that uses the fabricated field. Do NOT invent plausible-"
+            "sounding field names."
         )
     if facts['funcs_not_found']:
         issues.append(
