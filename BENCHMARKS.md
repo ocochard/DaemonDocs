@@ -212,6 +212,163 @@ endpoint is 2× slower than the others.)
 
 ---
 
+## run2 — 2026-05-02 (partial, interrupted)
+
+**Pipeline state at time of run:**
+
+- Still 9-criteria reviewer rubric (this run predates the 2026-05-02
+  Comparison-section removal — see run3 once that run lands).
+- LLM HTTP read timeout (600s) shipped 2026-05-01 (gap identified
+  in run1).
+- Struct-body fact-check added 2026-05-01: post-revision pass
+  that greps `freebsd-src` for the structs cited in
+  `## Key Data Structures` and asks the writer to fix any whose
+  field list disagrees with `sys/`.
+- Extended `_FACT_CHECK_IGNORE` denylist for cross-OS struct
+  names (`vm_area_struct`, `task_struct`, etc.) so passing
+  references in Comparison sections don't burn fact-fix steps.
+- Same 25 chapters in `chapters.yaml` as run1.
+- Topology change: dropped the `mac` endpoint; both runners now
+  drive the AMD Vulkan endpoints (fw, fw2). The script runs from
+  `bigone` and talks to remote llama-servers via OpenAI API —
+  see CLAUDE.md / CODE_MAP.md "Execution topology."
+
+**This run was interrupted at 13/22 attempted chapters** to apply
+the new Comparison-section removal (run3 picks up the rest with
+the new pipeline). Numbers below are valid for the 13 chapters
+that completed; treat the run as a snapshot, not a corpus.
+
+**Model used (both endpoints, identical):**
+
+- **GGUF**: `unsloth/Qwen3.6-35B-A3B-GGUF`,
+  `Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf` (Q8 vs run1's Q4)
+- **llama.cpp build**: `b8985-27aef3dd9` (unchanged from run1)
+- **Context**: 131072
+- **Sampling**: same as run1 (`temperature=0.6 top_p=0.95 top_k=20
+  min_p=0.0`, flash-attn on, batch 2048 / ubatch 512, parallel 1)
+
+### Endpoints
+
+| Endpoint | Hardware | OS | Backend | Driver |
+|---|---|---|---|---|
+| **fw** (192.168.100.7:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 128 GB | FreeBSD 16.0-CURRENT | Vulkan (`--device Vulkan0`) | Mesa RADV 24.1.7 |
+| **fw2** (192.168.100.136:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 122 GB | Ubuntu 24.04 / Linux 6.17.0-22-generic | Vulkan (`--device Vulkan0`) | Mesa RADV 25.2.8 |
+
+Same physical hardware as run1's fw1/fw2 — relabeled `fw`/`fw2` to
+match the current endpoint names (`framework`, `framework2`).
+
+### Per-endpoint speed
+
+| Endpoint | Successful | Failed | Total min | Avg min/ch | Min | Max |
+|---|---|---|---|---|---|---|
+| fw  |  7 | 0 |  592 | **84.5** |  69.5 | 120.2 |
+| fw2 |  6 | 0 |  607 | **101.2** | 35.4 | 243.2 |
+| **all** | **13** | **0** | **1199** | **92.2** | 35.4 | 243.2 |
+
+### Per-chapter detail
+
+```
+=== fw ===
+  ch  3    84.2 min   rc=0      VFS
+  ch  6    69.5 min   rc=0
+  ch  9    71.9 min   rc=0      GEOM
+  ch 11    74.4 min   rc=0
+  ch 12    92.3 min   rc=0
+  ch 13    79.2 min   rc=0      ZFS
+  ch 15   120.2 min   rc=0      Network Stack
+
+=== fw2 ===
+  ch  4    35.4 min   rc=0      Build System
+  ch  5    88.1 min   rc=0
+  ch  7    60.8 min   rc=0      Locking primitives
+  ch 10   243.2 min   rc=0      CAM (3 fact-fix rollbacks)
+  ch 14    57.8 min   rc=0
+  ch 16   121.8 min   rc=0      pf
+```
+
+### Headline findings
+
+1. **Q8 is slower than Q4 by ~25% wall-clock per chapter.**
+   Same hardware, same llama.cpp build, same prompts — quant
+   alone took the average from 60–63 min/ch (run1) to 84–101 min/ch
+   (run2). Expected: more bytes per weight, more memory bandwidth
+   pressure on iGPU.
+2. **Token budget exploded by ~55%.** Cumulative input+output
+   tokens averaged 25.6M/chapter on Q4 (run1) and 39.8M/chapter on
+   Q8 (run2). Q8 produces longer drafts and the reviewer calls
+   for more revisions on average.
+3. **Variance got worse.** ch10 hit 243 min with 3 fact-fix
+   rollbacks (writer kept fabricating `cam_periph` field names
+   that didn't survive `_struct_body_factcheck`). On Q4 the same
+   chapter ran 65 min. Q8's higher fluency confidently writes
+   wrong things — fact-check then catches them, and the rollback
+   path is expensive.
+4. **Grade quality did not improve.** Verified-rate and average
+   `criteria pass` count tracked Q4 within noise across the 13
+   shared chapters. The fluency upgrade did not buy measurable
+   accuracy on the 9-criteria rubric — confirming that the
+   accuracy bottleneck is grounding/fact-check, not the model's
+   prose ability. (The 2026-05-02 ch2 hallucination incident — Q8
+   confidently invented kernel-init function names that don't
+   exist in `freebsd-src` — is a representative case.)
+5. **Comparison-section failures dominated UNVERIFIED outcomes**,
+   same as run1. This was the trigger for removing the section
+   entirely (decision logged in `FUTURE_IMPROVEMENTS.md` and
+   `MEMORY.md`); the next run will be on a 7-section / 8-criteria
+   pipeline.
+
+### Comparison with run1 (Q4 → Q8, same hardware)
+
+For the 13 chapters present in both runs:
+
+| Metric | run1 (Q4) | run2 (Q8) | Δ |
+|---|---|---|---|
+| Avg wall-clock min/ch | ~72 | ~92 | **+28%** |
+| Avg cumulative tokens/ch (input+output) | 25.6M | 39.8M | **+55%** |
+| Avg reviewer score | 7.7 / 9 | 7.8 / 9 | ≈ 0 |
+| Worst-chapter wall-clock | 130.8 (ch20, fw1) | 243.2 (ch10, fw2) | **+86%** |
+| Verified-on-final-pass rate | low (~16%) | low (~15%) | ≈ 0 |
+
+**Takeaway:** Q8 is a clear regression on this workload. It
+costs +55% tokens and +28% wall-clock for no measurable accuracy
+gain. The fluency upgrade buys more confident prose, which on a
+fact-grounded book is actively harmful when paired with weak
+grounding (more plausible-sounding hallucinations to catch).
+
+The next run (run3) will combine **rolling back to Q4** with the
+**Comparison-section removal** to isolate the pipeline gain
+(8-criteria rubric, 7-section default) from the model change.
+
+### Failure modes observed during this run
+
+- **Fact-fix rollback hot loop on ch10 (CAM).** Writer cited
+  `cam_periph::periph_links` field that doesn't exist; revision
+  cycle reintroduced the same error twice. `best_fails`-based
+  rollback eventually picked the least-bad draft. Open issue:
+  fact-fix doesn't pin which structs are confirmed-real before
+  the revision step, so the writer "creatively" reconstructs
+  field names from prose context.
+- **Comparison-section claims still unverifiable.** As in run1,
+  ~22 chapters scored `comparison_quality: FAIL`. Resolved
+  upstream by removing the section (run3+).
+- **No JSON-decode crashes** — the run1 fix held.
+- **No HTTP stalls** — the run1 timeout fix held.
+
+### Reproduction
+
+K8 logs live on `framework` under `/tmp/regen-queue/run*-archive*/`.
+Pull them locally for analysis:
+
+```bash
+rsync -av framework:/tmp/regen-queue/ /tmp/k8-archive/
+```
+
+Then parse with the same script as run1. The runner-log timestamp
+format on this run is ISO (`[fw 2026-05-02T08:14:33+0200]`); adjust
+the regex/strptime accordingly.
+
+---
+
 ## How to add a new run
 
 When generating a corpus with a different model (or a meaningfully

@@ -4021,6 +4021,111 @@ def _dedupe_see_also_section(content: str) -> Tuple[str, int]:
     return content[:body_start] + "\n".join(out) + content[body_end:], dropped
 
 
+# Backtick-wrapped path inside a list-item line in See Also. Captures the
+# path (and only the path) so we can verify it exists on disk before
+# turning it into a markdown link. We deliberately match only inside list
+# items (leading bullet) — bare backtick paths in prose elsewhere are
+# inline code references, not navigation, and rewriting them would change
+# meaning. The lookahead/lookbehind on `[` and `]` skips paths that are
+# already inside a markdown link (idempotency).
+_BACKTICK_PATH_RE = re.compile(
+    r"(?<!\[)`("
+    # Path with extension: foo/bar.c, baz.h, etc.
+    r"[A-Za-z0-9_./+-]+\.[A-Za-z0-9]+"
+    # Path ending in a slash (directory marker): sys/kern/
+    r"|[A-Za-z0-9_./+-]+/"
+    # Slash-bearing extensionless path: tests/README, gnu/COPYING.
+    # Final _exists() check still gates this — false positives in
+    # prose only become real links if they happen to name a file
+    # under SRC_ROOT, which is acceptably rare in See Also context.
+    r"|[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)+"
+    r")`(?!\])"
+)
+
+
+def _link_see_also_source_paths(
+    content: str, current_file: str,
+) -> Tuple[str, int]:
+    """Wrap bare backtick source-file paths in See Also as relative
+    markdown links. Returns ``(new_content, linked_count)``.
+
+    Browser-readable rendering: the writer emits canonical paths from the
+    repo root (e.g. ``sys/kern/kern_mutex.c``) inside backticks, but
+    backticks are not clickable. A reader looking at the rendered README
+    on GitHub / cgit / a local file:// browser cannot jump to the source
+    file the way they can jump to a sibling chapter README.
+
+    We rewrite each bare backtick path that
+      1. lives inside the ``## See Also`` section,
+      2. is on a list-item line,
+      3. is not already inside a markdown link, and
+      4. resolves to an existing file or directory under SRC_ROOT
+    into ``[`canonical/path`](relpath)`` where ``relpath`` is computed
+    from the chapter's directory.
+
+    Out-of-scope on purpose:
+      - Backtick paths outside See Also (Architecture/Deep Dive prose
+        uses backticks as inline code, not as navigation).
+      - Paths that don't exist on disk (we don't fabricate links).
+      - Paths inside fenced code blocks (the regex won't match list-item
+        bullets there — code blocks don't start lines with ``- ``).
+    Idempotent — re-running on already-linked content is a no-op because
+    the regex skips paths already wrapped in ``[ ... ]``.
+    """
+    # Accept either a leading `## See Also` (file starts with the
+    # heading — rare, but happens in tests / minimal inputs) or the
+    # normal `\n## See Also` mid-document case.
+    if content.startswith("## See Also"):
+        body_start_tag = 0
+    else:
+        sa = content.find("\n## See Also")
+        if sa == -1:
+            return content, 0
+        body_start_tag = sa + 1  # position of '#' itself
+    body_start = content.find("\n", body_start_tag + len("## See Also"))
+    if body_start == -1:
+        return content, 0
+    body_start += 1
+    next_h2 = re.search(r"(?m)^## ", content[body_start:])
+    body_end = body_start + next_h2.start() if next_h2 else len(content)
+
+    current_dir = os.path.dirname(current_file)
+    linked = 0
+
+    def _exists(path: str) -> bool:
+        # Both files and directories are valid link targets; reject
+        # absolute paths or anything escaping SRC_ROOT.
+        if path.startswith("/") or ".." in path.split("/"):
+            return False
+        full = os.path.join(SRC_ROOT, path)
+        return os.path.exists(full)
+
+    out_lines: List[str] = []
+    for line in content[body_start:body_end].split("\n"):
+        # Only rewrite list-item lines. Bare-backtick paths in headings
+        # or prose paragraphs in See Also (rare) stay untouched.
+        if not re.match(r"^\s*[-*]\s", line):
+            out_lines.append(line)
+            continue
+
+        def _sub(m: "re.Match") -> str:
+            nonlocal linked
+            path = m.group(1)
+            if not _exists(path):
+                return m.group(0)
+            relpath = os.path.relpath(
+                path, start=current_dir if current_dir else "."
+            )
+            linked += 1
+            return f"[`{path}`]({relpath})"
+
+        out_lines.append(_BACKTICK_PATH_RE.sub(_sub, line))
+
+    if linked == 0:
+        return content, 0
+    return content[:body_start] + "\n".join(out_lines) + content[body_end:], linked
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """Extract a JSON object from LLM output (may have prose around it).
 
@@ -5988,6 +6093,17 @@ def build_navigation(chapters: List[dict]) -> dict:
             print(
                 f"  [links] {output_file}: rewrote {_ln_rewrote}, "
                 f"dropped {_ln_dropped} broken .md link(s)"
+            )
+
+        # Wrap bare backtick source-file paths in See Also as relative
+        # markdown links so the rendered README is clickable in a browser.
+        content, _src_linked = _link_see_also_source_paths(
+            content, output_file,
+        )
+        if _src_linked:
+            print(
+                f"  [links] {output_file}: linked {_src_linked} "
+                f"See Also source path(s)"
             )
 
         updated[output_file] = content

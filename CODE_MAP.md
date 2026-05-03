@@ -48,7 +48,10 @@ The file is divided by `# ---` banner comments. In source order:
 (Two more banner sections follow that aren't part of the
 per-chapter pipeline: **Cross-README navigation** —
 `build_navigation`, `_add_see_also_links`,
-`_build_chapter_rels` — and **Chapter index** —
+`_build_chapter_rels`, `_sanitize_chapter_links` (broken `.md`
+link repair), `_link_see_also_source_paths` (wrap bare backtick
+source paths in See Also as relative markdown links so READMEs
+are clickable in a browser) — and **Chapter index** —
 `build_chapter_index`, `_extract_glossary_terms`. These run
 once at the end of `main()`. Chapter relationships are
 derived from `chapters.yaml` (`related:` per chapter, or
