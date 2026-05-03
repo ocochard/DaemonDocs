@@ -4675,8 +4675,11 @@ _FACT_CHECK_CACHE: Dict[Tuple[str, str, str], bool] = {}
 # Single-call timeout for the batched grep. The previous code spent up to
 # 5 s per symbol; one batched grep with -m1 short-circuiting per file is
 # fast even on the full sys/ tree, so a tighter timeout is safe and bounds
-# the total cost.
-_GREP_TIMEOUT_SEC = 8
+# the total cost. Bumped 8→30 on 2026-05-03 after ch13 (ZFS) timed out:
+# the 55MB openzfs contrib subtree (~1100 C files) can't be batched-grepped
+# in 8s. 30s is still a hard ceiling — at that point the symbols are
+# treated as unverified, which cascades into reviewer accuracy:FAIL.
+_GREP_TIMEOUT_SEC = 30
 
 
 def _batched_grep_present(symbols: List[str], pattern_template: str,
