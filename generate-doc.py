@@ -3146,6 +3146,20 @@ def create_writer_agent(index: TfidfIndex):
         # draft / revise / fact-fix, so wide chapters need headroom for
         # all three.
         max_steps=80,
+        # Stream tokens as they arrive instead of awaiting the whole
+        # response in one shot. Two reasons:
+        #   1. Hang detection. 2026-05-03 ch13 wedged on fw2: llama-server
+        #      finished generating, the response (or trailing chunk) was
+        #      lost on the wire, and the non-streaming `chat.completions.
+        #      create(...)` call sat in httpx read forever — single-float
+        #      `timeout=600s` reset on every byte received and never tripped.
+        #      Streaming raises an httpx ReadTimeout if no chunk arrives for
+        #      `read` seconds, surfacing the hang as APITimeoutError that
+        #      the existing run_chapter except clause catches.
+        #   2. Live progress in the per-chapter log: each token shows up
+        #      immediately, so `tail -f /tmp/regen-queue/<lbl>-ch<N>.log`
+        #      shows real activity instead of multi-minute silences.
+        stream_outputs=True,
     )
 
 
@@ -3168,6 +3182,9 @@ def create_reviewer_agent(index: TfidfIndex):
         model=model,
         additional_authorized_imports=["json", "re"],
         max_steps=15,
+        # See create_writer_agent for the rationale — streams tokens so
+        # an httpx read-gap raises ReadTimeout instead of wedging the run.
+        stream_outputs=True,
     )
 
 
