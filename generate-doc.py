@@ -2664,6 +2664,25 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         {symbol_block}
         {macro_block}
         {scope_guard_block}
+        ## How You Operate (Sandbox Rules)
+
+        You are running in a constrained Python sandbox. You have NO
+        file-I/O tools, NO source-tree tools, NO subprocess, NO network.
+        The draft is already in this prompt — it's the only material
+        you need to grade. Specifically, do NOT attempt:
+        - `open()`, `read()`, `write()`, `Path.read_text()`, etc. —
+          all raise `InterpreterError: Forbidden function evaluation`
+          and burn a step.
+        - `os.path.exists`, `os.listdir`, `glob`, `subprocess.run` —
+          same, all forbidden.
+        - "Let me check the source to verify…" — you can't. The
+          Verified blocks above ARE the source-tree ground truth for
+          this review.
+        Your only authorized imports are `json` and `re`. Use them
+        only if you need to parse or pattern-match within the draft
+        text in your input. Most reviews need no code at all — just
+        emit the JSON verdict via `final_answer(...)` directly.
+
         ## Review Rubric
 
         Grade each criterion PASS / FAIL with a brief explanation:
@@ -3181,7 +3200,15 @@ def create_reviewer_agent(index: TfidfIndex):
         ],
         model=model,
         additional_authorized_imports=["json", "re"],
-        max_steps=15,
+        # 15 was generous and turned into a foot-gun: ch11 review pass 3
+        # on 2026-05-03 burned 1h+ of fw on a single step that produced
+        # 121K tokens of thinking with no parsed code, then ran into
+        # repeated InterpreterError on forbidden open() calls (the
+        # reviewer has no file I/O — see the prompt guard added in the
+        # same change). A reviewer that hasn't issued a verdict by step
+        # 5 is going to ship UNVERIFIED regardless; capping early frees
+        # the queue faster on bad chapters.
+        max_steps=5,
         # See create_writer_agent for the rationale — streams tokens so
         # an httpx read-gap raises ReadTimeout instead of wedging the run.
         stream_outputs=True,
