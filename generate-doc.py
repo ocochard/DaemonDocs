@@ -4126,6 +4126,190 @@ def _link_see_also_source_paths(
     return content[:body_start] + "\n".join(out_lines) + content[body_end:], linked
 
 
+# Inline man-page reference: `name(N)` where N is 1..9 (optional
+# trailing letter for subsections like 3lua, 9a). The name must start
+# with a letter or underscore; we allow dots/hyphens/underscores in the
+# middle so refs like `cap_enter(2)`, `pf.conf(5)`, `link-elf(8)`
+# match. Anchored with a non-word lookbehind so we don't match the
+# tail of a longer identifier (e.g. `frob_O(1)` shouldn't match).
+_MANREF_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"([A-Za-z_][A-Za-z0-9_+.-]*)\(([1-9][a-z]*)\)"
+)
+
+# Matches any fenced code block (``` … ```), used to mask out regions
+# where we should NOT rewrite man references (the content is sample
+# code, not prose).
+_FENCED_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+
+
+def _build_manpage_index(src_root: str) -> Dict[str, str]:
+    """Walk `src_root` once and return ``{ "name(N)": relpath }`` for
+    every plausible man-page file.
+
+    "Plausible" means filename matches `<stem>.<section>` where stem
+    starts with a letter/underscore and section is `[1-9][a-z]*`. This
+    rejects the noise files (`RELEASE-4.4`, version strings ending in
+    a digit) that share the suffix shape.
+
+    On collisions (same `name(N)` in multiple paths — common in the
+    OpenSSL contrib tree), the tiebreaker is:
+      1. Prefer paths under `share/man/manN/` (the canonical source).
+      2. Otherwise, take the first one walked.
+
+    Builds the index lazily and caches in `_MANPAGE_INDEX_CACHE` keyed
+    by `src_root`. Only invalidated when the process restarts; safe
+    because `freebsd-src` doesn't change underneath us inside one
+    Phase 4 invocation.
+    """
+    cached = _MANPAGE_INDEX_CACHE.get(src_root)
+    if cached is not None:
+        return cached
+
+    name_re = re.compile(r"^([A-Za-z_][A-Za-z0-9_+.-]*)\.([1-9][a-z]*)$")
+    index: Dict[str, str] = {}
+
+    for dirpath, _dirs, files in os.walk(src_root):
+        for fn in files:
+            m = name_re.match(fn)
+            if not m:
+                continue
+            stem, section = m.group(1), m.group(2)
+            key = f"{stem}({section})"
+            full = os.path.join(dirpath, fn)
+            relpath = os.path.relpath(full, src_root)
+            existing = index.get(key)
+            if existing is None:
+                index[key] = relpath
+                continue
+            # Collision — prefer canonical share/man/man<N>/ location.
+            canon_prefix = f"share/man/man{section[0]}/"
+            if relpath.startswith(canon_prefix) and not existing.startswith(canon_prefix):
+                index[key] = relpath
+            # Otherwise keep the existing one.
+
+    _MANPAGE_INDEX_CACHE[src_root] = index
+    return index
+
+
+# Per-process cache for `_build_manpage_index`. Keyed by SRC_ROOT
+# string so a different `--src-root` invocation rebuilds correctly.
+_MANPAGE_INDEX_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _link_manpage_refs(
+    content: str, current_file: str,
+) -> Tuple[str, int]:
+    """Wrap inline ``name(N)`` man-page references as relative markdown
+    links to the corresponding source-tree man-page file. Returns
+    ``(new_content, linked_count)``.
+
+    Browser-readable rendering: chapter prose mentions man pages
+    constantly (``src.conf(5)``, ``ngctl(8)``, ``mbuf(9)``) but the
+    rendered markdown shows them as plain text. This rewriter turns
+    them into clickable links to the unformatted mdoc source under
+    ``freebsd-src``. The reader can `make` the man page locally or
+    cross-reference to ``man.freebsd.org`` themselves; we link to the
+    source on disk so the link works offline and is self-contained.
+
+    Behavior:
+      1. Skip fenced code blocks (mask them out before scanning).
+      2. Skip refs that already sit inside a markdown link
+         ``[label](target)`` — the post-link content can include the
+         text ``foo(N)`` but we don't double-wrap.
+      3. Skip refs whose name doesn't resolve in the man-page index.
+         False positives like ``O(1)`` (algorithmic complexity) get
+         filtered for free because no `O.1` file exists.
+
+    Idempotent: re-running on already-linked content is a no-op
+    because the inside-link skip handles it.
+
+    Out-of-scope on purpose: rewriting man refs that the writer
+    accidentally placed inside backticks (e.g. `` `src.conf(5)` ``)
+    — left untouched because they're styled as inline code. If the
+    user wants those linked too, drop the backticks at the writer
+    level rather than here.
+    """
+    index = _build_manpage_index(SRC_ROOT)
+    if not index:
+        return content, 0
+
+    current_dir = os.path.dirname(current_file)
+
+    # Mask fenced code blocks: replace each block with placeholders
+    # that the regex won't touch, then restore after rewriting.
+    fences: List[str] = []
+
+    def _stash_fence(m: "re.Match") -> str:
+        fences.append(m.group(0))
+        return f"\x00FENCE{len(fences) - 1}\x00"
+
+    masked = _FENCED_BLOCK_RE.sub(_stash_fence, content)
+
+    # Build a set of (start, end) offsets inside markdown links
+    # `[label](target)` — both the label region AND the target
+    # region — so the man-ref regex can skip matches inside them.
+    # Without this, ``[src.conf](https://...src.conf(5)...)`` would
+    # get nested-rewritten.
+    link_spans: List[Tuple[int, int]] = []
+    for m in re.finditer(r"\[[^\]]*\]\([^)]*\)", masked):
+        link_spans.append((m.start(), m.end()))
+
+    def _in_link(pos: int) -> bool:
+        # Linear scan is fine — typical chapter has < 50 links and
+        # < 50 man refs.
+        for s, e in link_spans:
+            if s <= pos < e:
+                return True
+        return False
+
+    linked = 0
+    out_parts: List[str] = []
+    last = 0
+    for m in _MANREF_RE.finditer(masked):
+        if _in_link(m.start()):
+            continue
+        key = f"{m.group(1)}({m.group(2)})"
+        target_rel_to_src = index.get(key)
+        if target_rel_to_src is None:
+            continue
+        target = os.path.relpath(
+            target_rel_to_src,
+            start=current_dir if current_dir else ".",
+        )
+        # Preserve inline-code styling: if the ref is wrapped in single
+        # backticks (`src.conf(5)`), produce `[`src.conf(5)`](path)`
+        # so the styling survives. Without this, naive replacement
+        # would output ``[src.conf(5)](path)`` — backticks outside the
+        # link, which renders as literal text in most md engines.
+        ref_start = m.start()
+        ref_end = m.end()
+        wrapped = (
+            ref_start > 0
+            and ref_end < len(masked)
+            and masked[ref_start - 1] == "`"
+            and masked[ref_end] == "`"
+        )
+        if wrapped:
+            out_parts.append(masked[last:ref_start - 1])
+            out_parts.append(f"[`{key}`]({target})")
+            last = ref_end + 1
+        else:
+            out_parts.append(masked[last:ref_start])
+            out_parts.append(f"[{key}]({target})")
+            last = ref_end
+        linked += 1
+    out_parts.append(masked[last:])
+    new_masked = "".join(out_parts)
+
+    # Restore fences.
+    def _restore(m: "re.Match") -> str:
+        return fences[int(m.group(1))]
+    new_content = re.sub(r"\x00FENCE(\d+)\x00", _restore, new_masked)
+
+    return new_content, linked
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """Extract a JSON object from LLM output (may have prose around it).
 
@@ -6104,6 +6288,17 @@ def build_navigation(chapters: List[dict]) -> dict:
             print(
                 f"  [links] {output_file}: linked {_src_linked} "
                 f"See Also source path(s)"
+            )
+
+        # Wrap inline `name(N)` man-page references as relative links
+        # to the source-tree mdoc file (e.g. `src.conf(5)` →
+        # `share/man/man5/src.conf.5`). Whole body, not just See Also,
+        # because chapter prose mentions man pages constantly.
+        content, _man_linked = _link_manpage_refs(content, output_file)
+        if _man_linked:
+            print(
+                f"  [links] {output_file}: linked {_man_linked} "
+                f"man-page reference(s)"
             )
 
         updated[output_file] = content
