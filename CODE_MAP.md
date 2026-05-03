@@ -101,7 +101,7 @@ pattern.
 | Want to... | Edit | Pattern to follow |
 |---|---|---|
 | Add a writer rule (e.g. forbid a phrasing) | `build_chapter_prompt` | The existing **Rules:** block, then the **Quote, don't paraphrase** block. Each rule names the failure mode + names the right instinct + gives a concrete example. |
-| Add a reviewer rubric criterion | `build_review_prompt` | Add to the numbered rubric AND to the JSON output schema (`"criteria": { ... }`) AND to the gate. The gate is `_review_passes`, which iterates `criteria.values()` — adding a key there is automatic. The fail-counter `_criteria_fail_count` hard-codes the current count (`9`) for the "broken JSON" worst-case; bump it if you add criteria. Also bump the `N - fail_count`/`/N` print formatting in `run_chapter`'s review loop and rollback log, and the `best_fails = N+1` initializer (one more than the max possible). If the criterion is conditional (only fires when a certain section is present), gate it on `"Section Name" in sections` and emit a `PASS: not required` JSON line in the off branch — see the `wants_diagram` (Mermaid) and `wants_comparison` (Comparison Quality) gates as templates. |
+| Add a reviewer rubric criterion | `build_review_prompt` | Add to the numbered rubric AND to the JSON output schema (`"criteria": { ... }`) AND to the gate. The gate is `_review_passes`, which iterates `criteria.values()` — adding a key there is automatic. The fail-counter `_criteria_fail_count` hard-codes the current count (`8`) for the "broken JSON" worst-case; bump it if you add criteria. Also bump the `N - fail_count`/`/N` print formatting in `run_chapter`'s review loop and rollback log, and the `best_fails = N+1` initializer (one more than the max possible). If the criterion is conditional (only fires when a certain section is present), gate it on `"Section Name" in sections` and emit a `PASS: not required` JSON line in the off branch — the `wants_diagram` (Mermaid) gate is the canonical example. |
 | Inject ground truth into the reviewer | `build_review_prompt` | Pre-validate before the prompt is rendered, build a `verified_FOO_block` string, interpolate it alongside the existing `verified_block` / `symbol_block` / `macro_block`. The Accuracy criterion and the **No hedges** block reference these blocks by name — update both when adding a new ground-truth category. |
 | Inject ground truth into the writer | `_build_symbol_catalog` (called by `build_chapter_prompt`) | Pre-extract real symbol names from the chapter's `source_files` + bounded `source_dirs` sample, render an `## Authoritative Symbol Catalog` block. Caps live in `_CATALOG_MAX_*` and `_CATALOG_FILES_PER_DIR` — keep them tight; this is prompt-cost, not fact-check-cost. To add a new symbol kind, extend `_dirmap_extract_names` (which is shared with `directory_map`). |
 | Add a new section type (output template) | `_SECTION_CATALOG` | Each entry has `template_body`, `rubric_body`. Per-chapter section list comes from `_chapter_sections(chapter)` reading `sections:` in `chapters.yaml`. |
@@ -129,10 +129,14 @@ pattern.
   `issues`** — see `_review_passes` docstring. `grade` and
   `issues` are intentionally ignored; real defects must surface
   as a FAIL criterion.
-- **`_strip_comparison_section` runs before symbol extraction** —
-  the `## Comparison` section legitimately mentions
-  Linux/macOS/NetBSD names which would otherwise be flagged as
-  hallucinated.
+- **`_strip_comparison_section` is a legacy-content safety net** —
+  the mandatory `## Comparison` section was removed from the
+  pipeline in 2026-05 (cross-OS claims were the dominant source
+  of unverifiable hallucination). New chapters don't produce the
+  section, so the stripper is a no-op for fresh drafts. It still
+  runs before symbol extraction so on-disk drafts written before
+  the section was removed don't false-positive on Linux/macOS
+  symbol names during re-fact-check passes.
 - **`_extract_function_names` requires `()` evidence** — bare
   backticked identifiers are skipped because they're dominated
   by struct fields, type names, sysctls, and parameter names.

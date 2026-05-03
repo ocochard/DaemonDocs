@@ -998,6 +998,35 @@ comparison bullet (book reference or non-FreeBSD source path)"* —
 remains infeasible without a non-FreeBSD source corpus and is
 unlikely to ship.
 
+**SUPERSEDED 2026-05-02 — the mandatory Comparison section was
+removed entirely.** Even with the comparison-quality criterion in
+place, the K8 overnight regen left ~22 chapters UNVERIFIED, and the
+dominant failure mode was still cross-OS hallucination: the writer
+either emitted tautologies that scored FAIL or fabricated Linux/
+NetBSD/OpenBSD internals that the deterministic FreeBSD-source fact-
+checker couldn't grade either way (`_strip_comparison_section`
+exempts the region by design). User considered downloading Linux/
+NetBSD/OpenBSD sources but rejected it: comparison claims are
+*behavioral*, not symbolic — even with sources on disk, deterministic
+grep can't verify "Linux's vm_area_struct fragments more aggressively
+than FreeBSD's vm_map under fork." Symbol-existence checks would
+catch a small fraction of what comparison claims assert.
+
+Removing the section entirely eliminated this class of hallucination
+at the source: no prompt for cross-OS commentary, no review
+criterion grading it, no fact-checker-shaped exemption. The default
+section list dropped from 8 to 7 sections; the rubric from 9 to 8
+criteria. The training-data contamination warning to the writer
+("Linux/NetBSD/OpenBSD field names slip in even when you don't
+mention those OSes by name") stays — that's about FreeBSD-symbol
+verification, not comparison-section content. `_strip_comparison_
+section` is kept as a no-op safety net for legacy on-disk drafts
+during touch-up fact-check passes.
+
+Chapters that legitimately benefit from a small in-line analogy can
+include it within Architecture or Advanced Notes (no separately-
+graded section, no auto-fill pressure).
+
 ### [PARTIALLY DONE — shipped 2026-05-02] Struct-snippet faithfulness — code blocks can disagree with prose, nothing checks the layout
 
 Observed on `sys/sys/README_mbuf.md` (chapter 26, generated 2026-05-01,
@@ -1138,9 +1167,12 @@ What's still open:
   brace in `stand/common/bootstrap.h:230`). Forward declarations and
   pointer uses are still rejected. Regression test added to
   `test_hallucination_factcheck.py` (Test 11b).
-- **Comparison-section claims.** `_strip_comparison_section` deliberately
-  exempts that section. ch2's NetBSD/Linux/macOS comparison rows still
-  ship without verification.
+- **Comparison-section claims.** ~~`_strip_comparison_section`
+  deliberately exempts that section. ch2's NetBSD/Linux/macOS
+  comparison rows still ship without verification.~~ **Resolved
+  2026-05-02 by removing the mandatory Comparison section
+  entirely.** See the SUPERSEDED note at the top of this file for
+  rationale.
 - **Verifier scope `sys/` only — DONE-with-caveats (2026-05-02).** Per-
   chapter `extra_search_dirs:` knob added. ch2 (Boot Process) sets
   `extra_search_dirs: ["stand"]` so `preloaded_file`, `file_metadata`,

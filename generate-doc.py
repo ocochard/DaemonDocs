@@ -1899,29 +1899,26 @@ _SECTION_CATALOG = {
         ),
         "rubric_body": "DTrace, performance, pitfalls (advanced)",
     },
-    "Comparison": {
-        "template_body": (
-            "(How other OSes implement the same concept. Focus on Linux: note\n"
-            "key structural differences — e.g., FreeBSD's vm_map vs Linux's\n"
-            "vm_area_struct, UMA vs SLUB, sx locks vs rw_semaphore. Also mention\n"
-            "macOS/XNU, NetBSD, or OpenBSD where relevant. Keep it brief — 2-4\n"
-            "paragraphs. Do not fabricate Linux file paths or line numbers.)"
-        ),
-        "rubric_body": "Linux/macOS/NetBSD structural differences",
-    },
     "See Also": {
         "template_body": "(related chapters and source directories to explore next)",
         "rubric_body": "related chapters/directories",
     },
 }
 
-# Default section order, matching the original 8 H2 sections (plus the H1
+# Default section order, matching the original 7 H2 sections (plus the H1
 # title that's added separately by the prompt). Chapters that don't declare
 # a `sections:` list get this set, preserving backward-compatible behaviour
 # for chapters defined before the per-chapter override existed.
+#
+# The mandatory `## Comparison` section was removed in 2026-05: it was the
+# dominant source of unverifiable hallucinations (cross-OS claims that the
+# deterministic FreeBSD-source fact-checker cannot grade), and the writer
+# has no way to verify them either. Chapters that legitimately benefit from
+# a small in-line analogy can include it within Architecture or Advanced
+# Notes; a separately-graded section produced more harm than good.
 _DEFAULT_SECTIONS = [
     "Quick Summary", "Architecture", "Key Data Structures", "Deep Dive",
-    "Flow / Diagram", "Advanced Notes", "Comparison", "See Also",
+    "Flow / Diagram", "Advanced Notes", "See Also",
 ]
 
 
@@ -2651,46 +2648,6 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         )
         mermaid_json_line = '            "mermaid_diagram": "PASS: not required",\n'
 
-    # Comparison-quality criterion is conditional: chapters that opt out of
-    # the `## Comparison` section (via `sections:` in chapters.yaml) get an
-    # automatic PASS so revisions don't loop on a section that won't exist.
-    # When Comparison IS present, the reviewer is asked to flag the two
-    # specific failure modes seen in real runs:
-    #   1. Tautology — "X uses Y while Z uses Y" (no actual contrast).
-    #   2. Unsupported cross-OS claim — assertions about Linux/macOS/NetBSD
-    #      internals presented as fact with no concrete differentiator.
-    # The reviewer has no cross-OS source corpus, so this is shape-matching
-    # against the draft, not fact-checking against external sources.
-    wants_comparison = "Comparison" in sections
-    if wants_comparison:
-        comparison_criterion = (
-            "        9. **Comparison Quality** — In the `## Comparison` section, every\n"
-            "           contrastive statement must identify a CONCRETE difference. FAIL if\n"
-            "           you find any of:\n"
-            "             - **Tautology:** statements of the form *\"FreeBSD uses X while\n"
-            "               OS_Y also uses X\"* — the claimed contrast is empty (e.g.\n"
-            "               *\"FreeBSD's vm_map is a red-black tree, while Linux uses a\n"
-            "               red-black tree\"*).\n"
-            "             - **Unsupported cross-OS claim:** assertions about Linux / macOS\n"
-            "               / NetBSD / OpenBSD internals stated as fact without naming a\n"
-            "               concrete differentiator (e.g. *\"NetBSD uses SLAB while FreeBSD\n"
-            "               uses UMA\"* — collapses a multi-axis design difference into a\n"
-            "               wrong one-liner).\n"
-            "             - **Vague contrast:** *\"Linux handles this differently\"* with\n"
-            "               no specifics — no struct name, no algorithm name, nothing the\n"
-            "               reader could go look up.\n"
-            "           Quote the offending sentence(s) in `issues` so the writer can rewrite\n"
-            "           or remove them. PASS if every Comparison bullet either gives a\n"
-            "           concrete difference or is removed.\n"
-        )
-        comparison_json_line = '            "comparison_quality": "PASS/FAIL: reason (quote any tautology/unsupported claim)",\n'
-    else:
-        comparison_criterion = (
-            "        9. **Comparison Quality** — N/A for this chapter (no Comparison\n"
-            "           section). Always grade `comparison_quality` as `PASS: not required`.\n"
-        )
-        comparison_json_line = '            "comparison_quality": "PASS: not required",\n'
-
     return textwrap.dedent(f"""\
         You are reviewing a draft chapter for "FreeBSD Internals."
         Your job is to find problems — be strict but fair.
@@ -2773,7 +2730,6 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            rationale — apply this only where a junior reader would
            reasonably ask "but why is it built that way?"
 
-{comparison_criterion}
         ## Draft to Review
 
         {draft}
@@ -2791,8 +2747,8 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
 {mermaid_json_line}            "accessibility": "PASS/FAIL: reason",
             "structure": "PASS/FAIL: reason",
             "no_marketing": "PASS/FAIL: reason (quote any offending sentences)",
-            "rationale": "PASS/FAIL: reason (quote the paragraph if FAIL)",
-{comparison_json_line}          }},
+            "rationale": "PASS/FAIL: reason (quote the paragraph if FAIL)"
+          }},
           "issues": [
             "Specific issue 1 with actionable fix",
             "Specific issue 2 with actionable fix"
@@ -3271,11 +3227,10 @@ def _criteria_fail_count(criteria: object) -> int:
     null or list values. Treat anything non-string as a failure (safer
     default for the summary line).
     """
-    # 9 criteria total: completeness, accuracy, source_coverage,
-    # mermaid_diagram, accessibility, structure, no_marketing, rationale,
-    # comparison_quality.
+    # 8 criteria total: completeness, accuracy, source_coverage,
+    # mermaid_diagram, accessibility, structure, no_marketing, rationale.
     if not isinstance(criteria, dict):
-        return 9
+        return 8
     fails = 0
     for v in criteria.values():
         if not isinstance(v, str) or v.startswith("FAIL"):
@@ -3461,15 +3416,15 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         # last (worse) draft. Instead we keep the draft from the round
         # with the fewest FAIL criteria; ties go to the *later* round
         # (later drafts have had more issues addressed even if criteria
-        # count is unchanged). best_fails starts at 10 — strictly worse
-        # than any real review (max possible is 9) — so the very first
+        # count is unchanged). best_fails starts at 9 — strictly worse
+        # than any real review (max possible is 8) — so the very first
         # graded draft always wins on first comparison.
         warnings: List[str] = []
         revision = 0
         approved = False
         parse_retry_used = False
         best_draft = draft
-        best_fails = 10
+        best_fails = 9
         best_round = 0
         last_fails: Optional[int] = None  # fail_count of the most recent graded round
 
@@ -3502,7 +3457,7 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             criteria = review_json.get("criteria", {}) or {}
 
             fail_count = _criteria_fail_count(criteria)
-            print(f"         grade={grade}  ({9 - fail_count}/9 criteria pass)")
+            print(f"         grade={grade}  ({8 - fail_count}/8 criteria pass)")
             # Print every issue and every praise — truncating these hides
             # the diagnostic information needed to figure out why the
             # reviewer didn't approve. The log is verbose by design.
@@ -3570,13 +3525,13 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 and last_fails > best_fails
             ):
                 print(f"  [rollback] revision {revision} regressed "
-                      f"({9 - last_fails}/9) — using revision {best_round} "
-                      f"({9 - best_fails}/9) instead")
+                      f"({8 - last_fails}/8) — using revision {best_round} "
+                      f"({8 - best_fails}/8) instead")
                 draft = best_draft
                 warnings.append(
                     f"revisions regressed; kept revision {best_round} "
-                    f"({9 - best_fails}/9 criteria) over revision {revision} "
-                    f"({9 - last_fails}/9)"
+                    f"({8 - best_fails}/8 criteria) over revision {revision} "
+                    f"({8 - last_fails}/8)"
                 )
 
         # ---- Fact-checking pass ----
@@ -4188,9 +4143,12 @@ _FACT_CHECK_IGNORE = frozenset({
     "TDP_NOFAULTING",
     # Generic kernel sysctls / runtime knobs commonly referenced
     "bootverbose", "kdb", "ddb",
-    # Linux structs / funcs that legitimately appear in Comparison sections
-    # (they don't exist in the FreeBSD tree, but flagging them as
-    # "missing" wastes a fact-fix step).
+    # Linux/macOS structs and funcs the writer occasionally mentions in
+    # passing prose (e.g. a one-line analogy in Architecture or Advanced
+    # Notes). They don't exist in the FreeBSD tree, but flagging them as
+    # "missing" wastes a fact-fix step. The mandatory `## Comparison`
+    # section that used to require these names was removed in 2026-05;
+    # this denylist remains as cheap insurance against passing references.
     "vm_area_struct", "task_struct", "rw_semaphore", "rwsem",
     "start_kernel", "device_initcall", "core_initcall",
     "postcore_initcall", "module_init", "subsys_initcall",
@@ -4218,6 +4176,14 @@ _MACRO_PREFIX_RE = re.compile(
 # describe other OSes (Linux, macOS, NetBSD, OpenBSD) and must NOT be
 # verified against the FreeBSD source tree — every Linux struct flagged
 # as "missing" is a false positive that wastes a fact-fix step.
+#
+# Legacy-content safety net: the mandatory `## Comparison` section was
+# removed from the pipeline in 2026-05. New chapters won't have this
+# heading, so the regex is a no-op for them. But chapters previously
+# written to disk still carry the section — when those drafts are
+# re-fact-checked (e.g. during touch-ups before a regen), this stripper
+# keeps the legacy content from generating false positives on Linux/
+# macOS symbol names.
 _COMPARISON_SECTION_RE = re.compile(
     r'^[ ]{0,3}##\s+Comparison\b.*?(?=^[ ]{0,3}##\s+|\Z)',
     re.MULTILINE | re.DOTALL,
@@ -4227,8 +4193,11 @@ _COMPARISON_SECTION_RE = re.compile(
 def _strip_comparison_section(text: str) -> str:
     """Return `text` with all `## Comparison` H2 sections removed.
 
-    Used by the fact-checker so cross-OS struct/function names are not
-    grepped against the FreeBSD source tree and flagged as missing.
+    Used by the fact-checker so cross-OS struct/function names in legacy
+    chapter content are not grepped against the FreeBSD source tree and
+    flagged as missing. New chapters no longer produce this section; this
+    function is a no-op for them and only meaningful for on-disk drafts
+    written before the section was removed from the pipeline.
     """
     return _COMPARISON_SECTION_RE.sub('', text)
 
@@ -5502,9 +5471,11 @@ def fact_check_draft(draft: str, src_root: str,
         - 'malloc_tags_not_found': list of unverifiable MALLOC_DEFINE tags
         - 'total_issues': count of all issues
 
-    The `## Comparison` section is stripped before extraction. That section
-    legitimately discusses Linux/macOS/NetBSD symbols which would otherwise
-    be flagged as "not found in FreeBSD source," wasting fact-fix steps.
+    Any legacy `## Comparison` section is stripped before extraction
+    (the section was removed from the pipeline in 2026-05; new drafts
+    no longer produce it, but on-disk content from earlier runs still
+    contains Linux/macOS/NetBSD symbol names that must not be grepped
+    against the FreeBSD source tree).
     """
     fact_text = _strip_comparison_section(draft)
     file_paths = _extract_file_paths(fact_text)

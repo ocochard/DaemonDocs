@@ -197,20 +197,6 @@ chapters:
       - "What is the role of Makefile.inc1?"
       - "How are kernel .conf files processed into source sets?"
     mermaid: flowchart
-    # Drop Comparison: the FreeBSD build system (Makefile.inc1, share/mk
-    # rule files, src.conf(5)) has no real cross-OS analog at the level of
-    # detail this chapter operates at. Linux uses Kbuild/Kconfig, NetBSD
-    # uses a similar bsd.*.mk family, but a meaningful contrast would be
-    # its own chapter — not a tacked-on Comparison. Without this opt-out,
-    # the writer fills space with weakly-grounded one-liners.
-    sections:
-      - "Quick Summary"
-      - "Architecture"
-      - "Key Data Structures"
-      - "Deep Dive"
-      - "Flow / Diagram"
-      - "Advanced Notes"
-      - "See Also"
 
   - title: "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
     family: "memory-process"
@@ -255,7 +241,6 @@ chapters:
       - "Deep Dive"
       - "Flow / Diagram"
       - "Advanced Notes"
-      - "Comparison"
       - "See Also"
 
   - title: "Process Management — Scheduling and Lifecycle"
@@ -917,20 +902,6 @@ chapters:
       - "What is the typed-message system in ng_parse, and why does netgraph use it instead of raw byte buffers for control messages?"
       - "How does userland (ngctl(8), libnetgraph) attach to the kernel graph, and how does ng_socket bridge socket I/O to graph messages?"
     mermaid: flowchart
-    # Drop Comparison: netgraph has no real cross-OS analog. Linux
-    # nftables/tc and OpenBSD divert(4) solve narrower, differently-shaped
-    # problems; a meaningful contrast would be its own essay rather than
-    # a tacked-on Comparison section. Without this opt-out the writer
-    # tends to invent weakly-grounded one-liners ("Linux uses tc instead
-    # of netgraph") that mislead more than they explain.
-    sections:
-      - "Quick Summary"
-      - "Architecture"
-      - "Key Data Structures"
-      - "Deep Dive"
-      - "Flow / Diagram"
-      - "Advanced Notes"
-      - "See Also"
 
   - title: "mbuf — Network Buffer Allocation and Chaining"
     family: "networking"
@@ -1002,15 +973,6 @@ chapters:
       - "What is m_tag, and how does it let subsystems (pf, ipsec, lro) attach per-packet metadata without enlarging struct mbuf for everyone?"
       - "What happens when the mbuf zone is exhausted — how do M_NOWAIT callers fail gracefully, and what is mb_reclaim?"
     mermaid: class
-    sections:
-      - "Quick Summary"
-      - "Architecture"
-      - "Key Data Structures"
-      - "Deep Dive"
-      - "Flow / Diagram"
-      - "Comparison"
-      - "Advanced Notes"
-      - "See Also"
 
   - title: "Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP"
     family: "networking"
@@ -1100,15 +1062,6 @@ chapters:
       - "What does tcp_function_block let RACK and BBR replace, and why is that scope wider than just plugging in via cc_algo?"
       - "Why is UDP so much smaller than TCP — what does udp_usrreq.c do that is not already in in_pcb.c?"
     mermaid: state
-    sections:
-      - "Quick Summary"
-      - "Architecture"
-      - "Key Data Structures"
-      - "Deep Dive"
-      - "Flow / Diagram"
-      - "Comparison"
-      - "Advanced Notes"
-      - "See Also"
 
   - title: "IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop"
     family: "networking"
@@ -1197,13 +1150,4 @@ chapters:
       - "What did IPv6 redesign vs. IPv4 — addresses, fragmentation, neighbor discovery vs ARP, scope IDs — and which of those forced separate v6 input/output functions vs. shared code?"
       - "How do pfil_hooks let pf, ipfw, and ipsec interpose on the IP path without each having to patch ip_input/ip_output?"
     mermaid: flowchart
-    sections:
-      - "Quick Summary"
-      - "Architecture"
-      - "Key Data Structures"
-      - "Deep Dive"
-      - "Flow / Diagram"
-      - "Comparison"
-      - "Advanced Notes"
-      - "See Also"
 
