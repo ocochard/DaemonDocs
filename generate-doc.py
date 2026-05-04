@@ -4068,6 +4068,151 @@ def _dedupe_see_also_section(content: str) -> Tuple[str, int]:
     return content[:body_start] + "\n".join(out) + content[body_end:], dropped
 
 
+# docs.freebsd.org URLs that point at a handbook/articles slug. Captures
+# the section ("books/handbook" or "articles") and the slug (first path
+# segment after that). Trailing path / anchor / query are tolerated but
+# not used for validation — the slug alone determines whether the page
+# exists. Both http(s) and the writer's occasional bare-relative
+# `books/handbook/<slug>/` are validated by the slug check; the bare-
+# relative form is always broken (no host) and gets caught by the same
+# code path.
+_DOC_FREEBSD_URL_RE = re.compile(
+    r"^https?://docs\.freebsd\.org/(?:[a-z]{2}/)?"
+    r"(books/handbook|articles)/([A-Za-z0-9_+-]+)"
+)
+# Bare `books/handbook/<slug>/` or `articles/<slug>/` written as if it
+# were a relative link (no scheme, no host). Always broken — markdown
+# resolves it relative to the chapter file. Caught here so the dropper
+# treats it the same way as a bogus full URL.
+_DOC_FREEBSD_RELATIVE_RE = re.compile(
+    r"^(?:\.{0,2}/)?(books/(?:handbook|arch-handbook)|articles)/"
+    r"([A-Za-z0-9_+-]+)"
+)
+
+
+# Memoized known-slug index from $FREEBSD_DOC.
+_KNOWN_DOC_SLUGS_CACHE: Optional[Dict[str, set]] = None
+
+
+def _known_doc_slugs() -> Dict[str, set]:
+    """Return ``{"books/handbook": {slug, ...}, "articles": {slug, ...}}``
+    populated from ``$FREEBSD_DOC``. Empty sets if the tree isn't present.
+
+    A "slug" is a directory name directly under ``books/handbook/`` or
+    ``articles/`` in the freebsd-doc source — these are the URL path
+    segments docs.freebsd.org publishes (``/en/books/handbook/<slug>/``).
+    Memoized for the lifetime of the process; the doc tree doesn't change
+    mid-run.
+    """
+    global _KNOWN_DOC_SLUGS_CACHE
+    if _KNOWN_DOC_SLUGS_CACHE is not None:
+        return _KNOWN_DOC_SLUGS_CACHE
+    out: Dict[str, set] = {"books/handbook": set(), "articles": set()}
+    for section in ("books/handbook", "articles"):
+        root = os.path.join(FREEBSD_DOC, section)
+        if not os.path.isdir(root):
+            continue
+        try:
+            for name in os.listdir(root):
+                if name.startswith(("_", ".")):
+                    continue
+                if os.path.isdir(os.path.join(root, name)):
+                    out[section].add(name)
+        except OSError:
+            pass
+    _KNOWN_DOC_SLUGS_CACHE = out
+    return out
+
+
+def _doc_url_is_known(target: str) -> Optional[bool]:
+    """Return True if ``target`` is a docs.freebsd.org-style link whose
+    slug exists in $FREEBSD_DOC; False if it's a docs.freebsd.org-style
+    link with an unknown slug; None if the target doesn't look like a
+    handbook/articles URL at all (caller should leave it alone).
+
+    "docs.freebsd.org-style" covers two shapes:
+      * Full URL: ``https://docs.freebsd.org/en/books/handbook/<slug>/...``
+      * Bare relative: ``books/handbook/<slug>/...`` or
+        ``articles/<slug>/...`` (writer drift — markdown won't resolve
+        these to anything real).
+
+    If the doc tree isn't available (no $FREEBSD_DOC on disk), every
+    handbook URL is treated as unknown — this is the right failure mode:
+    the sanitizer falls back to "drop on doubt", which is what the user
+    asked for. Sites without freebsd-doc shouldn't ship handbook links
+    at all.
+    """
+    m = _DOC_FREEBSD_URL_RE.match(target) or _DOC_FREEBSD_RELATIVE_RE.match(
+        target
+    )
+    if m is None:
+        return None
+    section, slug = m.group(1), m.group(2)
+    # arch-handbook is a separate book; we don't ship that book's slugs
+    # in our index. Any `books/arch-handbook/...` reference from the
+    # writer is hallucinated until proven otherwise — the legitimate
+    # handbook lives at `books/handbook/`.
+    if section == "books/arch-handbook":
+        return False
+    known = _known_doc_slugs().get(section, set())
+    return slug in known
+
+
+def _sanitize_doc_urls(content: str, current_file: str) -> Tuple[str, int]:
+    """Drop or strip docs.freebsd.org links whose slug isn't real.
+
+    Mirrors `_sanitize_chapter_links`'s shape but for FreeBSD-handbook
+    and -articles URLs. The writer occasionally hallucinates a plausible
+    slug ("geom-class" instead of "geom") — every existing fact-check
+    layer passes because the URL never points into the source tree.
+    Validating against the on-disk freebsd-doc index catches it
+    deterministically.
+
+    Behaviour per shape:
+      * List-item link with a bogus slug → drop the whole list item
+        (same as `_sanitize_chapter_links` does for broken `.md` links).
+      * Inline-prose link with a bogus slug → strip the link wrapper,
+        keep the label text. We won't mangle a sentence by deleting it
+        whole, but we will neuter a misleading hyperlink.
+      * Non-docs.freebsd.org URLs → untouched.
+      * Real slugs → untouched.
+
+    Returns ``(content, dropped)`` for diagnostics. ``current_file`` is
+    accepted for symmetry with the other sanitizers; not currently used.
+    """
+    del current_file  # symmetry; not needed for URL validation
+    dropped = 0
+
+    out_lines: List[str] = []
+    for line in content.split("\n"):
+        m = _LIST_ITEM_LINK_RE.match(line)
+        if m:
+            target = m.group(3)
+            verdict = _doc_url_is_known(target)
+            if verdict is False:
+                dropped += 1
+                continue
+            out_lines.append(line)
+            continue
+
+        # Inline-prose links: strip wrapper if bogus, leave label.
+        def _sub_inline(mm: "re.Match") -> str:
+            nonlocal dropped
+            label, target = mm.group(1), mm.group(2)
+            verdict = _doc_url_is_known(target)
+            if verdict is False:
+                dropped += 1
+                return label
+            return mm.group(0)
+
+        out_lines.append(_INLINE_LINK_RE.sub(_sub_inline, line))
+
+    new_content = "\n".join(out_lines)
+    if dropped:
+        new_content = re.sub(r"\n{3,}", "\n\n", new_content)
+    return new_content, dropped
+
+
 # Backtick-wrapped path inside a list-item line in See Also. Captures the
 # path (and only the path) so we can verify it exists on disk before
 # turning it into a markdown link. We deliberately match only inside list
@@ -6656,6 +6801,19 @@ def build_navigation(chapters: List[dict]) -> dict:
             print(
                 f"  [links] {output_file}: rewrote {_ln_rewrote}, "
                 f"dropped {_ln_dropped} broken .md link(s)"
+            )
+
+        # Drop docs.freebsd.org handbook/articles links whose slug isn't
+        # in $FREEBSD_DOC. The writer hallucinates plausible-looking
+        # slugs (e.g. `/handbook/geom-class/` instead of `/handbook/geom/`)
+        # that no other fact-check layer notices because the URL never
+        # points into the source tree. Validating against the on-disk
+        # doc tree is deterministic and free.
+        content, _doc_dropped = _sanitize_doc_urls(content, output_file)
+        if _doc_dropped:
+            print(
+                f"  [links] {output_file}: dropped {_doc_dropped} "
+                f"unknown docs.freebsd.org link(s)"
             )
 
         # Wrap bare backtick source-file paths in See Also as relative

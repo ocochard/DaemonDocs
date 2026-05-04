@@ -49,8 +49,10 @@ The file is divided by `# ---` banner comments. In source order:
 per-chapter pipeline: **Cross-README navigation** —
 `build_navigation`, `_add_see_also_links`,
 `_build_chapter_rels`, `_sanitize_chapter_links` (broken `.md`
-link repair), `_link_see_also_source_paths` (wrap bare backtick
-source paths in See Also as relative markdown links),
+link repair), `_sanitize_doc_urls` (drop docs.freebsd.org links
+whose handbook/articles slug isn't in `$FREEBSD_DOC`),
+`_link_see_also_source_paths` (wrap bare backtick source paths
+in See Also as relative markdown links),
 `_link_manpage_refs` + `_build_manpage_index` (wrap inline
 `name(N)` man-page references in chapter prose as relative links
 to the source-tree mdoc file) — and **Chapter index** —
