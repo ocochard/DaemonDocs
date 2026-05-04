@@ -2340,6 +2340,24 @@ def build_chapter_prompt(chapter: dict) -> str:
           claims (e.g. mentioning a specific field name, function name,
           or sysctl OID by name).
 
+        **Man-page references — always use `name(N)`.** The canonical
+        FreeBSD form is `name(section)` with parentheses around the
+        section number: `mbuf(9)`, `pf.conf(5)`, `jail(8)`. Do NOT
+        write the dotted-filename form (`mbuf.9`, `g_bio.9`) and do
+        NOT pre-wrap them as markdown links — a post-processor turns
+        every bare `name(N)` into a clickable relative link to the
+        mdoc source under `share/man/manN/`, but only if you emit the
+        canonical form. Backticks around the ref are fine and survive
+        the link wrapper (`` `mbuf(9)` `` → `` [`mbuf(9)`](path) ``);
+        anything else is left as plain text.
+        - WRONG: ``- **Man pages**: `g_bio.9`, `g_geom.9` `` (dotted
+          form — the autolinker can't see these).
+        - WRONG: ``- [VNET(9)](../../share/man/man9/VNET.9)`` (you
+          guessed the path; the autolinker computes the correct
+          relative path from the chapter's location).
+        - RIGHT: ``- Man pages: `g_bio(9)`, `g_geom(9)`, `lock(9)` ``
+          (the post-processor links each one).
+
         **How to return your work — READ THIS CAREFULLY:**
         - You MUST return the complete Markdown chapter as the single argument
           to `final_answer(...)`. Example: `final_answer(content)` where
