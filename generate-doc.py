@@ -3599,6 +3599,9 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 print(f"         - missing structs: {', '.join(facts['structs_not_found'])}")
             if facts['funcs_not_found']:
                 print(f"         - missing functions: {', '.join(facts['funcs_not_found'])}")
+            if facts.get('func_sigs_mismatch'):
+                print(f"         - signature arity mismatches: "
+                      f"{'; '.join(facts['func_sigs_mismatch'])}")
             if facts.get('kernel_options_not_found'):
                 print(f"         - missing kernel options: "
                       f"{', '.join(facts['kernel_options_not_found'])}")
@@ -5381,6 +5384,136 @@ def _extract_struct_bodies(
     return claims
 
 
+# --- Function-signature claims --------------------------------------------
+#
+# The writer often emits real function names with the wrong arg count —
+# the "verified hallucination" pattern: `daemon_init` is real, but the
+# draft shows `int daemon_init(void)` while the source defines it as
+# `int daemon_init(struct config *conf, bool debug)`. Names pass the
+# existence grep, fields pass (no struct involved), but the signature
+# is from 2022. We can't catch the prose-level behavior drift, but we
+# can hard-fail an arity mismatch.
+#
+# Strictness is arity-only: comparing types runs into typedef
+# equivalence (`u_int` vs `unsigned int` vs `uint32_t`) and produces
+# false positives. Counting comma-separated top-level args is robust.
+#
+# Code fences only — call sites in prose (`daemon_init(conf)`) are not
+# signature claims and produce arity noise on partial calls / variadic
+# expansions / macro-style invocations. Same discipline as
+# `_extract_struct_bodies`.
+
+# Function-definition shape inside a code-fenced block. Mirrors the
+# regex in `_extract_func_sigs` (line 1573) which works against real
+# source files; the same shape matches inside markdown code fences
+# because the writer-prompt rule says "copy verbatim into the code
+# block." Two alternatives:
+#   1. `RETTY *? NAME(args)` — single-line return type form.
+#   2. `^NAME(args)` — K&R column-0 form with return type on previous
+#      line. We accept it but cannot easily attribute a return type.
+# `[^{;]*?` for the arg list lets it span lines (DOTALL).
+_FUNC_SIG_RE = re.compile(
+    r"(?:[A-Za-z_]\w*\s*\**\s+)+\*?\s*([A-Za-z_]\w*)\s*"
+    r"\(([^{;]*?)\)\s*(?:__\w+(?:\s*\([^)]*\))?\s*)*\{",
+    re.MULTILINE | re.DOTALL,
+)
+
+# Identifiers we never want to treat as a function definition even when
+# the regex matches them — control-flow keywords look like `if (...) {`
+# and would otherwise be flagged. Mirrors the filter in
+# `_extract_func_sigs`.
+_FUNC_SIG_KEYWORDS = frozenset({
+    "if", "else", "while", "for", "switch", "return",
+    "struct", "union", "enum", "typedef", "define",
+    "do", "case", "default", "sizeof", "goto",
+})
+
+
+def _count_c_args(arglist: str) -> Optional[int]:
+    """Count top-level args in a C parameter list. None if unparseable.
+
+    Handles:
+      - empty `()` and `(void)` → 0
+      - top-level commas only — commas inside nested parens (function
+        pointers like `int (*cmp)(void *, void *)`) are skipped
+      - C comments (`/* ... */`, `//`) stripped first
+      - trailing variadic `, ...` counts as one arg slot per the
+        C standard's perspective on `va_arg` reading; conservative
+        match keeps the explicit count and lets `...` add 1 — keeps
+        the writer honest about claiming variadic-ness in the draft
+
+    Returns None on K&R-style declarations (an arg list of bare
+    identifiers with no type tokens) — those are too ambiguous to
+    arity-check reliably and rare in modern FreeBSD code.
+    """
+    s = _strip_c_comments(arglist).strip()
+    if not s:
+        return 0
+    # `(void)` is the C idiom for "explicitly no arguments." Tolerate
+    # whitespace and a trailing `*` or `const` (writers sometimes write
+    # `(const void)` paraphrasing — the intent is still zero args).
+    if re.fullmatch(r"(?:const\s+)?void\s*\**", s):
+        return 0
+    # K&R smell test: arg list contains only identifiers + commas
+    # (no `*`, no whitespace-separated type tokens). E.g. `(td, args)`.
+    # A real prototype always has at least one type token alongside the
+    # parameter name. If we see only bare identifiers, we cannot count
+    # arity safely.
+    if re.fullmatch(r"[A-Za-z_]\w*(\s*,\s*[A-Za-z_]\w*)*", s):
+        return None
+
+    depth = 0
+    count = 1  # at least one argument once we've ruled out empty/void
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            count += 1
+    return count
+
+
+def _extract_function_signatures(
+    text: str,
+) -> List[Tuple[str, int, str]]:
+    """Find function-definition signatures in fenced code blocks.
+
+    Returns a list of `(func_name, arg_count, raw_signature_text)`
+    tuples. Code fences only — see the module-level note for why
+    inline backticked calls are excluded. Arity is the count from
+    `_count_c_args`; entries where arity comes back None (K&R style,
+    unparseable) are dropped — verification would be unreliable.
+
+    Dedup on `(name, arity)` so the same definition shown twice in the
+    same draft is reported once.
+    """
+    claims: List[Tuple[str, int, str]] = []
+    seen: set = set()
+    for block in _FENCED_BLOCK_RE.finditer(text):
+        body = block.group(1)
+        for m in _FUNC_SIG_RE.finditer(body):
+            name = m.group(1)
+            if name in _FUNC_SIG_KEYWORDS:
+                continue
+            arity = _count_c_args(m.group(2))
+            if arity is None:
+                continue
+            key = (name, arity)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Trim raw_sig to just the prototype line(s) up to the
+            # opening brace — the writer doesn't need the function body
+            # quoted back at them.
+            raw = m.group(0)
+            brace_idx = raw.rfind("{")
+            if brace_idx > 0:
+                raw = raw[:brace_idx].strip()
+            claims.append((name, arity, raw))
+    return claims
+
+
 def _struct_body_is_abridged(body: str) -> bool:
     """True if the writer marked a struct body as deliberately shortened.
 
@@ -5568,6 +5701,120 @@ def _real_struct_fields(struct_name: str, src_root: str,
 
     _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
     return frozenset()
+
+
+# Cache the *real* arity per (src_root+search-roots, func_name).
+# Value tuple: `(arity, file_path)` — file_path lets us tell the
+# writer where to read the real signature. `None` means "looked but
+# couldn't parse" and disables verification for that name (so we
+# don't false-flag K&R-style or attribute-heavy signatures we can't
+# count). Same cache-key shape as `_STRUCT_FIELDS_CACHE` so widened
+# search dirs (ch2's `["stand"]`) don't poison `sys/`-only chapters.
+_FUNC_SIG_CACHE: Dict[Tuple[str, str], Optional[Tuple[int, str]]] = {}
+
+
+def _real_function_signature(
+    func_name: str,
+    src_root: str,
+    extra_search_dirs: Optional[List[str]] = None,
+) -> Optional[Tuple[int, str]]:
+    """Locate `func_name`'s definition in the search tree and return its arity.
+
+    Searches `<src_root>/sys` plus any directories in `extra_search_dirs`.
+    Returns `(arity, file_path)` on success or `None` on any of: not
+    found, K&R-style declaration, parse failure, grep timeout. Callers
+    must treat `None` as "verification unavailable" — never as "the
+    function takes zero arguments."
+    """
+    search_roots, cache_suffix = _resolve_search_roots(
+        src_root, extra_search_dirs,
+    )
+    cache_key = (
+        src_root + ("::" + cache_suffix if cache_suffix else ""),
+        func_name,
+    )
+    if cache_key in _FUNC_SIG_CACHE:
+        return _FUNC_SIG_CACHE[cache_key]
+
+    if not search_roots:
+        _FUNC_SIG_CACHE[cache_key] = None
+        return None
+
+    # Find files containing the literal `func_name(` — definition or
+    # call. K&R-style definitions have the name at column 0 followed by
+    # `(`; modern definitions have it after a return type. Either way,
+    # the candidate file must contain the literal opener.
+    pattern = f"{func_name}("
+    roots_arg = " ".join(f"{shlex.quote(r)}/" for r in search_roots)
+    cmd = (
+        f"grep -rlF --include='*.c' --include='*.h' "
+        f"{shlex.quote(pattern)} {roots_arg} 2>/dev/null"
+    )
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            errors="replace", timeout=_GREP_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        _FUNC_SIG_CACHE[cache_key] = None
+        return None
+
+    candidates = [
+        line for line in result.stdout.splitlines() if line.strip()
+    ]
+
+    # Prefer .c files (definitions live there) over .h (declarations
+    # are usually prototypes — same arity, but parsing them risks
+    # picking up `void foo(int);` forward decls vs. the real defn,
+    # which is fine for arity but means we miss the body location for
+    # the writer to re-read). Then by depth so canonical paths win
+    # over deeply-nested test stubs.
+    def _candidate_priority(path: str) -> tuple:
+        rel = (
+            os.path.relpath(path, src_root)
+            if path.startswith(src_root) else path
+        )
+        is_c = path.endswith(".c")
+        depth = rel.count(os.sep)
+        # Test/stub paths last — same heuristic as struct lookup.
+        is_test = "/test/" in path or "/tests/" in path
+        return (
+            0 if (is_c and not is_test) else (1 if is_c else 2),
+            depth,
+            path,
+        )
+
+    candidates.sort(key=_candidate_priority)
+
+    # Walk candidates, run the function-definition regex, return the
+    # first match whose name == target. The regex from `_extract_func_sigs`
+    # only matches definitions (requires `{` after the arg list), so
+    # forward declarations and call sites are rejected automatically.
+    for candidate in candidates[:32]:
+        try:
+            with open(candidate, "r", encoding="utf-8",
+                      errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        for m in _FUNC_SIG_RE.finditer(content):
+            if m.group(1) != func_name:
+                continue
+            arity = _count_c_args(m.group(2))
+            if arity is None:
+                # Real source has K&R-style — we can't reliably count;
+                # skip rather than false-flag the writer.
+                continue
+            rel_path = (
+                os.path.relpath(candidate, src_root)
+                if candidate.startswith(src_root) else candidate
+            )
+            result_tuple: Optional[Tuple[int, str]] = (arity, rel_path)
+            _FUNC_SIG_CACHE[cache_key] = result_tuple
+            return result_tuple
+
+    _FUNC_SIG_CACHE[cache_key] = None
+    return None
 
 
 def _verify_struct_bodies(
@@ -5774,6 +6021,51 @@ def _verify_struct_field_claims(
     return issues
 
 
+def _verify_function_signatures(
+    claims: List[Tuple[str, int, str]],
+    src_root: str,
+    extra_search_dirs: Optional[List[str]] = None,
+    funcs_missing_set: Optional[set] = None,
+) -> List[str]:
+    """For each `(func_name, claimed_arity, raw_sig)` claim, flag arity mismatches.
+
+    Returns issue strings shaped:
+
+        "daemon_init: draft shows 0 args, real signature in
+         sys/kern/kern_daemon.c has 2 args"
+
+    Skips:
+      - functions in `funcs_missing_set` (already reported by
+        `_verify_functions`; double-reporting just adds noise)
+      - functions whose real signature can't be located or parsed
+        (returns None from `_real_function_signature` — silent skip)
+      - K&R-style draft signatures (filtered out at extraction time)
+    """
+    issues = []
+    missing = funcs_missing_set or set()
+    seen: set = set()
+    for name, claimed_arity, _raw in claims:
+        if name in missing:
+            continue
+        # Same name+arity reported once even across multiple chapters
+        # in the unlikely batch case; key is local to this call.
+        if (name, claimed_arity) in seen:
+            continue
+        seen.add((name, claimed_arity))
+        real = _real_function_signature(name, src_root, extra_search_dirs)
+        if real is None:
+            continue  # verification unavailable — don't flag
+        real_arity, real_path = real
+        if claimed_arity != real_arity:
+            issues.append(
+                f"{name}: draft shows {claimed_arity} arg"
+                f"{'' if claimed_arity == 1 else 's'}, "
+                f"real signature in {real_path} has "
+                f"{real_arity} arg{'' if real_arity == 1 else 's'}"
+            )
+    return issues
+
+
 def fact_check_draft(draft: str, src_root: str,
                      extra_search_dirs: Optional[List[str]] = None) -> dict:
     """Run structured fact-checking on a draft chapter.
@@ -5802,6 +6094,11 @@ def fact_check_draft(draft: str, src_root: str,
           (member-access claims like `bi->bi_efi_memmap` outside a
           `struct NAME { ... }` block)
         - 'funcs_not_found': list of missing function names
+        - 'func_sigs_mismatch': list of "name: draft shows N args, real
+          signature in PATH has M args" strings — the function name is
+          real but the draft's fenced ```c definition has the wrong
+          arity. Catches the "verified hallucination" pattern where the
+          writer pulled a 2022-era signature from training data.
         - 'kernel_options_not_found': list of unverifiable kernel-config options
         - 'dtrace_probes_not_found': list of unverifiable DTrace SDT probes
         - 'malloc_tags_not_found': list of unverifiable MALLOC_DEFINE tags
@@ -5824,6 +6121,7 @@ def fact_check_draft(draft: str, src_root: str,
         fact_text, known_structs=structs,
     )
     funcs = _extract_function_names(fact_text)
+    sig_claims = _extract_function_signatures(fact_text)
     kernel_options = _extract_kernel_options(fact_text)
     dtrace_probes = _extract_dtrace_probes(fact_text)
     malloc_tags = _extract_malloc_tags(fact_text)
@@ -5855,6 +6153,13 @@ def fact_check_draft(draft: str, src_root: str,
         field_ref_claims_filtered, src_root, extra_search_dirs,
     )
     funcs_missing = _verify_functions(funcs, src_root, extra_search_dirs)
+    # Arity-mismatch check runs after `_verify_functions` so we can
+    # skip names already flagged as missing — double-reporting just
+    # adds noise to the fact-fix prompt.
+    sig_mismatches = _verify_function_signatures(
+        sig_claims, src_root, extra_search_dirs,
+        funcs_missing_set=set(funcs_missing),
+    )
     kernel_options_missing = _verify_kernel_options(kernel_options, src_root)
     dtrace_probes_missing = _verify_dtrace_probes(dtrace_probes, src_root)
     malloc_tags_missing = _verify_malloc_tags(malloc_tags, src_root)
@@ -5867,6 +6172,7 @@ def fact_check_draft(draft: str, src_root: str,
         'struct_bodies_abridged': struct_bodies_abridged,
         'struct_field_refs_bogus': struct_field_refs_bogus,
         'funcs_not_found': funcs_missing,
+        'func_sigs_mismatch': sig_mismatches,
         'kernel_options_not_found': kernel_options_missing,
         'dtrace_probes_not_found': dtrace_probes_missing,
         'malloc_tags_not_found': malloc_tags_missing,
@@ -5875,6 +6181,7 @@ def fact_check_draft(draft: str, src_root: str,
                          len(struct_bodies_abridged) +
                          len(struct_field_refs_bogus) +
                          len(funcs_missing) +
+                         len(sig_mismatches) +
                          len(kernel_options_missing) +
                          len(dtrace_probes_missing) +
                          len(malloc_tags_missing)),
@@ -5972,6 +6279,31 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
             f"Functions not found in source tree: "
             f"{', '.join(facts['funcs_not_found'])}. "
             f"Remove or correct these with real function signatures."
+        )
+    if facts.get('func_sigs_mismatch'):
+        # Each entry: "name: draft shows N args, real signature in PATH
+        # has M args". The function is real (it survived `_verify_functions`)
+        # but the writer wrote the wrong arity in a fenced ```c block —
+        # the canonical "verified hallucination" tell where the model
+        # pulled a 2022-era signature from training data while the real
+        # source has since changed. Arity mismatch strongly suggests the
+        # behavior description in the surrounding prose is also stale,
+        # so the prompt explicitly asks the writer to re-read the body
+        # — not just patch the signature line.
+        issues.append(
+            "Function signatures in your code blocks do not match the "
+            "real function definitions: "
+            + "; ".join(facts['func_sigs_mismatch'])
+            + ". The function name is real but the argument count you "
+            "wrote is wrong. This is the signature of paraphrasing the "
+            "function from memory rather than reading the current "
+            "source. Open the file with `read_freebsd_source` (or call "
+            "`resolve_c_definition(symbol=\"<name>\")`) and copy the "
+            "real signature verbatim. IMPORTANT: an arity mismatch "
+            "almost always means the function's behavior has changed "
+            "too — re-read the body and revise any prose that "
+            "describes what the function does, do not just patch the "
+            "signature line in isolation."
         )
     if facts.get('kernel_options_not_found'):
         issues.append(

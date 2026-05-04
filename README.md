@@ -185,9 +185,9 @@ flowchart TD
     Revise["**Step 3 — Revise** (writer agent)<br/>build_revision_prompt(chapter, draft, review_raw)<br/>can ADD or REMOVE content<br/>→ new full draft"]
     Revise --> Review
 
-    FactCheck{"**Step 4 — Fact-check** (deterministic)<br/>fact_check_draft: paths + structs + functions<br/>verified against FreeBSD source tree<br/>does NOT edit the draft"}
+    FactCheck{"**Step 4 — Fact-check** (deterministic)<br/>fact_check_draft: paths, structs, struct fields,<br/>function names, function arities, kernel options,<br/>DTrace probes, MALLOC tags<br/>verified against FreeBSD source tree<br/>does NOT edit the draft"}
     FactCheck -- "all claims verified" --> Write
-    FactCheck -- "missing paths /<br/>structs / funcs" --> FactFix
+    FactCheck -- "missing or<br/>mismatched claims" --> FactFix
 
     FactFix["**Step 5 — Fact-fix** (writer agent)<br/>_build_fact_check_prompt(chapter, draft, facts)<br/>corrects bad paths, replaces missing symbols,<br/>removes unfixable claims"]
     FactFix --> Write
@@ -236,11 +236,17 @@ prompt can stay small and focused.
    **add** content (fill a section the reviewer marked thin, answer a missed
    key question). Loop returns to Step 2 with the new draft.
 
-4. **Fact-check (deterministic, no agent).** `fact_check_draft` extracts every
-   file path, struct name, and function name claimed in the draft and verifies
-   each against the FreeBSD source tree (3-stage grep pipeline in
-   `_batched_grep_present`, plus `_resolve_path_in_tree`). Returns a dict of
-   missing/corrected items. **Does not modify the draft.**
+4. **Fact-check (deterministic, no agent).** `fact_check_draft` extracts and
+   verifies, against the FreeBSD source tree: file paths, struct names, struct
+   field names (both inside `struct N { ... }` blocks and in `var->field`
+   prose), function names, **function arities** (a fenced ```c definition
+   that shows `daemon_init(void)` is flagged when the real signature has two
+   parameters — catches "verified hallucination" where the writer pulled a
+   stale signature from training data), kernel-config options, DTrace SDT
+   probes, and `MALLOC_DEFINE`/`MALLOC_DECLARE` tags. The verifiers grep
+   `<freebsd-src>/sys` (plus per-chapter widened roots like `stand/` for
+   ch2) and cache by symbol so re-runs within a session are free. Returns a
+   dict of missing/mismatched items. **Does not modify the draft.**
 
 5. **Fact-fix (writer).** Only runs when fact-check finds issues. Reads
    `_build_fact_check_prompt(chapter, draft, facts)` — original chapter
@@ -513,24 +519,32 @@ instead of relying on prompt rules alone:
 
 1. **Authoritative Symbol Catalog** (pre-draft). Verifies that cited
    symbols exist before the writer composes prose. Catches "function
-   `foo_bar` doesn't exist" — but not "function `foo_bar` exists with
-   different arguments than you described."
+   `foo_bar` doesn't exist."
 2. **Reviewer rubric** (post-draft, tool-less). Grades shape:
-   completeness, structure, marketing language, comparison quality.
-   Cannot fact-check fields or call signatures because it has no way
-   to read the source.
+   completeness, structure, marketing language, rationale. The
+   reviewer has only `search_books` and the prompt-injected verified-
+   symbol blocks; it does not re-read the source itself.
 3. **Fact-check** (post-revision). Re-greps the source for cited
-   paths, symbols, macros, DTrace probes — anything top-level. Catches
-   "you cited `sys/kern/init_main.c:sysinit_compar` but it's actually
-   in `sys/kern/init_main.c:sysinit_mklist`" — but currently does not
-   reach into struct bodies or function call mechanics.
+   paths, symbols, macros, DTrace probes, `MALLOC_DEFINE` tags, and
+   kernel-config options — anything top-level. Catches "you cited
+   `sys/kern/init_main.c:sysinit_compar` but it's actually in
+   `sys/kern/init_main.c:sysinit_mklist`." Reaches into struct bodies
+   (`_verify_struct_bodies` flags fenced `struct NAME { ... }` blocks
+   whose claimed fields don't exist, plus the "zero overlap" case
+   where every claimed field is fabricated together) and function-call
+   mechanics (`_verify_function_signatures` flags arity mismatches
+   between fenced `c` definitions and the real source — the "verified
+   hallucination" pattern where a real function name is paired with
+   a stale-from-training-data argument list).
 
 Each layer covers a different failure mode. None of them, individually,
-prevents Behavior B. Together they catch most of it; what remains is
-the open question tracked in `FUTURE_IMPROVEMENTS.md`: extending
-fact-check to verify struct field names and function-call shapes
-against the actual source, so a citation can no longer claim more
-than it earned.
+prevents Behavior B. Together they catch the structural cases —
+non-existent symbols, wrong field names, wrong arities. What remains
+open (tracked in `FUTURE_IMPROVEMENTS.md`) is *behavioral*
+verification: prose that names a real function with a real arity but
+describes its behavior from outdated training data. Deterministic Python
+can grep names and count commas; it cannot judge whether "initializes
+a PID file" matches what the current function body actually does.
 
 The take-away for anyone reading or extending this project:
 **a citation is a navigation hint, not proof of grounding.** The
