@@ -24,7 +24,7 @@ The goal is **not** to reproduce man pages. The goal is to help anyone who knows
 3. **Builds a TF-IDF search index** over the combined corpus (numpy only)
 4. **For each chapter** in `chapters.yaml`:
    - A writer agent studies the source code and searches the corpus
-   - A reviewer agent grades the draft on 9 criteria (including a check that no marketing language slipped in)
+   - A reviewer agent grades the draft on 8 criteria (including a check that no marketing language slipped in)
    - If needed, the writer revises — up to `--max-revisions` rounds
 5. **Writes** the final markdown file into the relevant source directory (e.g. `README_internals.md`, `sys/vm/README_vm.md`)
 
@@ -173,10 +173,10 @@ Finds the definition of a C struct, function, macro, or type alias. Follows `#in
 flowchart TD
     Start([chapter from chapters.yaml]) --> Draft
 
-    Draft["**Step 1 — Draft** (writer agent, 40 steps)<br/>build_chapter_prompt → full markdown draft<br/>tools: read_freebsd_source, search_books,<br/>explore_tree, directory_map, resolve_c_definition"]
+    Draft["**Step 1 — Draft** (writer agent, 80 steps)<br/>build_chapter_prompt → full markdown draft<br/>tools: read_freebsd_source, search_books,<br/>explore_tree, directory_map, resolve_c_definition"]
     Draft --> Review
 
-    Review{"**Step 2 — Review** (reviewer agent, 15 steps)<br/>build_review_prompt → JSON verdict<br/>tools: search_books only<br/>does NOT edit the draft"}
+    Review{"**Step 2 — Review** (reviewer agent, 5 steps)<br/>build_review_prompt → JSON verdict<br/>tools: search_books only<br/>does NOT edit the draft"}
     Review -- "grade=PASS AND<br/>no issues AND<br/>no FAIL criteria" --> FactCheck
     Review -- "any FAIL<br/>(and revisions left)" --> Revise
     Review -- "max_revisions reached<br/>or JSON unparseable twice" --> Unapproved[mark UNVERIFIED]
@@ -256,7 +256,7 @@ prompt can stay small and focused.
 
 ### Reviewer rubric
 
-The reviewer grades on 9 criteria:
+The reviewer grades on 8 criteria:
 1. **Completeness** — all key questions answered
 2. **Accuracy** — no hallucinated structs/functions/paths
 3. **Source Coverage** — expected files actually discussed (not just listed)
@@ -265,11 +265,56 @@ The reviewer grades on 9 criteria:
 6. **Structure** — every section the chapter declared in `sections:` is present and substantive
 7. **No marketing language** — no "comprehensive", "robust", "seamless", "leverage", "elegant", etc. The reviewer quotes the offending sentence.
 8. **Rationale** — every non-obvious mechanism (shadow chains, UMA kegs, witness, turnstiles, …) gets at least one sentence explaining WHY the design exists, not just what it looks like.
-9. **Comparison Quality** — when the chapter has a `## Comparison` section, every contrastive statement names a concrete difference. Tautologies (*"FreeBSD uses X while Linux also uses X"*), unsupported cross-OS claims, and vague "Linux handles this differently" forms are FAIL. Auto-PASS for chapters that opted out of `Comparison`.
+
+The mandatory `## Comparison` section was removed in May 2026: it was the dominant source of unverifiable hallucinations (cross-OS claims that the deterministic FreeBSD-source fact-checker cannot grade), and the writer had no way to verify them either. Chapters that legitimately benefit from a small in-line analogy can include it within Architecture or Advanced Notes; a separately-graded section produced more harm than good.
 
 The strict gate (in `_review_passes`) only approves a chapter when `grade == "PASS"` AND `issues[]` is empty AND every criterion passes. This prevents the failure mode where the model returns `grade=PASS` while individual criteria still say `FAIL`.
 
 Default: `--max-revisions 3` (one draft + up to three revision rounds).
+
+---
+
+## Resilience
+
+Long full-corpus runs (5–8 hours per endpoint) hit failure modes that
+single-chapter testing doesn't surface. Several defenses are layered
+through the pipeline:
+
+- **Streaming LLM calls.** Both writer and reviewer agents set
+  `stream_outputs=True`. The non-streaming OpenAI path can wedge
+  indefinitely when a server-side connection issue silently breaks
+  HTTP framing — the single-float `timeout=600` does not fire as a
+  per-byte read budget. Streaming makes httpx enforce a per-chunk read
+  timeout; any silence longer than the budget raises `ReadTimeout`,
+  which the orchestrator catches and ships the chapter UNVERIFIED
+  rather than hanging the whole run.
+
+- **Tight reviewer step budget.** `create_reviewer_agent` caps the
+  reviewer at `max_steps=5`. A reviewer that hasn't issued a verdict
+  by step 5 is in a runaway-thinking loop (observed: a single review
+  step decoding 121K tokens with no parsed code). Capping early frees
+  the queue.
+
+- **Sandbox rules in the reviewer prompt.** The reviewer has no source
+  tree, no file I/O, no subprocess. The system prompt now states this
+  explicitly so the agent doesn't waste steps on `open()` calls that
+  raise `InterpreterError`.
+
+- **Phase-4 deterministic post-processors.** After the LLM is done,
+  pure-Python passes turn backtick source paths in `## See Also` into
+  clickable relative links, and inline `name(N)` man-page references
+  anywhere in the body into links to the mdoc source under
+  `$FREEBSD_SRC`. Both gate on `os.path.exists` so they never fabricate
+  links to nonexistent files. Run via `--nav-only` after a corpus
+  edit to retrofit the entire output without invoking any LLM.
+
+- **External queue runner with watchdog.** For overnight runs, a
+  `runner.sh` script pops chapter numbers from a queue file and
+  launches `generate-doc.py` per chapter. A sidecar polls the
+  per-chapter log's mtime; if it stops growing for 20 minutes while
+  Python is still alive, the runner SIGTERMs the process and pops the
+  next chapter. Catches anything streaming doesn't — runaway
+  generation, smolagents deadlocks, OS-level hangs.
 
 ---
 
@@ -283,49 +328,52 @@ Each chapter has:
 - `focus` — what aspect to emphasize
 - `key_questions` — questions the chapter must answer
 - `mermaid` — diagram type: `sequence`, `flowchart`, `class`, or `state`
-- `sections` — *(optional)* which template sections this chapter should produce. Defaults to the full set: `Quick Summary`, `Architecture`, `Key Data Structures`, `Deep Dive`, `Flow / Diagram`, `Advanced Notes`, `Comparison`, `See Also`. A tree-overview chapter, for example, can drop `Key Data Structures` and `Deep Dive` because there's no specific subsystem to feature. The catalog of valid section names lives in `_SECTION_CATALOG` in `generate-doc.py`.
+- `sections` — *(optional)* which template sections this chapter should produce. Defaults to the full set: `Quick Summary`, `Architecture`, `Key Data Structures`, `Deep Dive`, `Flow / Diagram`, `Advanced Notes`, `See Also`. A tree-overview chapter, for example, can drop `Key Data Structures` and `Deep Dive` because there's no specific subsystem to feature. A chapter can also opt in to `Glossary` (single-line definitions for jargon used in the chapter). The catalog of valid section names lives in `_SECTION_CATALOG` in `generate-doc.py`.
 - `scope_guard` — *(optional)* free-text hard rule injected into the writer prompt under `## Scope Guard`. Use this when section selection alone isn't enough to keep the writer on-topic. The tree-overview chapter uses it to forbid pulling subsystem internals (vm_page, struct proc, etc.) from referenced source directories.
 
-Current chapters (25), grouped by subsystem family:
+Current chapters (28), grouped by subsystem family:
 
 **Boot & kernel core**
-1. FreeBSD Source Tree Overview
-2. UEFI Bootloader-to-Kernel Handoff
-3. The FreeBSD Kernel — Structure and Entry Point
-4. The FreeBSD Build System
+1. Source Tree — Layout and Conventions
+2. Boot Process — UEFI Bootloader to Kernel Handoff
+3. Kernel Core — Structure and Entry Point
+4. Build System — buildworld and buildkernel
 
 **Memory & process**
-5. Virtual Memory Subsystem
-6. Process Management and Scheduling
-7. Kernel Locking Primitives
+5. Virtual Memory Subsystem — vm_page, UMA, and Pagers
+6. Process Management — Scheduling and Lifecycle
+7. Locking Primitives — Mutexes, sx, rmlocks, and Atomics
 
 **Storage I/O**
-8. The Buffer Cache and I/O Subsystem
-9. GEOM Storage Framework
-10. CAM — Common Access Method storage stack
-11. Virtual File System (VFS) Layer
-12. UFS Filesystem Implementation
-13. ZFS Filesystem
+8. Buffer Cache — Block I/O Subsystem
+9. GEOM — Storage Framework
+10. CAM — Common Access Method Storage Stack
+11. VFS — Virtual File System Layer
+12. UFS — FreeBSD's Native Filesystem
+13. ZFS — Pooled Storage and Copy-on-Write Filesystem
 
 **Networking**
-14. Network Stack Architecture
+14. Network Stack — Architecture and Packet Flow
 15. VNET — Virtual Network Stacks
 16. pf — OpenBSD-derived Packet Filter
-17. ipfw and dummynet — FreeBSD's Native Firewall
+17. ipfw and dummynet — Native Firewall and Traffic Shaper
 25. netgraph — Graph-based Networking Framework
+26. mbuf — Network Buffer Allocation and Chaining
+27. Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP
+28. IP Layer — IPv4, IPv6, Forwarding, FIB, and nhop
 
 **Devices & interrupts**
-18. Device Driver Framework
-19. Interrupt Handling
+18. Device Driver Framework — newbus and devclass
+19. Interrupt Handling — Threads, Filters, and Dispatch
 20. NIC Drivers — from if_vr to iflib to if_cxgbe
 
 **Security & isolation**
-21. Jails and System Isolation
-22. Capsicum Capability Mode
+21. Jails — OS-level Isolation
+22. Capsicum — Capability Mode and Sandboxing
 
 **Virtualization & observability**
-23. bhyve Hypervisor — VMM Kernel Module
-24. DTrace Framework
+23. bhyve — VMM Kernel Module and Hypervisor
+24. DTrace — Dynamic Tracing Framework
 
 ---
 
@@ -338,13 +386,14 @@ Each chapter produces a markdown file in the FreeBSD source tree:
 | root | `README_internals.md` |
 | `sys/` | `README.md` |
 | `sys/vm/` | `README.md`, `README_bcache.md` |
-| `sys/kern/` | `README_process.md`, `README_driver.md`, `README_intr.md`, `README_jail.md` |
+| `sys/kern/` | `README_process.md`, `README_locking.md`, `README_driver.md`, `README_intr.md`, `README_jail.md`, `README_capsicum.md` |
+| `sys/sys/` | `README_mbuf.md` |
 | `sys/fs/` | `README.md` |
 | `sys/ufs/` | `README.md` |
 | `sys/net/` | `README.md`, `README_vnet.md` |
+| `sys/netinet/` | `README_transport.md`, `README_ip.md` |
 | `sys/geom/` | `README.md` |
 | `sys/contrib/openzfs/` | `README_freebsd.md` |
-| `sys/kern/` | `README_capsicum.md`, `README_locking.md` (in addition to others above) |
 | `sys/netpfil/pf/` | `README.md` |
 | `sys/netpfil/ipfw/` | `README.md` |
 | `sys/netgraph/` | `README.md` |
@@ -384,15 +433,11 @@ with code snippets. Intermediate reading level.)
 performance implications, race conditions, common pitfalls,
 connection to OS theory.)
 
-## Comparison
-(How Linux/macOS/NetBSD implement the same concept — structural
-differences, not code details. 2-4 paragraphs.)
-
 ## See Also
 (related chapters and source directories)
 ```
 
-A chapter can opt out of sections that don't fit by declaring `sections:` in `chapters.yaml`. Chapter 1 (the tree overview) drops `Key Data Structures`, `Deep Dive`, and `Comparison` for that reason — there are no single structs or functions worth featuring at the tree-level view, and forcing those sections led the writer to invent thin, out-of-context examples. A chapter can also add a `scope_guard:` block to forbid specific patterns the writer would otherwise drift into.
+A chapter can opt out of sections that don't fit by declaring `sections:` in `chapters.yaml`. Chapter 1 (the tree overview) drops `Key Data Structures` and `Deep Dive` for that reason — there are no single structs or functions worth featuring at the tree-level view, and forcing those sections led the writer to invent thin, out-of-context examples. A chapter can also add a `scope_guard:` block to forbid specific patterns the writer would otherwise drift into, or opt in to a `Glossary` section for jargon-heavy chapters.
 
 Rules:
 - Always reference specific file paths (e.g., `sys/vm/vm_page.c`)
@@ -410,7 +455,7 @@ Every generated file ends with a **provenance footer** recording the LLM model i
 DaemonDocs/
 ├── README.md              ← you are here
 ├── generate-doc.py        ← single self-contained script
-├── chapters.yaml          ← 25 chapter definitions
+├── chapters.yaml          ← 28 chapter definitions
 ├── requirements.txt       ← Python dependencies
 └── .index/                ← cached corpus + TF-IDF index (gitignored)
     ├── books_corpus.txt
