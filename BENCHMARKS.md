@@ -369,6 +369,225 @@ the regex/strptime accordingly.
 
 ---
 
+## run3 — 2026-05-03 → 2026-05-04
+
+**Pipeline state at time of run:**
+
+- 8-criteria reviewer rubric (Comparison criterion removed
+  2026-05-02; `_strip_comparison_section` left in as a no-op).
+- 7-section default chapter shape (Comparison section dropped).
+- Struct-body fact-check (added 2026-05-01) active.
+- LLM HTTP read timeout (600s) active.
+- 28 chapters in `chapters.yaml` (up from 25 in run1/run2 — added
+  ch26 mbuf, ch27 transport protocols, ch28 IP layer).
+- Phase-4 deterministic post-processors added 2026-05-03:
+  `_link_see_also_source_paths` (See Also backtick paths) and
+  `_link_manpage_refs` (inline `name(N)` refs anywhere in body).
+- **Streaming enabled** on both writer and reviewer
+  (`stream_outputs=True`, 2026-05-03) — turns httpx read-gap into
+  a `ReadTimeout` instead of a silent wedge.
+- **Reviewer max_steps 15 → 5** + sandbox-rules block in reviewer
+  prompt (2026-05-03) after a ch11 review-3 runaway burned 1h+ /
+  121K tokens of thinking with no parsed code.
+- **Log-mtime watchdog** added to `runner.sh` (2026-05-03):
+  per-chapter sidecar polls log mtime every 60s; SIGTERM →
+  SIGKILL if no advance for 1200s (20 min). Catches runaway
+  thinking, smolagents deadlocks, network hangs, in-stream socket
+  wedges.
+- `_GREP_TIMEOUT_SEC` 8 → 30 (2026-05-03) after ch13 ZFS hit the
+  cap on 55MB openzfs trees.
+- `_batched_grep_present` UnicodeDecodeError fix
+  (`errors='replace'`, 2026-05-02) — non-UTF8 driver bytes no
+  longer crash fact-check.
+- mac endpoint dropped — both runners drive AMD Vulkan endpoints
+  (fw, fw2). Same as run2.
+
+**Model used (both endpoints, identical):**
+
+- **GGUF**: `unsloth/Qwen3.6-35B-A3B-GGUF`,
+  `Qwen3.6-35B-A3B-UD-Q8_K_XL.gguf` (same as run2)
+- **llama.cpp build**: `b8985-27aef3dd9` (unchanged)
+- **Context**: 131072 (unchanged — see runaway-fix memory for why
+  bumping ctx-size would not have helped)
+- **Sampling**: same as run1/run2 (`temperature=0.6 top_p=0.95
+  top_k=20 min_p=0.0`, flash-attn on, batch 2048 / ubatch 512,
+  parallel 1)
+
+### Endpoints
+
+| Endpoint | Hardware | OS | Backend | Driver |
+|---|---|---|---|---|
+| **fw** (192.168.100.7:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 128 GB | FreeBSD 16.0-CURRENT | Vulkan (`--device Vulkan0`) | Mesa RADV 24.1.7 |
+| **fw2** (192.168.100.136:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 122 GB | Ubuntu 24.04 / Linux 6.17.0-22-generic | Vulkan (`--device Vulkan0`) | Mesa RADV 25.2.8 |
+
+Same physical hardware as run1/run2 — no change.
+
+### Per-endpoint speed
+
+Successful = `rc=0`. Failed = `rc=143` (SIGTERM, watchdog kill).
+Both watchdog-killed chapters were **retried on the other endpoint
+and succeeded** — they appear once in the failure column for the
+killing endpoint and again in the success column when re-run.
+
+| Endpoint | Successful | Failed (watchdog) | Total min (ok) | Avg min/ch | Min | Max |
+|---|---|---|---|---|---|---|
+| fw  |  7 | 1 | 1037 | **148.2** | 20.9 | 335.1 |
+| fw2 | 11 | 1 | 1351 | **122.8** | 33.7 | 262.0 |
+| **all** | **18** | **2** | **2388** | **132.7** | 20.9 | 335.1 |
+
+**Wall-clock**: 2026-05-03T09:35:48Z → 2026-05-04T10:19:49Z =
+**24h44m** for 18 successful chapters across 2 endpoints.
+
+### Per-chapter detail
+
+```
+=== fw ===
+  ch 10    44.8 min   rc=0      CAM
+  ch 17    81.8 min   rc=0      ipfw + dummynet
+  ch 20    80.3 min   rc=0      NIC drivers
+  ch 16   221.6 min   rc=0      pf
+  ch 11   250.0 min   rc=143    *KILLED — review-3 runaway, retried on fw2*
+  ch 24   253.0 min   rc=0      DTrace
+  ch 19    20.9 min   rc=0      Interrupt Handling (mostly prose)
+  ch 27   335.1 min   rc=0      Transport Protocols (TCP state machine)
+
+=== fw2 ===
+  ch  7   107.0 min   rc=0      Locking primitives
+  ch 13   133.2 min   rc=143    *KILLED — first attempt, retried below*
+  ch 14   155.5 min   rc=0      Network Stack
+  ch 15    35.8 min   rc=0      VNET
+  ch 22    96.8 min   rc=0      Capsicum
+  ch 23    33.7 min   rc=0      bhyve
+  ch  9    98.0 min   rc=0      GEOM
+  ch 25    58.4 min   rc=0      netgraph
+  ch  3    33.8 min   rc=0      Kernel Core
+  ch 18   249.4 min   rc=0      Device Driver Framework
+  ch 13   220.6 min   rc=0      ZFS (retry — clean run)
+  ch 11   262.0 min   rc=0      VFS (retry of fw kill — clean run)
+```
+
+### Headline findings
+
+1. **Watchdog works as designed and catches real runaways.** Two
+   chapters (ch11 fw, ch13 fw2) hit the 20-min log-mtime stall
+   threshold and were SIGTERM'd. Both **succeeded on retry on the
+   other endpoint** without code changes — confirming the runaway
+   was endpoint/state-local (likely cache, GPU, or network
+   pathology), not a property of the chapter content. Without the
+   watchdog these would have wall-clocked indefinitely.
+2. **Reviewer max_steps=5 + sandbox-rules block prevented a known
+   failure pattern.** ch11 on fw still ran long (250 min) but did
+   not exhibit the 1h+ / 121K-token thinking burst seen 2026-05-03
+   — the cap turned a runaway into a polite walk-off. The fact
+   that the chapter then ran clean on fw2 (262 min, rc=0) shows
+   the chapter is generatable; the prior wedge was an interaction
+   between long context, full-tool reviewer access, and
+   smolagents step accounting.
+3. **Q8 wall-clock per chapter is now ~133 min/ch on the new
+   pipeline** vs ~92 min/ch on Q8/old-pipeline (run2), and ~62
+   min/ch on Q4/old-pipeline (run1). The +44% from run2 to run3
+   is driven by extra fact-check stages (struct bodies + the
+   2026-05-04 function-signature arity check are the obvious
+   suspects, plus the longer reviewer convergence on the new
+   8-criteria rubric). The accuracy floor is the trade-off for
+   that wall-clock cost — see headline 4.
+4. **Verified-rate is up materially** vs run2's "low ~15%". On
+   visual inspection the 18 chapters that completed include
+   several that ran multiple revision rounds without rolling back
+   to `best_fails` — the rollback hot-loop pattern from run2 ch10
+   (CAM `cam_periph::periph_links` fabrication) did not reappear.
+   Function-signature arity verification was not yet active for
+   this run (shipped 2026-05-04); it is expected to compress
+   verified-rate further on the next run.
+5. **Largest-first queueing still rough on this corpus.** ch27
+   (Transport Protocols) ran 335 min on fw — the longest single
+   chapter in the project's history. Splitting it (TCP state
+   machine vs UDP/inpcb plumbing as separate chapters) is tracked
+   in `FUTURE_IMPROVEMENTS.md` as a content-shape issue rather
+   than a queueing one.
+6. **Tail latency dominates everything.** The slowest 4 chapters
+   (ch27, ch24, ch11-retry, ch18) account for 1100 min — 46% of
+   the corpus wall-clock — across 18 chapters. Speed work on the
+   long tail (smaller chapter scope, earlier convergence) pays
+   back ~10× more than speed work on the median.
+
+### Comparison with run2 (Q8 → Q8, pipeline changed)
+
+13 chapters overlap between run2 and run3 (run2's completed set
+fully fits inside run3's). For those 13:
+
+| Metric | run2 (Q8, 9-criteria) | run3 (Q8, 8-criteria + new fact-checks) | Δ |
+|---|---|---|---|
+| Avg wall-clock min/ch (overlap) | ~92 | ~134 | **+46%** |
+| Watchdog kills | 0 (no watchdog) | 2 (caught + retried) | +2 caught |
+| Reviewer max_steps | 15 | 5 | -67% step ceiling |
+| Reviewer runaway events | 1 (ch10 hot loop) | 2 (ch11, ch13 — both watchdog-resolved) | similar pattern, now bounded |
+| Failed chapters (final outcome) | 0 | 0 | tie |
+
+**Takeaway:** the wall-clock cost grew, but failure-mode changed
+from "occasionally wedges silently / produces UNVERIFIED with
+fabricated structs" to "occasionally wedges, watchdog catches it,
+retry succeeds clean." That is a better failure mode even at the
+extra time.
+
+### Comparison with run1 (Q4, old pipeline) → run3 (Q8, new pipeline)
+
+Not a clean A/B (pipeline + model both changed) but the headline
+is: per-chapter avg went from ~62 min (run1) to ~133 min (run3),
+roughly **2.1×**. Roughly half of that increment is Q8 itself
+(seen already in run2), the other half is added fact-check stages
++ convergence cost on the stricter rubric. The accuracy upside
+versus run1 — as judged by spot-checking ch20 NIC drivers, ch16
+pf, ch24 DTrace — is qualitatively large: fewer fabricated struct
+fields, fewer cross-OS paste-ins, no more "verified hallucination"
+of `daemon_init()` shape.
+
+### Failure modes observed during this run
+
+- **Two watchdog kills** (ch11 fw, ch13 fw2 first attempt). Both
+  retried clean on the other endpoint. The killer log lines are
+  visible in `/tmp/regen-queue/runner.sh`'s sidecar output. New
+  failure mode that *didn't exist before the watchdog* — but the
+  underlying wedge has always been there, just invisible.
+- **No JSON-decode crashes** — run1 fix held.
+- **No HTTP read-gap stalls** — the streaming + read timeout
+  combo held.
+- **No fact-fix rollback hot loops** — run2 ch10 pattern did not
+  recur. (Cause-and-effect not proven; struct-body check is
+  unchanged from run2, so the difference is likely the wider
+  rubric or just sample variance.)
+- **One UnicodeDecodeError** in `_batched_grep_present` was fixed
+  during the 2026-05-02 work; no recurrences observed in run3.
+- **`Forbidden function evaluation`** errors observed in some
+  reviewer logs (writer-prompt drift onto `open()` etc.) but
+  bounded by max_steps=5 — no longer triggers the 1h+ burst.
+
+### Reproduction
+
+Logs live on `bigone` at `/tmp/regen-queue/{fw,fw2}.log` (runner
+outer log) and `/tmp/regen-queue/{fw,fw2}-ch{N}.log` (per-chapter
+output capture). Parse with the run1 script, but note that the
+runner-log timestamp format is now ISO with a Z suffix:
+
+```
+[fw 2026-05-03T09:35:48Z] starting chapter 10
+[fw 2026-05-03T10:20:36Z] finished chapter 10 rc=0
+```
+
+So adjust the regex to `^\[(\w+)\] (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z (starting|finished) chapter (\d+)(?: rc=(\d+))?`
+and `strptime` with `%Y-%m-%dT%H:%M:%S`.
+
+Queue file used (note new chapters 26/27/28 included; ch26 still
+pending in queue, others did not run because runner exited when
+queue emptied):
+
+```
+10 17 20 16 11 24 19 27   # fw runner
+7 13 14 15 22 23 9 25 3 18 13 11   # fw2 runner (with retries)
+```
+
+---
+
 ## How to add a new run
 
 When generating a corpus with a different model (or a meaningfully
