@@ -1,0 +1,14 @@
+# Secrets / local config
+.env
+.qwen/
+
+# Build cache: TF-IDF index, corpus dump, book hashes (regenerated from books)
+.index/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Generated output (rebuildable via --index-only). The generated chapter
+# READMEs live in $FREEBSD_SRC, not here; the index follows the same rule.
+CHAPTER_INDEX.md
