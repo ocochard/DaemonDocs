@@ -1097,6 +1097,28 @@ def get_or_build_index(corpus_path: str, force: bool = False) -> TfidfIndex:
 # ---------------------------------------------------------------------------
 
 
+def _safe_src_path(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve an agent-supplied `path` against SRC_ROOT and confine it.
+
+    The writer/reviewer agents choose these paths, so a naive
+    `os.path.join(SRC_ROOT, path)` is a traversal hole: `../../etc/passwd`
+    climbs out of the tree, and an absolute `path` makes `os.path.join`
+    discard SRC_ROOT entirely. Both let the agent read any file the
+    process can.
+
+    Returns `(resolved_abspath, None)` when `path` stays inside SRC_ROOT,
+    or `(None, error_message)` when it escapes. Callers surface the error
+    string in their own tool-output style. Symlinks are resolved with
+    `realpath` on both ends so a symlink inside the tree can't be used to
+    hop out either.
+    """
+    root = os.path.realpath(SRC_ROOT)
+    full = os.path.realpath(os.path.join(SRC_ROOT, path))
+    if full == root or full.startswith(root + os.sep):
+        return full, None
+    return None, f"Error: '{path}' resolves outside the source tree"
+
+
 class ReadFreeBSDSource(Tool):
     """Read source code files from the FreeBSD tree."""
 
@@ -1115,7 +1137,9 @@ class ReadFreeBSDSource(Tool):
     output_type = "string"
 
     def forward(self, path: str) -> str:
-        full = os.path.join(SRC_ROOT, path)
+        full, err = _safe_src_path(path)
+        if err:
+            return err
         try:
             if not os.path.exists(full):
                 # Try glob for partial matches
@@ -1194,7 +1218,9 @@ class ExploreTree(Tool):
     output_type = "string"
 
     def forward(self, path: str) -> str:
-        full = os.path.join(SRC_ROOT, path)
+        full, err = _safe_src_path(path)
+        if err:
+            return err
         try:
             if not os.path.isdir(full):
                 return f"Not a directory: '{path}'"
@@ -1393,7 +1419,9 @@ class DirectoryMap(Tool):
     output_type = "string"
 
     def forward(self, path: str) -> str:
-        full = os.path.join(SRC_ROOT, path)
+        full, err = _safe_src_path(path)
+        if err:
+            return err
         if not os.path.isdir(full):
             return f"Not a directory: '{path}'"
 
@@ -1648,7 +1676,8 @@ class ResolveCDefinition(Tool):
 
         files_to_search = set()
 
-        if start_file and os.path.exists(os.path.join(SRC_ROOT, start_file)):
+        start_full, start_err = _safe_src_path(start_file) if start_file else (None, None)
+        if start_file and start_err is None and os.path.exists(start_full):
             # Trace #include chain from start file
             visited = set()
             queue = [start_file]
@@ -1660,7 +1689,9 @@ class ResolveCDefinition(Tool):
                 files_to_search.add(current)
 
                 try:
-                    full_path = os.path.join(SRC_ROOT, current)
+                    full_path, cur_err = _safe_src_path(current)
+                    if cur_err:
+                        continue
                     content = Path(full_path).read_text(errors="ignore")
                     includes = _extract_includes(content)
                     for inc in includes:
@@ -1837,6 +1868,24 @@ def gather_source_context(chapter: dict) -> str:
 # ---------------------------------------------------------------------------
 # 4. Chapter Prompt Builder
 # ---------------------------------------------------------------------------
+
+
+# Single source of truth for the "no marketing language" ban. The writer
+# prompt warns against these; the reviewer prompt FAILs on them. Previously
+# each prompt carried its own hand-maintained copy and they had already
+# drifted (the writer forbade "advanced" but the reviewer's list omitted it,
+# so it was instructed-but-unenforced). Both prompts now interpolate this
+# constant, so the writer's warning and the reviewer's gate can never
+# disagree again. Keep the phrasing free of double quotes — it is embedded
+# in f-strings and, downstream, in the reviewer's JSON-emitting prompt.
+_FORBIDDEN_MARKETING_WORDS = (
+    "comprehensive, robust, seamless, seamlessly, leverage, leveraging, "
+    "cutting-edge, state-of-the-art, elegant, powerful, simply, easily, "
+    "effortlessly, blazing-fast, world-class, best-in-class, "
+    "industry-leading, rich set of, wide range of, wide variety of, "
+    "tight integration, deep integration, first-class, rock-solid, "
+    "battle-tested, modern, sophisticated, advanced"
+)
 
 
 # Section catalog. Each entry maps the H2 header name to:
@@ -2391,15 +2440,11 @@ def build_chapter_prompt(chapter: dict) -> str:
 
         **No marketing language.** This is a technical reference, not a
         product brochure. Forbidden words and phrases — do NOT use any of
-        them, even rephrased: comprehensive, robust, seamless, seamlessly,
-        leverage, leveraging, cutting-edge, state-of-the-art, elegant,
-        powerful, simply, easily, effortlessly, blazing-fast, world-class,
-        best-in-class, industry-leading, rich set of, wide range of,
-        wide variety of, tight integration, deep integration, first-class,
-        rock-solid, battle-tested, modern, sophisticated, advanced
-        (as a generic adjective; the section title is fine). If a sentence
-        relies on one of these words to be impressive, the sentence is
-        empty — replace it with a concrete fact or delete it.
+        them, even rephrased: {_FORBIDDEN_MARKETING_WORDS}. ("advanced" is
+        banned as a generic adjective; the section title "Advanced Notes"
+        is fine.) If a sentence relies on one of these words to be
+        impressive, the sentence is empty — replace it with a concrete
+        fact or delete it.
 
         **Explain WHY a non-obvious structure exists, not just what it
         is.** When you introduce a non-trivial data structure or mechanism
@@ -2742,14 +2787,11 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            do not flag missing sections that are not on this list.
 
         7. **No marketing language** — FAIL if the draft contains any of
-           these words or phrases (or close paraphrases): comprehensive,
-           robust, seamless(ly), leverage/leveraging, cutting-edge,
-           state-of-the-art, elegant, powerful, simply/easily/effortlessly,
-           blazing-fast, world-class, best-in-class, industry-leading,
-           rich set of, wide range of, wide variety of, tight/deep
-           integration, first-class, rock-solid, battle-tested, modern,
-           sophisticated. Quote the offending sentence(s) in the issue
-           text so the writer can find and remove them.
+           these words or phrases (or close paraphrases):
+           {_FORBIDDEN_MARKETING_WORDS}. ("advanced" as a generic adjective
+           only; the section title "Advanced Notes" is allowed.) Quote the
+           offending sentence(s) in the issue text so the writer can find
+           and remove them.
 
         8. **Rationale** — When the draft introduces a non-obvious data
            structure or mechanism (shadow chains, inactive queues, UMA
@@ -3248,13 +3290,28 @@ def load_chapters() -> List[dict]:
     return data.get("chapters", [])
 
 
+# Canonical list of reviewer criteria — the single source of truth for the
+# criterion COUNT used in every "N/total pass" print and the best-draft
+# fail-count bookkeeping. These are the keys the reviewer is instructed to
+# emit in build_review_prompt's JSON schema; mermaid_diagram is always
+# present (graded when a diagram is wanted, "PASS: not required" otherwise).
+# Deriving the count from here means adding/removing a criterion in the
+# rubric can't silently desync the display math — previously the count `8`
+# was hard-coded in ~6 places and CODE_MAP had to warn "bump manually."
+_REVIEW_CRITERIA = (
+    "completeness", "accuracy", "source_coverage", "mermaid_diagram",
+    "accessibility", "structure", "no_marketing", "rationale",
+)
+_N_CRITERIA = len(_REVIEW_CRITERIA)
+
+
 def _review_passes(review_json: Optional[dict]) -> bool:
     """Review gate: criteria are the canonical assessment, not `grade`/`issues`.
 
     History: an earlier version accepted on grade==PASS *or* empty issues,
     which silently approved drafts where individual criteria said FAIL.
     The over-correction was to also require empty issues — but that ran
-    into a second failure mode where the reviewer marks all 8 criteria
+    into a second failure mode where the reviewer marks all criteria
     PASS and still pads `issues` with stylistic nits, forcing another
     revision round (and risking regressions where the writer reintroduces
     bugs we already fixed).
@@ -3289,10 +3346,10 @@ def _criteria_fail_count(criteria: object) -> int:
     null or list values. Treat anything non-string as a failure (safer
     default for the summary line).
     """
-    # 8 criteria total: completeness, accuracy, source_coverage,
-    # mermaid_diagram, accessibility, structure, no_marketing, rationale.
+    # Broken-JSON worst case: assume every criterion failed. The count
+    # is derived from _REVIEW_CRITERIA so it tracks the rubric.
     if not isinstance(criteria, dict):
-        return 8
+        return _N_CRITERIA
     fails = 0
     for v in criteria.values():
         if not isinstance(v, str) or v.startswith("FAIL"):
@@ -3478,15 +3535,16 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         # last (worse) draft. Instead we keep the draft from the round
         # with the fewest FAIL criteria; ties go to the *later* round
         # (later drafts have had more issues addressed even if criteria
-        # count is unchanged). best_fails starts at 9 — strictly worse
-        # than any real review (max possible is 8) — so the very first
-        # graded draft always wins on first comparison.
+        # count is unchanged). best_fails starts at _N_CRITERIA + 1 —
+        # strictly worse than any real review (max possible is
+        # _N_CRITERIA) — so the very first graded draft always wins on
+        # first comparison.
         warnings: List[str] = []
         revision = 0
         approved = False
         parse_retry_used = False
         best_draft = draft
-        best_fails = 9
+        best_fails = _N_CRITERIA + 1
         best_round = 0
         last_fails: Optional[int] = None  # fail_count of the most recent graded round
 
@@ -3519,7 +3577,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             criteria = review_json.get("criteria", {}) or {}
 
             fail_count = _criteria_fail_count(criteria)
-            print(f"         grade={grade}  ({8 - fail_count}/8 criteria pass)")
+            print(f"         grade={grade}  "
+                  f"({_N_CRITERIA - fail_count}/{_N_CRITERIA} criteria pass)")
             # Print every issue and every praise — truncating these hides
             # the diagnostic information needed to figure out why the
             # reviewer didn't approve. The log is verbose by design.
@@ -3587,13 +3646,15 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 and last_fails > best_fails
             ):
                 print(f"  [rollback] revision {revision} regressed "
-                      f"({8 - last_fails}/8) — using revision {best_round} "
-                      f"({8 - best_fails}/8) instead")
+                      f"({_N_CRITERIA - last_fails}/{_N_CRITERIA}) — using "
+                      f"revision {best_round} "
+                      f"({_N_CRITERIA - best_fails}/{_N_CRITERIA}) instead")
                 draft = best_draft
                 warnings.append(
                     f"revisions regressed; kept revision {best_round} "
-                    f"({8 - best_fails}/8 criteria) over revision {revision} "
-                    f"({8 - last_fails}/8)"
+                    f"({_N_CRITERIA - best_fails}/{_N_CRITERIA} criteria) over "
+                    f"revision {revision} "
+                    f"({_N_CRITERIA - last_fails}/{_N_CRITERIA})"
                 )
 
         # ---- Fact-checking pass ----
@@ -4891,9 +4952,42 @@ _FACT_CHECK_CACHE: Dict[Tuple[str, str, str], bool] = {}
 # treated as unverified, which cascades into reviewer accuracy:FAIL.
 _GREP_TIMEOUT_SEC = 30
 
+# Corpus-level grep-output cache for the small, near-static macro corpora
+# (kernel-config options, SDT probes). Unlike the per-symbol
+# `_FACT_CHECK_CACHE`, these checks match every candidate against the SAME
+# grep output, so caching the output once per (kind, root) turns N grabs —
+# one per revision round — into a single grep for the whole run. Keyed by
+# an opaque string the caller builds; the value is the captured stdout.
+# A timeout is never stored (fail-closed, must be retryable next round).
+_GREP_CORPUS_CACHE: Dict[str, str] = {}
+
+
+def _cached_grep_corpus(cache_key: str, cmd: str) -> Optional[str]:
+    """Run `cmd` once per `cache_key`, caching stdout for the run.
+
+    Returns the captured stdout, or `None` on timeout. `None` is NOT
+    cached: the timeout is transient, so the next round retries. This is
+    the fail-closed policy shared with `_batched_grep_present` — a caller
+    that gets `None` must flag every candidate as unverified rather than
+    silently approving it.
+    """
+    if cache_key in _GREP_CORPUS_CACHE:
+        return _GREP_CORPUS_CACHE[cache_key]
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            errors='replace', timeout=_GREP_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  ⚠ fact-check grep timed out after {_GREP_TIMEOUT_SEC}s "
+              f"({cache_key}) — treating candidates as unverified")
+        return None
+    _GREP_CORPUS_CACHE[cache_key] = result.stdout
+    return result.stdout
+
 
 def _batched_grep_present(symbols: List[str], pattern_template: str,
-                          search_roots, shape_grep: str) -> set:
+                          search_roots, shape_grep: str) -> Optional[set]:
     """Run one grep over `search_roots` looking for any of `symbols`.
 
     `search_roots` is a string (single root) or a sequence of strings
@@ -4960,14 +5054,18 @@ def _batched_grep_present(symbols: List[str], pattern_template: str,
             errors='replace', timeout=_GREP_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
-        # Conservative behaviour: treat a timeout as "verification not
-        # available" — return empty set so callers report all symbols as
-        # not-found rather than silently approving them. The fact-check
-        # is itself best-effort, but a silent timeout would mask real
-        # hallucinations, which is the failure mode we care most about.
+        # Conservative (fail-closed) behaviour: treat a timeout as
+        # "verification not available" so callers report all symbols as
+        # not-found rather than silently approving them. A silent timeout
+        # would mask real hallucinations, the failure mode we care most
+        # about. We return `None` (NOT an empty set) so the caller can
+        # tell "grep ran, nothing matched" (cacheable) apart from "grep
+        # timed out" (must NOT be cached — a transient timeout would
+        # otherwise poison the cache and mark these symbols missing for
+        # the rest of the run).
         print(f"  ⚠ fact-check grep timed out after {_GREP_TIMEOUT_SEC}s — "
               f"treating {len(symbols)} symbol(s) as unverified")
-        return set()
+        return None
 
     output = result.stdout
     if not output:
@@ -5049,11 +5147,18 @@ def _verify_with_cache(kind: str, symbols: List[str], src_root: str,
         present = _batched_grep_present(
             uncached, pattern_template, search_roots, shape_grep,
         )
-        for s in uncached:
-            present_now = s in present
-            _FACT_CHECK_CACHE[(kind, cache_root, s)] = present_now
-            if not present_now:
-                not_found.append(s)
+        if present is None:
+            # Grep timed out. Fail closed — flag every uncached symbol as
+            # not-found this round — but do NOT cache the verdict: the
+            # timeout is transient and caching `False` would keep these
+            # symbols flagged for every later round in the run.
+            not_found.extend(uncached)
+        else:
+            for s in uncached:
+                present_now = s in present
+                _FACT_CHECK_CACHE[(kind, cache_root, s)] = present_now
+                if not present_now:
+                    not_found.append(s)
 
     return not_found
 
@@ -5213,21 +5318,22 @@ def _verify_kernel_options(options: List[str], src_root: str) -> List[str]:
     sys_conf = os.path.join(src_root, "sys", "conf")
     if not os.path.isdir(sys_conf):
         return []  # can't verify — don't flag
-    fixed_args = " ".join(f"-e {shlex.quote(s)}" for s in options)
+    # The option corpus (sys/conf/options*, NOTES) is the same regardless
+    # of which options we're checking, so grep it once per run and match
+    # every candidate against the cached output. `-w` on any option name
+    # keeps the grep cheap; we widen the match set to all options here so
+    # the cache key is stable across revision rounds that check different
+    # subsets.
     cmd = (
-        f"grep -rhwF "
+        f"grep -rh "
         f"--include='options' --include='options.*' --include='NOTES' "
-        f"{fixed_args} {shlex.quote(sys_conf)}/ 2>/dev/null | "
+        f"-E '[A-Z][A-Z0-9_]{{3,}}' {shlex.quote(sys_conf)}/ 2>/dev/null | "
         f"head -c 524288"
     )
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            errors='replace', timeout=_GREP_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        return []  # treat as unverified rather than all-missing
-    output = result.stdout
+    output = _cached_grep_corpus(f"kernopt::{sys_conf}", cmd)
+    if output is None:
+        # Fail closed: grep timed out, flag all candidates as unverified.
+        return list(options)
     not_found = []
     for opt in options:
         # Word-boundary check; `re.search` is fine since the corpus is small.
@@ -5270,20 +5376,18 @@ def _verify_dtrace_probes(probes: List[Tuple[str, str]],
         return []
     # Pull all SDT_PROBE_DEFINE* lines from sys/. The grep is cheap because
     # the macro is rare. The 1 MB cap is generous; the FreeBSD tree has a
-    # few hundred SDT probes total.
+    # few hundred SDT probes total. The corpus is identical regardless of
+    # which probes we check, so cache it once per run rather than grepping
+    # all of sys/ on every revision round.
     cmd = (
         f"grep -rhE --include='*.c' --include='*.h' "
         f"'SDT_PROBE_DEFINE[0-9]?\\b' {shlex.quote(sys_root)}/ 2>/dev/null | "
         f"head -c 1048576"
     )
-    try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            errors='replace', timeout=_GREP_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        return []
-    output = result.stdout
+    output = _cached_grep_corpus(f"sdtprobe::{sys_root}", cmd)
+    if output is None:
+        # Fail closed: grep timed out, flag all candidates as unverified.
+        return [f"{p}:::{n}" for p, n in probes]
     not_found = []
     for provider, name in probes:
         # Match `SDT_PROBE_DEFINE…(provider, anything, anything, name`
@@ -5773,7 +5877,13 @@ def _real_struct_fields(struct_name: str, src_root: str,
             errors="replace", timeout=_GREP_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
-        _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
+        # Verification unavailable this round. Return empty (callers treat
+        # empty as "don't flag" — the fail-open contract is deliberate for
+        # struct-body checks, where flagging every field on a transient
+        # timeout would be a false-positive storm). But do NOT cache it:
+        # a cached empty set would keep this struct unverifiable for the
+        # rest of the run even after the pressure that caused the timeout
+        # is gone.
         return frozenset()
 
     candidates = [
@@ -5919,7 +6029,10 @@ def _real_function_signature(
             errors="replace", timeout=_GREP_TIMEOUT_SEC,
         )
     except subprocess.TimeoutExpired:
-        _FUNC_SIG_CACHE[cache_key] = None
+        # Verification unavailable this round — callers treat None as
+        # "don't flag." Do NOT cache: a cached None would keep this
+        # function unverifiable for the rest of the run even after the
+        # transient timeout clears (see _real_struct_fields).
         return None
 
     candidates = [
