@@ -20,8 +20,11 @@ before changing pipeline behavior).
 The file is divided by `# ---` banner comments. In source order:
 
 1. **Configuration** — `SRC_ROOT`, `BOOKS_DIR`, `MODEL_CONFIG`,
-   `RESOLVED_PROVENANCE`. Env vars: `FREEBSD_SRC`, `BOOKS_DIR`,
-   `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`.
+   `RESOLVED_PROVENANCE`, `SYSCTL_GRAPH` + `_sysctl_graph_available`
+   (optional codebase-memory-mcp backend for sysctl fact-check). Env
+   vars: `FREEBSD_SRC`, `BOOKS_DIR`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
+   `OPENAI_MODEL`, `CODEBASE_MEMORY_MCP_BIN`, `SYSCTL_GRAPH_PROJECT`,
+   `SYSCTL_GRAPH_TIMEOUT`.
 2. **Book corpus extraction** — PDF/CHM/EPUB → text; FreeBSD
    handbook + man pages + git logs. Builds the searchable corpus.
 3. **TF-IDF index** — `class TfidfIndex`, `get_or_build_index`.
@@ -43,7 +46,10 @@ The file is divided by `# ---` banner comments. In source order:
    `_review_passes` (the gate), `load_chapters`, `_extract_json`.
 8. **Fact-checking** — symbol/path extractors, verifiers, the
    `_FACT_CHECK_CACHE`, `fact_check_draft`,
-   `_build_fact_check_prompt`.
+   `_build_fact_check_prompt`. All verifiers are grep-over-`sys/`
+   EXCEPT the sysctl OID pair (`_extract_sysctls` /
+   `_verify_sysctls_via_graph`), which queries the optional
+   codebase-memory-mcp graph — the one symbol class grep cannot check.
 
 (Two more banner sections follow that aren't part of the
 per-chapter pipeline: **Cross-README navigation** —
@@ -112,7 +118,8 @@ pattern.
 | Inject ground truth into the reviewer | `build_review_prompt` | Pre-validate before the prompt is rendered, build a `verified_FOO_block` string, interpolate it alongside the existing `verified_block` / `symbol_block` / `macro_block`. The Accuracy criterion and the **No hedges** block reference these blocks by name — update both when adding a new ground-truth category. |
 | Inject ground truth into the writer | `_build_symbol_catalog` (called by `build_chapter_prompt`) | Pre-extract real symbol names from the chapter's `source_files` + bounded `source_dirs` sample, render an `## Authoritative Symbol Catalog` block. Caps live in `_CATALOG_MAX_*` and `_CATALOG_FILES_PER_DIR` — keep them tight; this is prompt-cost, not fact-check-cost. To add a new symbol kind, extend `_dirmap_extract_names` (which is shared with `directory_map`). |
 | Add a new section type (output template) | `_SECTION_CATALOG` | Each entry has `template_body`, `rubric_body`. Per-chapter section list comes from `_chapter_sections(chapter)` reading `sections:` in `chapters.yaml`. |
-| Add a new fact-check verifier | Banner **Fact-checking** | Pair: `_extract_FOO(text) -> List` and `_verify_FOO(items, src_root, extra_search_dirs=None) -> List[missing]`. Use `_verify_with_cache` if the verifier is a grep over `sys/` (free re-runs via `_FACT_CHECK_CACHE`). Wire into `fact_check_draft` and `_build_fact_check_prompt`. Existing examples: structs, functions, kernel options, DTrace probes, MALLOC_DEFINE tags. |
+| Add a new fact-check verifier | Banner **Fact-checking** | Pair: `_extract_FOO(text) -> List` and `_verify_FOO(items, src_root, extra_search_dirs=None) -> List[missing]`. Use `_verify_with_cache` if the verifier is a grep over `sys/` (free re-runs via `_FACT_CHECK_CACHE`). Wire into `fact_check_draft` and `_build_fact_check_prompt`. Existing examples: structs, functions, kernel options, DTrace probes, MALLOC_DEFINE tags, sysctl OIDs (graph-backed — see next row). |
+| Add a **graph-backed** verifier (something grep can't check) | Banner **Fact-checking**, model on the sysctl OID pair | `_extract_sysctls` + `_verify_sysctls_via_graph` query the `codebase-memory-mcp` graph via its `cli <tool>` subcommand instead of grep — sysctl OIDs (`vm.pmap.pde.mappings`) are assembled from `SYSCTL_*` macros and exist nowhere as a literal, so grep provably can't verify them; the indexer reconstructs the OID tree into `Sysctl` nodes. The backend is OPTIONAL: gate every graph call on `_sysctl_graph_available()` (cached probe that prints ONE warning when off) and return `[]` when unavailable so the pipeline never blocks. Cache per-item in a dedicated dict (`_SYSCTL_GRAPH_CACHE`), NOT the grep `_FACT_CHECK_CACHE` (different backend + key space). "Not found" is reported as *suspect* not *hallucinated* because ~1/3 of OID nodes are `resolved:false`. Config + probe live in the **Configuration** banner (`SYSCTL_GRAPH`, `_sysctl_graph_available`). |
 | Verify symbols outside `sys/` (e.g. `stand/`) | `chapters.yaml` `extra_search_dirs:` | Per-chapter list of additional grep roots, joined to `~/freebsd-src`. `_resolve_search_roots` always includes `<src>/sys` and appends each existing extra. The cache key embeds a sorted-tuple suffix so widening roots for one chapter does NOT poison the sys-only cache for others. Use this when a chapter's subject (boot loader, userland tool) lives outside `sys/`. |
 | Catch struct bodies hallucinated wholesale | `_verify_struct_bodies` returns `(bogus, abridged)` | The bogus-field check (per-field grep) misses bodies where every claimed field is fabricated together. The overlap-threshold layer flags any non-abridged body whose claimed-field set has zero overlap with the real top-level fields (≥4 real fields). `_struct_body_is_abridged` recognizes `...`, `\u2026`, and comments containing `elided`/`omitted`/`for brevity`/etc — writers can opt out by elision. Wired into `fact_check_draft` as `struct_bodies_abridged`. |
 | Catch arity-mismatched function signatures ("verified hallucination") | `_extract_function_signatures` + `_real_function_signature` + `_verify_function_signatures`, wired as `func_sigs_mismatch` | Names of real FreeBSD functions can be combined with stale 2022-era arg lists from the model's training data — every existing check passes (name, paths, fields) while the chapter teaches the wrong API. The new pass parses fenced ```c definitions only (call-site arity is too noisy), counts top-level commas with `_count_c_args` (skipping `void`, K&R-style, and nested parens for function-pointer args), and compares against the real definition arity grepped from the source tree. Cache: `_FUNC_SIG_CACHE` keyed `(cache_root, func_name)`. Returns `None` whenever lookup or parse is uncertain so we never false-flag. Skips names already in `funcs_not_found` to avoid double-reporting. |
@@ -176,6 +183,23 @@ pattern.
   run regardless of which chapter or revision round asked for it.
   This is why pre-validating symbols in `build_review_prompt` is
   effectively free for the post-review fact-check.
+- **The sysctl verifier is the only one that shells out to a graph,
+  and the only one that can silently verify nothing** — sysctl OID
+  paths (`vm.pmap.pde.mappings`) are built at compile time from
+  `SYSCTL_NODE`/`SYSCTL_INT`/... macro chains and appear nowhere in
+  the source as a literal string, so grep returns 0 for a REAL OID
+  exactly as for a fabricated one. codebase-memory-mcp reconstructs
+  the OID tree into `Sysctl` graph nodes; `_verify_sysctls_via_graph`
+  queries them via the binary's `cli search_graph` subcommand. When
+  the binary or index is absent, `_sysctl_graph_available()` returns
+  False (after one warning) and the verifier returns `[]` — by design,
+  so a machine without the graph still runs the full pipeline, just
+  without sysctl checking. A "not found" is phrased to the writer as
+  *suspect, verify against `sysctl(8)`* rather than *hallucinated*,
+  because ~1/3 of `Sysctl` nodes are `resolved:false` (parent chain
+  built from a macro arg the indexer couldn't resolve) and a real OID
+  can land among them — a false-negative, which is the safe direction
+  for a hallucination gate.
 - **`subprocess.run(..., text=True, errors='replace', ...)`** in
   every grep-over-tree site — FreeBSD source contains a few non-UTF8
   bytes (Latin-1 author names in old driver comments). Without the

@@ -39,6 +39,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -216,6 +217,121 @@ def _provenance_footer() -> str:
         f"on {ts} using model `{prov['model_name']}`{build}. "
         "AI-generated content — verify against source before relying on it._\n"
     )
+
+
+# --- Optional sysctl fact-check via codebase-memory-mcp --------------------
+#
+# Sysctl OID paths (`vm.pmap.pde.mappings`) are the one class of symbol
+# grep CANNOT verify: the dotted string exists nowhere in the source. It is
+# assembled at compile time from a chain of `SYSCTL_NODE`/`SYSCTL_INT`/...
+# macros whose leaves are bare identifiers (`OID_AUTO, mappings, ...`) under
+# parent OID nodes (`_vm_pmap_pde`). To know `vm.pmap.pde.mappings` is real
+# you must parse the macro tree and walk the parent chain — which the
+# codebase-memory-mcp indexer does, exposing each reconstructed OID as a
+# `Sysctl` graph node keyed by its full dotted `path`.
+#
+# This makes the graph an OPTIONAL fact-check backend, not a dependency:
+# when the `codebase-memory-mcp` binary and a ready index for the source
+# tree are both present, `_verify_sysctls_via_graph` verifies claimed OIDs
+# against it; otherwise the check silently no-ops (returns "nothing missing")
+# after printing a single warning. Everything else in the pipeline — and
+# every other fact-check verifier — is grep-based and works unchanged
+# without the graph. See CODE_MAP.md "Optional sysctl fact-check".
+SYSCTL_GRAPH = {
+    # The `codebase-memory-mcp` executable. Its `cli <tool>` subcommand runs
+    # one graph query and exits, so we shell out per OID (results are cached
+    # in `_SYSCTL_GRAPH_CACHE`, so re-runs within a session are free).
+    "bin": os.environ.get("CODEBASE_MEMORY_MCP_BIN", "codebase-memory-mcp"),
+    # The indexed project name. codebase-memory derives it from the repo
+    # path: `/usr/home/olivier/freebsd-src` -> `usr-home-olivier-freebsd-src`.
+    # Override with SYSCTL_GRAPH_PROJECT if your index is named differently.
+    "project": os.environ.get(
+        "SYSCTL_GRAPH_PROJECT",
+        SRC_ROOT.strip("/").replace("/", "-"),
+    ),
+    "timeout": float(os.environ.get("SYSCTL_GRAPH_TIMEOUT", "30")),
+}
+
+# Tri-state cache for the availability probe: None = not yet probed,
+# True/False = probed result. The probe runs at most once per process.
+_SYSCTL_GRAPH_OK: Optional[bool] = None
+
+
+def _sysctl_graph_available() -> bool:
+    """Return True iff the codebase-memory-mcp graph can verify sysctls.
+
+    Checks, once per process (result cached in `_SYSCTL_GRAPH_OK`):
+      1. the `codebase-memory-mcp` binary is on PATH / at the configured path,
+      2. it reports the configured project's index as `status: ready`.
+
+    On any failure prints ONE warning explaining that sysctl OID
+    verification is disabled and how to enable it, then returns False so
+    `_verify_sysctls_via_graph` degrades to a no-op. This is the
+    "graph optional" contract: the pipeline never blocks on it.
+    """
+    global _SYSCTL_GRAPH_OK
+    if _SYSCTL_GRAPH_OK is not None:
+        return _SYSCTL_GRAPH_OK
+
+    bin_path = shutil.which(SYSCTL_GRAPH["bin"]) or (
+        SYSCTL_GRAPH["bin"] if os.path.isfile(SYSCTL_GRAPH["bin"]) else None
+    )
+    if not bin_path:
+        print(
+            f"  [sysctl fact-check] disabled: '{SYSCTL_GRAPH['bin']}' not found. "
+            f"Sysctl OID names (kern.*, vm.*, …) will NOT be verified — they "
+            f"are the one symbol class grep cannot check. To enable, install "
+            f"codebase-memory-mcp and index the source tree, or set "
+            f"CODEBASE_MEMORY_MCP_BIN."
+        )
+        _SYSCTL_GRAPH_OK = False
+        return False
+
+    # Confirm the project index exists and is ready.
+    ready = False
+    try:
+        proc = subprocess.run(
+            [bin_path, "cli", "--json", "index_status",
+             "--project", SYSCTL_GRAPH["project"]],
+            capture_output=True, text=True, errors="replace",
+            timeout=SYSCTL_GRAPH["timeout"],
+        )
+        # `cli --json` emits log lines on stderr and the JSON payload on
+        # stdout; the payload is the last line starting with '{'.
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            payload = json.loads(line)
+            text = ""
+            if isinstance(payload.get("content"), list) and payload["content"]:
+                text = payload["content"][0].get("text", "")
+            # index_status ready-ness can appear either as a JSON field in
+            # the wrapped text or the structuredContent — match on the
+            # literal, which is stable across both encodings.
+            if '"status":"ready"' in text or '"status": "ready"' in text \
+                    or '"status":"indexed"' in text:
+                ready = True
+                break
+    except Exception:
+        ready = False
+
+    if not ready:
+        print(
+            f"  [sysctl fact-check] disabled: codebase-memory-mcp found but "
+            f"project '{SYSCTL_GRAPH['project']}' is not indexed/ready. "
+            f"Sysctl OID names will NOT be verified. To enable, run: "
+            f"{SYSCTL_GRAPH['bin']} cli index_repository --repo-path {SRC_ROOT} "
+            f"(or set SYSCTL_GRAPH_PROJECT to the correct index name)."
+        )
+    else:
+        print(
+            f"  [sysctl fact-check] enabled via codebase-memory-mcp "
+            f"(project '{SYSCTL_GRAPH['project']}')."
+        )
+    _SYSCTL_GRAPH_OK = ready
+    return ready
+
 
 # ---------------------------------------------------------------------------
 # 1. Book Text Extraction (PDF / CHM / EPUB)
@@ -5455,6 +5571,138 @@ def _verify_malloc_tags(tags: List[str], src_root: str) -> List[str]:
     )
 
 
+# --- Sysctl OID paths (graph-backed, optional) -----------------------------
+#
+# THE ONE SYMBOL CLASS GREP CANNOT VERIFY. A sysctl OID path such as
+# `vm.pmap.pde.mappings` exists nowhere in the source as a literal string —
+# it is assembled at compile time from a chain of SYSCTL_* macros:
+#
+#     SYSCTL_NODE(_vm,       OID_AUTO, pmap, ...)            -> vm.pmap
+#     SYSCTL_NODE(_vm_pmap,  OID_AUTO, pde,  ...)            -> vm.pmap.pde
+#     SYSCTL_COUNTER_U64(_vm_pmap_pde, OID_AUTO, mappings, ..)-> vm.pmap.pde.mappings
+#
+# The leaf (`mappings`) is a bare identifier token, and the prefix comes
+# from walking the `_vm_pmap_pde` parent chain. `grep vm.pmap.pde.mappings`
+# returns nothing for a REAL sysctl exactly as it does for a fabricated one,
+# so grep cannot tell them apart — and sysctls are a favorite writer
+# hallucination ("tune `net.inet.tcp.fictional_knob`").
+#
+# codebase-memory-mcp reconstructs the OID tree during indexing and stores
+# each resolved path as a `Sysctl` graph node. We verify a claimed OID with
+# an anchored `search_graph` name-pattern query against that label:
+# real -> 1 hit at the registration line, fabricated -> 0 hits.
+#
+# GRACEFUL DEGRADATION: this is the only verifier with an external backend.
+# When the graph is unavailable (`_sysctl_graph_available()` is False) it
+# returns [] — nothing flagged — after the probe's one-time warning. The
+# rest of fact-check is unaffected.
+#
+# FALSE-NEGATIVE, NOT FALSE-POSITIVE: ~1/3 of Sysctl nodes are `resolved:
+# false` (parent chain built from a macro arg / runtime string the indexer
+# could not resolve). Those never match a real dotted query, so a genuine
+# OID among them would be reported "not found". That is the SAFE direction
+# for a hallucination checker (over-flag, never under-flag), and it is why
+# the fact-fix prompt says "verify against sysctl(8)", NOT "hallucinated".
+
+# Canonical top-level OID namespaces (covers 99%+ of resolved OIDs plus the
+# `compat.*` tree). Scoping to these avoids matching arbitrary dotted prose
+# — method calls (`obj.method`), version strings, filenames — as sysctls.
+_SYSCTL_ROOTS = (
+    "kern", "vm", "net", "hw", "dev", "vfs", "debug", "security",
+    "machdep", "user", "compat", "kstat", "p1003_1b",
+)
+
+# Backticked OID: a canonical root followed by at least one `.segment`.
+# Requires >=2 segments total so a bare `kern` or `hw` never matches.
+_SYSCTL_OID_RE = re.compile(
+    r'`(' + r'|'.join(_SYSCTL_ROOTS) + r')((?:\.[a-z0-9_]+)+)`'
+)
+
+# Per-OID availability cache (True=real, False=not found). Separate from the
+# grep `_FACT_CHECK_CACHE` because the backend and key space are different.
+_SYSCTL_GRAPH_CACHE: Dict[str, bool] = {}
+
+
+def _extract_sysctls(text: str) -> List[str]:
+    """Extract claimed sysctl OID paths (`kern.ipc.maxsockbuf`) from a draft.
+
+    Only backticked tokens whose first segment is a canonical sysctl root
+    AND that have at least two dotted segments are collected — this keeps
+    ordinary dotted prose (method calls, filenames, version numbers) out of
+    the candidate set. Deduplicated, sorted.
+    """
+    found = set()
+    for m in _SYSCTL_OID_RE.finditer(text):
+        found.add(m.group(1) + m.group(2))
+    return sorted(found)
+
+
+def _sysctl_exists_in_graph(oid: str) -> Optional[bool]:
+    """Query the graph for one sysctl OID. True/False, or None on error.
+
+    Runs `codebase-memory-mcp cli search_graph` with an ANCHORED name
+    pattern (`^oid$`) restricted to the `Sysctl` label, and reads the
+    `total:` count from the wrapped tree-text payload. Returns None (not
+    False) on any subprocess/parse failure so the caller can distinguish
+    "verified absent" from "could not check" and avoid false-flagging.
+    """
+    # Anchor the regex; escape the dots so they match literally rather than
+    # any-char (an unescaped `kern.ipc` would also match `kernXipc`).
+    pattern = "^" + re.escape(oid) + "$"
+    try:
+        proc = subprocess.run(
+            [SYSCTL_GRAPH["bin"], "cli", "--json", "search_graph",
+             "--project", SYSCTL_GRAPH["project"],
+             "--name-pattern", pattern, "--label", "Sysctl", "--limit", "1"],
+            capture_output=True, text=True, errors="replace",
+            timeout=SYSCTL_GRAPH["timeout"],
+        )
+    except Exception:
+        return None
+
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("isError"):
+            return None
+        text = ""
+        if isinstance(payload.get("content"), list) and payload["content"]:
+            text = payload["content"][0].get("text", "")
+        m = re.search(r"total:\s*(\d+)", text)
+        if m:
+            return int(m.group(1)) > 0
+    return None
+
+
+def _verify_sysctls_via_graph(oids: List[str]) -> List[str]:
+    """Return the subset of `oids` NOT found as resolved sysctl nodes.
+
+    No-op (returns []) when the graph backend is unavailable — the "graph
+    optional" contract. OIDs whose lookup errors out (None) are treated as
+    present, never flagged: we only report an OID as suspect when the graph
+    positively returns zero matches. Results are cached per OID.
+    """
+    if not oids or not _sysctl_graph_available():
+        return []
+    missing = []
+    for oid in oids:
+        cached = _SYSCTL_GRAPH_CACHE.get(oid)
+        if cached is None:
+            exists = _sysctl_exists_in_graph(oid)
+            # None (lookup failed) -> treat as present so a flaky backend
+            # never manufactures a "hallucinated sysctl" finding.
+            cached = True if exists is None else exists
+            _SYSCTL_GRAPH_CACHE[oid] = cached
+        if not cached:
+            missing.append(oid)
+    return missing
+
+
 # --- Struct-body field verification ---------------------------------------
 #
 # Writers paraphrase struct definitions from training-data memory: they
@@ -6378,6 +6626,14 @@ def fact_check_draft(draft: str, src_root: str,
         - 'kernel_options_not_found': list of unverifiable kernel-config options
         - 'dtrace_probes_not_found': list of unverifiable DTrace SDT probes
         - 'malloc_tags_not_found': list of unverifiable MALLOC_DEFINE tags
+        - 'sysctls_not_found': list of sysctl OID paths not found as resolved
+          nodes in the codebase-memory-mcp graph. Sysctl OIDs are the one
+          symbol class grep cannot verify (the dotted path is assembled from
+          SYSCTL_* macros and appears nowhere as a literal). ALWAYS empty
+          when the graph backend is unavailable — this verifier degrades to
+          a no-op rather than blocking the pipeline. Reported as "suspect,
+          verify against sysctl(8)" not "hallucinated", because ~1/3 of OID
+          nodes have an unresolved parent chain (false-negative risk).
         - 'total_issues': count of all issues
 
     Any legacy `## Comparison` section is stripped before extraction
@@ -6401,6 +6657,7 @@ def fact_check_draft(draft: str, src_root: str,
     kernel_options = _extract_kernel_options(fact_text)
     dtrace_probes = _extract_dtrace_probes(fact_text)
     malloc_tags = _extract_malloc_tags(fact_text)
+    sysctls = _extract_sysctls(fact_text)
 
     paths_missing = _verify_file_paths(file_paths, src_root)
     paths_corrected = [x for x in paths_missing if ' → ' in x]
@@ -6439,6 +6696,11 @@ def fact_check_draft(draft: str, src_root: str,
     kernel_options_missing = _verify_kernel_options(kernel_options, src_root)
     dtrace_probes_missing = _verify_dtrace_probes(dtrace_probes, src_root)
     malloc_tags_missing = _verify_malloc_tags(malloc_tags, src_root)
+    # Sysctl OIDs are verified against the codebase-memory-mcp graph, not
+    # grep (the dotted path is never a literal in the source). No-ops to an
+    # empty list when the graph backend is unavailable — see
+    # `_verify_sysctls_via_graph` and CODE_MAP.md "Optional sysctl fact-check".
+    sysctls_missing = _verify_sysctls_via_graph(sysctls)
 
     return {
         'file_paths_not_found': paths_missing,
@@ -6452,6 +6714,7 @@ def fact_check_draft(draft: str, src_root: str,
         'kernel_options_not_found': kernel_options_missing,
         'dtrace_probes_not_found': dtrace_probes_missing,
         'malloc_tags_not_found': malloc_tags_missing,
+        'sysctls_not_found': sysctls_missing,
         'total_issues': (len(paths_missing) + len(paths_corrected) +
                          len(structs_missing) + len(struct_fields_bogus) +
                          len(struct_bodies_abridged) +
@@ -6460,7 +6723,8 @@ def fact_check_draft(draft: str, src_root: str,
                          len(sig_mismatches) +
                          len(kernel_options_missing) +
                          len(dtrace_probes_missing) +
-                         len(malloc_tags_missing)),
+                         len(malloc_tags_missing) +
+                         len(sysctls_missing)),
     }
 
 
@@ -6602,6 +6866,28 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
             f"{', '.join(facts['malloc_tags_not_found'])}. "
             f"These appear hallucinated — remove the claim or replace "
             f"with a real tag (grep for `MALLOC_DEFINE` in sys/)."
+        )
+    if facts.get('sysctls_not_found'):
+        # Each entry is a sysctl OID path (`net.inet.tcp.foo`) that has no
+        # matching resolved `Sysctl` node in the codebase-memory-mcp graph.
+        # Deliberately softer wording than the other checks: the graph
+        # cannot resolve ~1/3 of real OIDs (macro-arg / runtime-built parent
+        # chains), so a "not found" here is SUSPECT, not proven fabricated.
+        # We ask the writer to confirm against the authoritative runtime
+        # source (`sysctl(8)`) or the registering SYSCTL_* macro, and to
+        # remove the claim if they cannot — never to trust the flag blindly.
+        issues.append(
+            "Sysctl OID paths that could not be verified against the source "
+            "tree's registered sysctls: "
+            + ", ".join(f"`{s}`" for s in facts['sysctls_not_found'])
+            + ". These are SUSPECT (possibly hallucinated, possibly just "
+            "unverifiable). A sysctl OID is real only if some SYSCTL_* macro "
+            "registers it. Confirm each against the real registration — grep "
+            "`sys/` for the leaf name inside a `SYSCTL_` macro, e.g. the last "
+            "segment of `net.inet.tcp.foo` would appear as `SYSCTL_...(..., "
+            "OID_AUTO, foo, ...)` — or against `sysctl -a` output if you can "
+            "cite it. If you cannot confirm the OID exists, remove the "
+            "sentence that names it. Do NOT invent tunable names."
         )
 
     return textwrap.dedent(f"""\

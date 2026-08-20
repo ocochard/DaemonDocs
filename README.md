@@ -53,6 +53,28 @@ The script talks to an OpenAI-compatible local server. Defaults are set in `MODE
 
 The `model_id` must match exactly what `llama-server` advertises at `/v1/models`. A mismatch causes the request to fail or to silently route to whichever model is loaded — the output looks plausible but quality drops.
 
+### Optional sysctl fact-check
+
+The fact-check pass can verify **sysctl OID paths** (`net.inet.tcp.*`, `vm.pmap.pde.mappings`) — the one symbol class plain grep cannot check, because the dotted path is assembled from `SYSCTL_*` macros and never appears in the source as a literal string. This requires the external [`codebase-memory-mcp`](https://github.com/DeusData/codebase-memory-mcp) tool, which reconstructs the sysctl OID tree during indexing.
+
+It is entirely optional. Without it, `generate-doc.py` runs exactly as before; every grep-based verifier is unaffected and the sysctl check simply no-ops after printing one warning.
+
+To enable:
+
+```sh
+# 1. Install the tool (FreeBSD package):
+pkg install codebase-memory-mcp
+#    (must be on PATH, or set CODEBASE_MEMORY_MCP_BIN to its full path.)
+# 2. Index the FreeBSD source tree:
+codebase-memory-mcp cli index_repository --repo-path "$FREEBSD_SRC"
+```
+
+The index project name is derived from the tree path (`/usr/home/you/freebsd-src` → `usr-home-you-freebsd-src`). Override with `SYSCTL_GRAPH_PROJECT` if your index is named differently. Re-index after pulling new source so the graph tracks the tree.
+
+Relevant env vars: `CODEBASE_MEMORY_MCP_BIN` (binary path), `SYSCTL_GRAPH_PROJECT` (index name), `SYSCTL_GRAPH_TIMEOUT` (per-query seconds, default 30).
+
+A "not found" from this check is reported to the writer as *suspect — verify against `sysctl(8)`*, not as a definite hallucination: the indexer cannot resolve the parent OID chain for roughly a third of sysctls (dynamically-built names), so it may occasionally fail to confirm a real one. That is the safe direction for a hallucination gate — it over-flags rather than letting a fabricated tunable through.
+
 ## Quick start
 
 ```sh
@@ -185,7 +207,7 @@ flowchart TD
     Revise["**Step 3 — Revise** (writer agent)<br/>build_revision_prompt(chapter, draft, review_raw)<br/>can ADD or REMOVE content<br/>→ new full draft"]
     Revise --> Review
 
-    FactCheck{"**Step 4 — Fact-check** (deterministic)<br/>fact_check_draft: paths, structs, struct fields,<br/>function names, function arities, kernel options,<br/>DTrace probes, MALLOC tags<br/>verified against FreeBSD source tree<br/>does NOT edit the draft"}
+    FactCheck{"**Step 4 — Fact-check** (deterministic)<br/>fact_check_draft: paths, structs, struct fields,<br/>function names, function arities, kernel options,<br/>DTrace probes, MALLOC tags<br/>verified against FreeBSD source tree<br/>(+ sysctl OIDs via codebase-memory-mcp graph, if installed)<br/>does NOT edit the draft"}
     FactCheck -- "all claims verified" --> Write
     FactCheck -- "missing or<br/>mismatched claims" --> FactFix
 
@@ -247,6 +269,16 @@ prompt can stay small and focused.
    `<freebsd-src>/sys` (plus per-chapter widened roots like `stand/` for
    ch2) and cache by symbol so re-runs within a session are free. Returns a
    dict of missing/mismatched items. **Does not modify the draft.**
+
+   **Sysctl OIDs (optional, graph-backed).** One symbol class grep *cannot*
+   verify is a sysctl OID path (`net.inet.tcp.*`, `vm.pmap.pde.mappings`):
+   the dotted string never appears in the source as a literal — it is built
+   at compile time from a chain of `SYSCTL_*` macros. When the
+   [`codebase-memory-mcp`](#optional-sysctl-fact-check) tool is installed
+   and the source tree is indexed, `fact_check_draft` verifies claimed OIDs
+   against the graph's reconstructed `Sysctl` nodes (real → found,
+   fabricated → flagged as *suspect*). When the tool is absent the check
+   silently no-ops after one warning; every other verifier is unaffected.
 
 5. **Fact-fix (writer).** Only runs when fact-check finds issues. Reads
    `_build_fact_check_prompt(chapter, draft, facts)` — original chapter

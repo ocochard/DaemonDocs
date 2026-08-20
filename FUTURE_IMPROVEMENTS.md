@@ -17,6 +17,69 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-08-20] Sysctl OID paths were unverifiable by grep; added optional graph-backed fact-check
+
+Sysctl OIDs (`net.inet.tcp.*`, `vm.pmap.pde.mappings`, `kern.ipc.maxsockbuf`)
+are a favorite writer hallucination — the model emits a plausible-sounding
+tunable and every existing fact-check passes it, because **grep cannot
+verify a sysctl OID at all**. The dotted path exists nowhere in the source
+as a literal string; it is assembled at compile time from a chain of
+`SYSCTL_*` macros:
+
+```c
+SYSCTL_NODE(_vm,       OID_AUTO, pmap, ...)              /* vm.pmap        */
+SYSCTL_NODE(_vm_pmap,  OID_AUTO, pde,  ...)              /* vm.pmap.pde    */
+SYSCTL_COUNTER_U64(_vm_pmap_pde, OID_AUTO, mappings, ..) /* .pde.mappings  */
+```
+
+`grep vm.pmap.pde.mappings` returns 0 for this REAL sysctl exactly as it
+does for a fabricated one. To verify an OID you must parse the macro tree
+and walk the `_vm_pmap_pde` parent chain — which is precisely what the
+`codebase-memory-mcp` indexer does, storing each reconstructed OID as a
+`Sysctl` graph node keyed by its full dotted path.
+
+**What shipped:** a new fact-check verifier pair, `_extract_sysctls` +
+`_verify_sysctls_via_graph`, that pulls canonical-root OID tokens
+(`kern hw vm net dev vfs debug security machdep user compat kstat
+p1003_1b`, ≥2 dotted segments, backticked) from the draft and verifies
+each with an anchored `search_graph --name-pattern '^oid$' --label Sysctl`
+query against the graph. Real OIDs resolve to their registration line;
+fabricated OIDs return zero hits. Wired into `fact_check_draft` as
+`sysctls_not_found` and into `_build_fact_check_prompt`.
+
+**Why it's OPTIONAL, not a dependency:** this is the only verifier with an
+external backend. `_sysctl_graph_available()` probes for the binary and a
+ready index once per process; when either is missing it prints a single
+warning and `_verify_sysctls_via_graph` returns `[]` (nothing flagged). A
+host without codebase-memory-mcp runs the full pipeline unchanged, minus
+sysctl checking. This was a hard requirement — the script's execution host
+(`bigone`) has the tree, but a contributor's checkout may not have the
+graph indexed.
+
+**The false-negative caveat (why "suspect", not "hallucinated"):** ~1/3 of
+`Sysctl` nodes are `resolved:false` — the indexer built the leaf but could
+not resolve the parent OID chain (parent name came from a macro argument,
+a runtime string, or `LINUXKPI_PARAM_NAME(...)`-style expansion). Those
+nodes carry a `<unresolved>.leaf` path and never match a real dotted query,
+so a genuine OID among them would be reported "not found". That is the SAFE
+failure direction for a hallucination gate (over-flag, never under-flag),
+and the fact-fix prompt reflects it: it tells the writer the OID is
+*suspect — confirm against the registering `SYSCTL_*` macro or `sysctl(8)`*,
+not that it is definitely invented. Tests in `test_sysctl_factcheck.py`
+(extractor tests always run; graph-verify tests auto-skip when the backend
+is absent).
+
+**Backstory:** the K8 regen (2026-05-02, see
+`project_k8_regen_failed` memory) got *worse* on hallucination after a
+quant upgrade; the demand was to fix hallucination in code before any
+re-run. The MCP was evaluated and initially rejected for fact-check —
+early builds stored sysctls only as `Macro` nodes with no OID path, so the
+graph could not distinguish a real sysctl from a fake one any better than
+grep. After the codebase-memory-mcp maintainer added OID-tree
+reconstruction (`Sysctl` nodes with a resolved `path`), a re-index proved
+the discrimination worked (real accepted, fabricated flagged), and this
+verifier was built on it.
+
 ### [DONE — fix 1 shipped 2026-05-01] Struct field names and function-call mechanics not grounded in source; fact-check doesn't reach into struct bodies
 
 Observed on the kernel-core chapter (`sys/README.md`, regenerated
