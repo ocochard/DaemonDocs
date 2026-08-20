@@ -198,6 +198,133 @@ chapters:
       - "How are kernel .conf files processed into source sets?"
     mermaid: flowchart
 
+  - title: "System Calls and Image Activation — Entry, sysent, and exec"
+    family: "boot-kernel-core"
+    related:
+      - "Kernel Core — Structure and Entry Point"
+      - "Process Management — Scheduling and Lifecycle"
+      - "Capsicum — Capability Mode and Sandboxing"
+    output_file: "sys/kern/README_syscall.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/sys"
+    # The syscall entry path is split machine-independent (subr_syscall.c
+    # drives the common enter/leave, kern_syscalls.c manages dynamic
+    # registration) vs machine-dependent (the trap/SYSCALL stub in
+    # amd64/amd64/trap.c that fills the trapframe). syscalls.master is the
+    # generator input; init_sysent.c is its generated output — mention
+    # both but do not paste the generated table. exec lives in kern_exec.c
+    # with the ELF/shell image activators in imgact_*.c.
+    source_files:
+      - "sys/kern/subr_syscall.c"
+      - "sys/kern/kern_syscalls.c"
+      - "sys/kern/init_sysent.c"
+      - "sys/kern/syscalls.master"
+      - "sys/kern/kern_exec.c"
+      - "sys/kern/imgact_elf.c"
+      - "sys/kern/imgact_shell.c"
+      - "sys/sys/sysent.h"
+      - "sys/sys/imgact.h"
+    # Guard against re-explaining process/thread creation (Process
+    # Management owns fork/thread lifecycle) and Capsicum's per-fd rights
+    # enforcement (Capsicum chapter). This chapter owns the *mechanism* of
+    # crossing the user/kernel boundary and turning a file into a running
+    # image, not scheduling or sandbox policy.
+    scope_guard: >
+      This chapter owns the system-call entry/exit mechanism and image
+      activation (exec). Do NOT re-explain fork(), thread creation, or the
+      scheduler — refer to the Process Management chapter; here, cover only
+      what exec does to an *already-created* process's address space. Do
+      NOT explain Capsicum capability-mode syscall filtering in depth —
+      name the SV_CAPMODE / cap_enter interposition point and link to the
+      Capsicum chapter. Do NOT paste the generated init_sysent.c table;
+      explain syscalls.master as its source and how the build regenerates
+      it. Keep the machine-dependent trap stub to a one-paragraph
+      hand-off: focus on the machine-independent path in subr_syscall.c.
+    focus: >
+      Trace a system call from the userland INT/SYSCALL instruction
+      through the machine-dependent trap stub into the machine-independent
+      path in subr_syscall.c: how the syscall number indexes sysent[], how
+      arguments are copied in (copyin/copyinstr) and results returned, and
+      how errno propagates back. Explain struct sysent, syscalls.master as
+      the generator source for init_sysent.c and the libc stubs, and how
+      loadable modules register syscalls dynamically (kern_syscalls.c,
+      SYSCALL_MODULE, NO_SYSCALL). Then cover image activation: how
+      kern_exec.c probes registered image activators, how imgact_elf.c
+      maps a static or dynamically-linked ELF binary (PT_LOAD segments,
+      the interpreter/rtld, the auxiliary vector and initial stack), and
+      how imgact_shell.c handles "#!" interpreter files. Connect the two:
+      execve is itself a syscall that rebuilds the calling process's image.
+    key_questions:
+      - "What happens between a userland SYSCALL instruction and the C function that implements the call, and how does sysent[] drive that dispatch?"
+      - "What is syscalls.master, and how does it generate init_sysent.c, the syscall.h numbers, and the libc stubs so all three stay in sync?"
+      - "How does a kernel module add a new system call at runtime via SYSCALL_MODULE, and what is the role of the NO_SYSCALL dynamic offset?"
+      - "How does imgact_elf.c turn an ELF file on disk into a running address space — PT_LOAD mapping, the rtld interpreter, and the auxiliary vector on the initial stack?"
+    mermaid: sequence
+
+  - title: "Kernel Modules and the Linker — KLD, SYSINIT, and linker sets"
+    family: "boot-kernel-core"
+    related:
+      - "Kernel Core — Structure and Entry Point"
+      - "Device Driver Framework — newbus and devclass"
+      - "System Calls and Image Activation — Entry, sysent, and exec"
+    output_file: "sys/kern/README_kld.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/sys"
+    # kern_linker.c is the linker-file abstraction + kldload/kldunload
+    # backing; link_elf.c / link_elf_obj.c are the two ELF backends
+    # (preloaded/.ko relocatable objects). kern_module.c is the module
+    # registry that sits on top. subr_module.c handles preloaded-module
+    # metadata from the loader. linker.h/module.h/kernel.h hold the KPI
+    # macros (DECLARE_MODULE, MODULE_DEPEND, SYSINIT, the linker set
+    # machinery in <sys/linker_set.h>).
+    source_files:
+      - "sys/kern/kern_linker.c"
+      - "sys/kern/kern_module.c"
+      - "sys/kern/link_elf.c"
+      - "sys/kern/link_elf_obj.c"
+      - "sys/kern/subr_module.c"
+      - "sys/sys/linker.h"
+      - "sys/sys/module.h"
+      - "sys/sys/kernel.h"
+    # newbus's DRIVER_MODULE is a *consumer* of this machinery — mention
+    # the relationship but let the Device Driver Framework chapter own
+    # driver attachment. SYSINIT ordering also drives early boot, which
+    # the Kernel Core chapter owns; here, explain SYSINIT as the mechanism
+    # modules hook into, not the boot sequence itself.
+    scope_guard: >
+      This chapter owns the kernel linker, the module registry, SYSINIT,
+      and linker sets. Do NOT walk the boot-time SYSINIT ordering of the
+      whole kernel — that belongs to the Kernel Core chapter; here explain
+      SYSINIT/SYSUNINIT as the hook mechanism a module uses. Do NOT
+      explain newbus driver attachment — DRIVER_MODULE is a consumer of
+      DECLARE_MODULE; name the link and defer to the Device Driver
+      Framework chapter. Keep ELF relocation detail at the level a module
+      author needs (why .ko files are relocatable objects and what the
+      linker resolves at load time), not a full ELF-format tutorial.
+    focus: >
+      Explain how FreeBSD loads code into a running kernel. Cover the
+      linker-file abstraction in kern_linker.c (kldload/kldunload/kldstat,
+      reference counting, symbol resolution) and its two ELF backends:
+      link_elf.c for the statically-preloaded/kernel image and
+      link_elf_obj.c for relocatable .ko objects. Explain the module
+      registry (kern_module.c): DECLARE_MODULE, moduledata_t, the
+      MOD_LOAD/MOD_UNLOAD/MOD_QUIESCE/MOD_SHUTDOWN event handler,
+      MODULE_VERSION and MODULE_DEPEND. Then cover the two declarative
+      mechanisms that make modular init work: SYSINIT/SYSUNINIT (ordered
+      startup/teardown keyed by subsystem and order) and linker sets (how
+      <sys/linker_set.h> gathers scattered declarations — sysctls,
+      SYSINITs, device methods — into a contiguous table the linker
+      builds). Note how the boot loader preloads modules before the kernel
+      runs (subr_module.c metadata).
+    key_questions:
+      - "What is a linker file, and how do link_elf.c (the kernel image) and link_elf_obj.c (.ko relocatable objects) differ in how they resolve symbols?"
+      - "What does DECLARE_MODULE register, and what is the contract of the MOD_LOAD/MOD_UNLOAD/MOD_QUIESCE event handler?"
+      - "How does a linker set let independently-compiled files (sysctls, SYSINITs, drivers) contribute entries to one table without a central list, and how does the linker assemble it?"
+      - "How does SYSINIT ordering (subsystem + order keys) let a loadable module insert its initialization at the right point relative to already-running subsystems?"
+    mermaid: class
+
   - title: "Virtual Memory Subsystem — vm_page, UMA, and Pagers"
     family: "memory-process"
     related:
@@ -261,12 +388,19 @@ chapters:
       - "sys/kern/sched_ule.c"
     focus: >
       Cover process creation (fork/exec), the process struct (struct proc),
-      thread representation (struct thread), and the 4BSD scheduler.
-      Explain run queues, time slicing, and CPU assignment.
+      thread representation (struct thread), and the scheduler. FreeBSD
+      ships two schedulers behind the same sched(9) KPI: ULE
+      (sched_ule.c), the default in GENERIC on amd64/arm64, and the
+      historical 4BSD scheduler (sched_4bsd.c). Explain ULE first — its
+      per-CPU run queues, interactivity scoring, CPU affinity and
+      topology-aware load balancing — then contrast 4BSD's single global
+      run queue and simpler priority decay, and note when 4BSD is still
+      selected. Cover run queues, time slicing, and CPU assignment.
     key_questions:
       - "How does fork() create a new process in FreeBSD?"
       - "What is the relationship between proc and thread structures?"
-      - "How does the 4BSD scheduler decide which thread runs next?"
+      - "How does the ULE scheduler decide which thread runs next, and how do its per-CPU run queues and interactivity scoring differ from the 4BSD scheduler's single global queue?"
+      - "Both schedulers implement the same sched(9) interface — what does that interface require, and how does the kernel pick between ULE and 4BSD at build time?"
     mermaid: sequence
 
   - title: "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
@@ -306,6 +440,74 @@ chapters:
       - "What is a turnstile, and how does priority propagation defeat priority inversion on a contended mtx?"
       - "How does WITNESS detect lock-order reversals, and why is that a runtime check rather than a static one?"
       - "What is the difference between a spin mutex and a sleep mutex, and which contexts force you to use a spin mutex?"
+    mermaid: class
+
+  - title: "Signals, kqueue, and IPC — Process Communication and Notification"
+    family: "memory-process"
+    related:
+      - "Process Management — Scheduling and Lifecycle"
+      - "The Socket Layer — sockets, sockbuf, and UNIX-domain"
+      - "VFS — Virtual File System Layer"
+    output_file: "sys/kern/README_ipc.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/sys"
+    # Three related families of userland-facing kernel machinery:
+    # (1) signals — kern_sig.c; (2) event notification — kern_event.c
+    # (kqueue/kevent) plus the select/poll backend in sys_generic.c;
+    # (3) IPC objects — sys_pipe.c (pipes/FIFOs), the SysV trio
+    # (sysv_shm/msg/sem.c), the POSIX equivalents (uipc_shm.c shm_open,
+    # uipc_sem.c named semaphores), and umtx (kern_umtx.c) which backs
+    # userland pthread mutexes/condvars.
+    source_files:
+      - "sys/kern/kern_sig.c"
+      - "sys/kern/kern_event.c"
+      - "sys/kern/sys_generic.c"
+      - "sys/kern/sys_pipe.c"
+      - "sys/kern/uipc_shm.c"
+      - "sys/kern/uipc_sem.c"
+      - "sys/kern/sysv_shm.c"
+      - "sys/kern/kern_umtx.c"
+      - "sys/sys/signalvar.h"
+      - "sys/sys/event.h"
+    # UNIX-domain sockets and fd-passing are IPC too, but they belong to
+    # the Socket Layer chapter (they ride the socket KPI). Name them and
+    # link; do not cover uipc_usrreq.c here. Scheduler/thread wakeups
+    # (sleepqueue, msleep) belong to Locking/Process Management — kqueue's
+    # EVFILT_PROC and signal delivery *interact* with those, so reference
+    # them, but the sleep/wakeup mechanism itself is out of scope.
+    scope_guard: >
+      This chapter owns signals, kqueue/kevent, select/poll, pipes/FIFOs,
+      SysV and POSIX shared memory and semaphores, and umtx. Do NOT cover
+      UNIX-domain sockets or file-descriptor passing — those ride the
+      socket KPI and belong to the Socket Layer chapter; name them and
+      link. Do NOT re-explain the sleepqueue/turnstile wakeup machinery
+      (Locking chapter) or run-queue scheduling (Process Management) —
+      reference how signal delivery and EVFILT_PROC interact with them,
+      but keep the mechanism out of scope. Treat the userland API surface
+      (sigaction, kevent, shm_open) as the framing, but focus the prose on
+      the in-kernel data structures and delivery paths.
+    focus: >
+      Document the kernel machinery behind process communication and
+      notification. Signals (kern_sig.c): the per-process/per-thread
+      pending sets, signal disposition and masks, how a signal is posted
+      (from a syscall, a device, or another process) and delivered at the
+      next AST/return-to-userland boundary, and the special uncatchable
+      cases. Event notification: kqueue/kevent (kern_event.c) as the
+      scalable, edge/level filter mechanism (knote, the EVFILT_* filters
+      for read/write/vnode/proc/signal/timer), and the older select/poll
+      backend in sys_generic.c. IPC objects: anonymous pipes and named
+      FIFOs (sys_pipe.c), the System V shared-memory/message-queue/
+      semaphore trio, their POSIX counterparts (shm_open-backed uipc_shm.c
+      and named semaphores in uipc_sem.c), and umtx (kern_umtx.c) as the
+      kernel assist behind userland pthread mutexes and condition
+      variables. Emphasize which primitive a program should reach for and
+      why kqueue superseded select/poll for high-fd-count servers.
+    key_questions:
+      - "How is a signal represented and delivered — where does it sit pending, and at what point in returning to userland is the handler actually run?"
+      - "What is a knote, and how does kqueue let one kevent() call scale to thousands of descriptors where select/poll cannot?"
+      - "What is the difference between SysV IPC (sysv_shm/msg/sem) and the POSIX equivalents (shm_open, sem_open), and why does FreeBSD carry both?"
+      - "What does umtx do for userland threads, and why can't pthread mutexes be implemented purely in userland without kernel help under contention?"
     mermaid: class
 
   - title: "Buffer Cache — Block I/O Subsystem"
@@ -499,6 +701,68 @@ chapters:
       - "What is the role of the ZIL, and when is it actually written to (sync writes vs async)?"
     mermaid: class
 
+  - title: "NFS — Network File System, Client and Server"
+    family: "storage-io"
+    related:
+      - "VFS — Virtual File System Layer"
+      - "UFS — FreeBSD's Native Filesystem"
+      - "The Socket Layer — sockets, sockbuf, and UNIX-domain"
+    output_file: "fs/nfs/README.md"
+    source_dirs:
+      - "sys/fs/nfs"
+      - "sys/fs/nfsclient"
+      - "sys/fs/nfsserver"
+      - "sys/rpc"
+    # The modern (post-2011 rewrite) NFS lives in fs/nfs (shared common
+    # code + XDR), fs/nfsclient (the VFS/vnode ops that turn file
+    # operations into RPCs), and fs/nfsserver (the nfsd that services
+    # them). It rides SunRPC/XDR in sys/rpc. nfsport.h is the FreeBSD
+    # portability shim over the OpenSolaris-derived core.
+    source_files:
+      - "sys/fs/nfsclient/nfs_clvfsops.c"
+      - "sys/fs/nfsclient/nfs_clrpcops.c"
+      - "sys/fs/nfsserver/nfs_nfsdserv.c"
+      - "sys/fs/nfsserver/nfs_nfsdkrpc.c"
+      - "sys/fs/nfs/nfs_commonsubs.c"
+      - "sys/fs/nfs/nfsport.h"
+      - "sys/rpc/clnt.h"
+    # VFS owns the vnode/VOP abstraction; this chapter shows how NFS
+    # *implements* that abstraction over the wire. The Socket Layer owns
+    # sockets; here, sockets are just the transport RPC rides on. Do not
+    # re-derive either — link. Keep the on-wire protocol (NFSv3 vs NFSv4
+    # differences, stateful vs stateless) as framing, not an RFC recital.
+    scope_guard: >
+      This chapter shows how NFS implements the VFS/vnode contract over a
+      network. Do NOT re-explain the vnode/VOP abstraction (VFS chapter)
+      or local on-disk layout (UFS chapter) — link to them; here, cover
+      how a VOP on an NFS vnode becomes an RPC. Do NOT re-explain the
+      socket layer — treat the socket as the transport SunRPC rides on and
+      link. Keep protocol-version detail (NFSv3 statelessness vs NFSv4
+      compound ops, state, and delegations) at the level needed to explain
+      the code paths, not a full RFC walkthrough. The userland mountd/nfsd
+      plumbing is context, not the subject — the kernel nfsd and client
+      RPC ops are.
+    focus: >
+      Document FreeBSD's NFS client and server as the canonical networked
+      filesystem. Show the client side: how nfs_clvfsops.c mounts an
+      export and how nfs_clrpcops.c turns vnode operations (lookup, read,
+      write, getattr) into SunRPC calls, plus the caching model (attribute
+      caching, the buffer-cache interaction, close-to-open consistency).
+      Show the server side: how nfs_nfsdkrpc.c dispatches incoming RPCs to
+      the nfsd service routines in nfs_nfsdserv.c, and how those map back
+      onto local VFS operations. Cover the shared substrate: XDR
+      encoding/decoding in nfs_commonsubs.c, the SunRPC transport in
+      sys/rpc, and the NFSv3-vs-NFSv4 split (stateless per-op vs stateful
+      compound operations with state and delegations). Frame NFS as the
+      concrete answer to "how does VFS reach a file that isn't on a local
+      disk."
+    key_questions:
+      - "How does a read() on an NFS-mounted file become an RPC — the path from VOP_READ through nfs_clrpcops.c, XDR encoding, and the SunRPC transport?"
+      - "How does the client keep cached data coherent with the server (attribute caching, close-to-open consistency) without a distributed lock on every access?"
+      - "How does the kernel nfsd dispatch an incoming request (nfs_nfsdkrpc.c → nfs_nfsdserv.c) and translate it back into local VFS operations?"
+      - "What changes architecturally between NFSv3 (stateless, per-operation) and NFSv4 (stateful compound operations, delegations), and how does the shared code accommodate both?"
+    mermaid: sequence
+
   - title: "Network Stack — Architecture and Packet Flow"
     family: "networking"
     related:
@@ -522,13 +786,80 @@ chapters:
       - "sys/netinet/tcp_input.c"
     focus: >
       Trace the network input and output paths: from driver receive
-      interrupt through netisr, protocol dispatch, socket buffers, and
-      into userland. Cover the socket API, ifnet, and network threads.
+      interrupt through netisr, protocol dispatch, and up to the socket
+      layer (then into userland). Cover ifnet, netisr, and network
+      threads. Treat the socket/sockbuf endpoint as the hand-off point —
+      the socket layer itself has its own chapter; here, show how the
+      stack delivers into a socket buffer, not how the socket KPI works.
     key_questions:
-      - "How does a packet travel from NIC driver to userland socket?"
+      - "How does a packet travel from NIC driver up to the socket layer?"
       - "What is netisr and why does FreeBSD use network threads?"
-      - "How are socket buffers (sbappend/sbreserve) managed?"
+      - "Where does the packet-processing path end and the socket layer begin (the sbappend hand-off)?"
     mermaid: sequence
+
+  - title: "The Socket Layer — sockets, sockbuf, and UNIX-domain"
+    family: "networking"
+    related:
+      - "Network Stack — Architecture and Packet Flow"
+      - "Transport Protocols — inpcb, tcpcb, TCP State Machine, UDP"
+      - "Signals, kqueue, and IPC — Process Communication and Notification"
+    output_file: "sys/kern/README_socket.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/sys"
+    # uipc_socket.c is the socket KPI (socket/bind/connect/send/recv and
+    # the socket state machine); uipc_sockbuf.c is the send/receive buffer
+    # queueing discipline (sbappend/sbreserve/sbwait/sbwakeup);
+    # uipc_usrreq.c is the UNIX-domain (AF_UNIX) protocol including
+    # file-descriptor passing over SCM_RIGHTS; uipc_domain.c is the
+    # domain/protosw registration that ties an address family to its
+    # pr_usrreqs; uipc_accf.c is accept filters.
+    source_files:
+      - "sys/kern/uipc_socket.c"
+      - "sys/kern/uipc_sockbuf.c"
+      - "sys/kern/uipc_usrreq.c"
+      - "sys/kern/uipc_domain.c"
+      - "sys/kern/uipc_accf.c"
+      - "sys/sys/socketvar.h"
+      - "sys/sys/protosw.h"
+    # The wire protocols (TCP/UDP/IP) belong to the Transport and IP Layer
+    # chapters; the packet path from the NIC belongs to Network Stack.
+    # This chapter owns the socket abstraction that sits *above* protosw:
+    # the struct socket, the two socket buffers, the protosw/domain
+    # indirection, and AF_UNIX. Do not re-derive tcpcb/inpcb here.
+    scope_guard: >
+      This chapter owns the socket abstraction (struct socket, the two
+      socket buffers, the protosw/pr_usrreqs indirection, and the
+      UNIX-domain protocol). Do NOT re-explain TCP/UDP state machines or
+      inpcb/tcpcb — those are the Transport chapter; here, protosw is the
+      seam that connects a socket to whichever protocol backs it. Do NOT
+      re-trace the NIC-to-netisr packet path (Network Stack chapter) — the
+      socket buffer is where that path terminates on receive and
+      originates on send. DO own file-descriptor passing over AF_UNIX
+      (SCM_RIGHTS in uipc_usrreq.c), accept filters, and the sockbuf
+      wakeup/select/kqueue interaction. Keep the userland socket API as
+      framing; focus the prose on the in-kernel structures.
+    focus: >
+      Document the socket layer that sits between userland and the
+      protocol stacks. Cover struct socket and its state, the two socket
+      buffers (uipc_sockbuf.c: sbappend/sbreserve/sbwait, flow control,
+      low-water marks, and how they wake select/poll/kqueue), and the
+      protosw/domain indirection (uipc_domain.c) that lets one socket KPI
+      (socket, bind, connect, send, recv, in uipc_socket.c) dispatch to
+      TCP, UDP, UNIX-domain, or any registered address family via
+      pr_usrreqs. Give UNIX-domain sockets (uipc_usrreq.c) first-class
+      treatment: local stream/datagram/seqpacket transport and, crucially,
+      passing file descriptors between processes via SCM_RIGHTS control
+      messages. Cover accept filters (uipc_accf.c) as an example of the
+      socket layer's extensibility. Frame the socket as the unifying IPC
+      and network endpoint abstraction — the reason a program uses the same
+      read()/write() on a pipe, a file, and a TCP connection.
+    key_questions:
+      - "What does struct socket hold, and how do the send and receive socket buffers (sbappend/sbreserve) implement flow control and wake up a blocked or kqueue-registered reader?"
+      - "How does protosw/pr_usrreqs let the single socket KPI dispatch to TCP, UDP, or UNIX-domain without the socket code knowing the protocol?"
+      - "How does SCM_RIGHTS pass a file descriptor between processes over a UNIX-domain socket, and what does the kernel do to the fd table on each side?"
+      - "What is an accept filter, and how does it let the kernel defer handing a connection to userland until data has arrived?"
+    mermaid: class
 
   - title: "VNET — Virtual Network Stacks"
     family: "networking"
@@ -724,6 +1055,200 @@ chapters:
       - "Why is if_cxgbe NOT an iflib driver? Which features of the Chelsio hardware (TOE, multi-queue with NIC/TOE/RDMA partitioning, hardware filters) make iflib's abstractions unsuitable, in contrast to if_vr (which is pre-iflib) vs if_em (which is iflib-fitted)?"
     mermaid: class
 
+  - title: "DMA and busdma — Tags, Maps, and Bounce Buffers"
+    family: "devices-interrupts"
+    related:
+      - "Device Driver Framework — newbus and devclass"
+      - "NIC Drivers — from if_vr to iflib to if_cxgbe"
+      - "mbuf — Network Buffer Allocation and Chaining"
+    output_file: "sys/kern/README_busdma.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/x86/x86"
+      - "sys/arm64/arm64"
+    # subr_bus_dma.c is the machine-independent busdma KPI
+    # (bus_dmamap_load_mbuf/uio and the callback plumbing);
+    # subr_busdma_bounce.c holds the shared bounce-buffer logic. The
+    # per-arch backends (x86/x86/busdma_bounce.c + busdma_machdep.c,
+    # arm64/arm64/busdma_bounce.c + busdma_machdep.c) implement
+    # bus_dma_tag_create / bus_dmamap_load / bus_dmamap_sync for that
+    # architecture. bus_dma.h is the KPI header every driver includes.
+    source_files:
+      - "sys/kern/subr_bus_dma.c"
+      - "sys/kern/subr_busdma_bounce.c"
+      - "sys/x86/x86/busdma_bounce.c"
+      - "sys/x86/x86/busdma_machdep.c"
+      - "sys/arm64/arm64/busdma_machdep.c"
+      - "sys/sys/bus_dma.h"
+    # newbus resource allocation (bus_alloc_resource for IRQ/memory/ports)
+    # is a *sibling* subject owned by the Device Driver Framework chapter;
+    # busdma is specifically the DMA-addressability problem. Do not
+    # re-explain rman or resource activation here. mbuf loading
+    # (bus_dmamap_load_mbuf_sg) touches the mbuf chapter — reference it.
+    scope_guard: >
+      This chapter owns the busdma framework: DMA tags, maps, bounce
+      buffers, and synchronization. Do NOT re-explain newbus resource
+      allocation (bus_alloc_resource, rman, IRQ/BAR activation) — that is
+      the Device Driver Framework chapter; busdma is only about making
+      buffers DMA-addressable. Do NOT re-derive the mbuf structure — when
+      covering bus_dmamap_load_mbuf_sg, reference the mbuf chapter. Keep
+      per-architecture detail to what illuminates the abstraction (why an
+      IOMMU or a 32-bit-only device forces bouncing); do not turn it into
+      an x86-vs-arm64 IOMMU tour.
+    focus: >
+      Explain the busdma abstraction that lets a driver hand a buffer to
+      hardware for DMA safely and portably. Cover the DMA tag
+      (bus_dma_tag_create: alignment, boundary, address-width, and
+      segment constraints that describe what the device can address), the
+      DMA map (bus_dmamap_create/load and the scatter/gather
+      bus_dma_segment_t list a load produces), and the callback model for
+      deferred loads. Explain bounce buffers: when a buffer's physical
+      address is unreachable by the device (a 32-bit DMA engine on a
+      64-bit machine, or alignment/boundary violations), busdma copies
+      through an intermediate buffer, and bus_dmamap_sync
+      (PREREAD/POSTREAD/PREWRITE/POSTWRITE) is what makes that copy — and
+      cache coherency on architectures that need it — correct. Contrast
+      the machine-independent KPI in subr_bus_dma.c with the per-arch
+      backends, and show the common mbuf and uio load helpers that
+      network and character drivers actually call.
+    key_questions:
+      - "What does a DMA tag describe, and how do its constraints (address width, alignment, boundary, max segments) determine whether a buffer can be DMA'd directly or must be bounced?"
+      - "What is a bounce buffer, and what sequence of bus_dmamap_sync calls makes a bounced transfer correct on both read and write?"
+      - "Why must even a cache-coherent x86 driver call bus_dmamap_sync, and what does the same call do differently on an architecture without DMA cache coherency?"
+      - "How does bus_dmamap_load_mbuf_sg turn an mbuf chain into a scatter/gather segment list a NIC's descriptor ring can consume?"
+    mermaid: sequence
+
+  - title: "Callouts, Taskqueues, and Kernel Time — Deferred Execution"
+    family: "devices-interrupts"
+    related:
+      - "Interrupt Handling — Threads, Filters, and Dispatch"
+      - "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
+      - "Device Driver Framework — newbus and devclass"
+    output_file: "sys/kern/README_defer.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/sys"
+    # kern_timeout.c is the callout wheel (callout_reset/stop, the
+    # per-CPU callout wheels driven by hardclock); subr_taskqueue.c is
+    # the taskqueue mechanism (deferring work to a thread context where
+    # sleeping is allowed); subr_eventhandler.c is the EVENTHANDLER
+    # publish/subscribe framework; kern_clock.c/kern_tc.c/
+    # kern_clocksource.c are the timekeeping + tick machinery that drives
+    # callouts and accounting.
+    source_files:
+      - "sys/kern/kern_timeout.c"
+      - "sys/kern/subr_taskqueue.c"
+      - "sys/kern/subr_eventhandler.c"
+      - "sys/kern/kern_clock.c"
+      - "sys/kern/kern_tc.c"
+      - "sys/kern/kern_clocksource.c"
+      - "sys/sys/callout.h"
+      - "sys/sys/taskqueue.h"
+    # Interrupt threads/filters themselves are the Interrupt chapter's
+    # subject; this chapter is about deferring work *out of* interrupt or
+    # time-critical context. The sleepqueue/wakeup primitives belong to
+    # Locking. Reference both; don't re-derive them.
+    scope_guard: >
+      This chapter owns deferred and time-driven execution: the callout
+      wheel, taskqueues, EVENTHANDLER, and the timekeeping tick that
+      drives them. Do NOT re-explain interrupt filters vs ithreads
+      (Interrupt Handling chapter) — this is about work deferred *out of*
+      those contexts. Do NOT re-derive sleepqueue/msleep (Locking
+      chapter). Cover timekeeping (timecounters, hardclock/statclock,
+      one-shot vs periodic clocksources) only far enough to explain what
+      advances a callout and what times out a sleep; a full NTP/timecounter
+      treatment is out of scope. Emphasize the practical decision: callout
+      vs taskqueue vs direct ithread work, and the locking/race pitfalls of
+      each (the classic callout_stop-vs-callout_drain race).
+    focus: >
+      Explain the mechanisms FreeBSD kernel code uses to run work later or
+      in a safer context. Callouts (kern_timeout.c): the per-CPU callout
+      wheels, callout_reset/callout_stop/callout_drain, direct vs
+      deferred callouts, and the notorious teardown races. Taskqueues
+      (subr_taskqueue.c): deferring work from an interrupt filter or a
+      non-sleepable context into a thread where locking and sleeping are
+      allowed — FreeBSD's answer to Linux's softirq/workqueue split.
+      EVENTHANDLER (subr_eventhandler.c): the in-kernel publish/subscribe
+      hooks (shutdown, process exit, mountroot, low-memory) that let
+      subsystems react to lifecycle events without hard-coding callers.
+      And the timekeeping substrate (kern_clock.c, kern_tc.c,
+      kern_clocksource.c): timecounters, hardclock/statclock ticks, and
+      one-shot event timers — the heartbeat that fires callouts and drives
+      time accounting.
+    key_questions:
+      - "When should a driver use a callout, a taskqueue, or direct ithread work — what does each cost and what context does each run in?"
+      - "What is the callout_stop-versus-callout_drain race, and why can stopping a callout that has already begun executing corrupt a driver's state?"
+      - "Why does deferring work to a taskqueue let code sleep or take an sx lock that it could not take in an interrupt filter?"
+      - "What advances a callout and charges CPU time to a thread — how do hardclock/statclock and the timecounter machinery drive the deferred-execution and accounting systems?"
+    mermaid: state
+
+  - title: "Character Devices and the TTY Layer — cdev, devfs, and terminals"
+    family: "devices-interrupts"
+    related:
+      - "Device Driver Framework — newbus and devclass"
+      - "VFS — Virtual File System Layer"
+      - "Signals, kqueue, and IPC — Process Communication and Notification"
+    output_file: "sys/kern/README_cdev.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/fs/devfs"
+      - "sys/sys"
+    # kern_conf.c owns make_dev/destroy_dev and the cdevsw registration;
+    # subr_uio.c is uiomove (the copyin/copyout engine every d_read/d_write
+    # uses); fs/devfs/* is the filesystem that exposes cdevs as /dev nodes;
+    # tty.c is the TTY core, tty_ttydisc.c the line discipline,
+    # tty_pts.c the pseudo-terminal driver, tty_inq.c/tty_outq.c the tty
+    # buffers. conf.h/tty.h are the KPIs.
+    source_files:
+      - "sys/kern/kern_conf.c"
+      - "sys/kern/subr_uio.c"
+      - "sys/fs/devfs/devfs_devs.c"
+      - "sys/fs/devfs/devfs_vnops.c"
+      - "sys/kern/tty.c"
+      - "sys/kern/tty_ttydisc.c"
+      - "sys/kern/tty_pts.c"
+      - "sys/sys/conf.h"
+      - "sys/sys/tty.h"
+    # newbus attaches devices; this chapter is about how a driver exposes
+    # a /dev node and the read/write/ioctl interface on it. devfs is a
+    # filesystem but its vnode ops belong here (as the cdev face), not in
+    # the VFS chapter — reference VFS for the generic vnode contract.
+    # Signals from the tty (job control, SIGINT/SIGTSTP) connect to the
+    # IPC chapter — reference it.
+    scope_guard: >
+      This chapter owns the character-device abstraction (cdevsw,
+      make_dev, the d_open/d_read/d_write/d_ioctl/d_poll/d_kqfilter
+      methods, uiomove), devfs as the /dev face of cdevs, and the TTY
+      layer (core, line discipline, ptys). Do NOT re-explain newbus device
+      attachment (Device Driver Framework chapter) — a cdev is what a
+      driver *exposes*, not how it attaches. Do NOT re-derive the generic
+      vnode/VOP contract (VFS chapter); cover only devfs's cdev-specific
+      vnode ops. Terminal-driven signals (job control, SIGINT/SIGTSTP/
+      SIGTTOU) connect to the Signals/IPC chapter — reference it rather
+      than re-explaining signal delivery. Block devices are gone in modern
+      FreeBSD — say so once and move on.
+    focus: >
+      Explain how a driver presents itself to userland as a device node
+      and how terminals work. The cdev half: struct cdevsw and the d_*
+      method table, make_dev/destroy_dev, the /dev node lifecycle, and
+      uiomove (subr_uio.c) as the copyin/copyout engine behind every
+      d_read/d_write. devfs (fs/devfs): how it materializes cdevs as a
+      kernel-populated filesystem, cloning, and per-jail /dev visibility.
+      The TTY half: the tty core (tty.c), the line discipline
+      (tty_ttydisc.c) that turns raw byte streams into canonical lines and
+      handles echo, the input/output queues, session/controlling-terminal
+      and job-control semantics (which terminal-generated signals like
+      SIGINT and SIGTSTP flow from), and pseudo-terminals (tty_pts.c) that
+      back sshd, xterm, and script(1). Frame the cdev as the second half
+      of driver authorship — newbus attaches the hardware, the cdev
+      exposes it.
+    key_questions:
+      - "What does make_dev create, and how do the cdevsw d_* methods (d_open/d_read/d_write/d_ioctl/d_kqfilter) get invoked when userland opens and reads a /dev node?"
+      - "How does devfs differ from an ordinary filesystem — where do the /dev entries come from, and how does per-jail devfs visibility work?"
+      - "What does the TTY line discipline do to a byte stream in canonical mode, and how does it generate job-control signals to the foreground process group?"
+      - "How does a pseudo-terminal pair (pts) let sshd or xterm present a real terminal to a shell that has no physical serial line behind it?"
+    mermaid: class
+
   - title: "Jails — OS-level Isolation"
     family: "security-isolation"
     related:
@@ -776,6 +1301,75 @@ chapters:
       - "How does Capsicum differ architecturally from jails (chapter 12) and from MAC?"
       - "How does a real-world consumer (e.g. tcpdump, dhclient) restructure itself to run capability-mode-clean?"
     mermaid: flowchart
+
+  - title: "Credentials, Privilege, and the MAC Framework — the Access-Control Substrate"
+    family: "security-isolation"
+    related:
+      - "Jails — OS-level Isolation"
+      - "Capsicum — Capability Mode and Sandboxing"
+      - "VFS — Virtual File System Layer"
+    output_file: "sys/kern/README_cred.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/security/mac"
+      - "sys/sys"
+    # kern_prot.c owns struct ucred and the uid/gid credential model
+    # (setuid/setgid, credential inheritance across fork/exec);
+    # kern_priv.c is priv_check(9), the single point every discretionary
+    # privilege check funnels through. security/mac is the MAC framework:
+    # mac_framework.c is the entry-point dispatcher, mac_policy.h the KPI
+    # a policy module implements, mac_process/mac_vfs the labeled-object
+    # hooks. ucred.h/priv.h are the KPIs.
+    source_files:
+      - "sys/kern/kern_prot.c"
+      - "sys/kern/kern_priv.c"
+      - "sys/security/mac/mac_framework.c"
+      - "sys/security/mac/mac_process.c"
+      - "sys/security/mac/mac_vfs.c"
+      - "sys/sys/ucred.h"
+      - "sys/sys/priv.h"
+      - "sys/security/mac/mac_policy.h"
+    # Jails and Capsicum are *consumers* of this substrate (a jail is a
+    # ucred field checked in prison_check; Capsicum is a credential flag
+    # plus fd rights). This chapter owns the substrate itself — ucred,
+    # priv_check, and MAC — and shows how those two chapters build on it.
+    # Do not re-explain jail or Capsicum policy here; reference them.
+    scope_guard: >
+      This chapter owns the access-control substrate: struct ucred (the
+      uid/gid credential every process carries), priv_check(9) (the single
+      funnel for discretionary privilege), and the MAC framework (how
+      policy modules interpose labeled checks on subjects and objects). Do
+      NOT re-explain jails or Capsicum as policies — they are *consumers*
+      of this substrate (a jail is a field on ucred; Capsicum is a
+      credential flag plus per-fd rights); name the relationship and link
+      to those chapters. Do NOT catalog every shipped mac_* module — cover
+      the framework and use one or two (mac_bsdextended/ugidfw, mac_mls or
+      mac_biba) as concrete examples. Do NOT re-derive the vnode contract
+      (VFS chapter); cover only how MAC hooks interpose on VFS operations.
+    focus: >
+      Document the credential and access-control substrate that jails,
+      Capsicum, and file permissions all build on. struct ucred
+      (kern_prot.c): the real/effective/saved uid and gid set, supplementary
+      groups, the login class and resource-limit pointers, and how a
+      credential is copied, shared (reference-counted), and mutated across
+      setuid/setgid, fork, and exec. priv_check(9) (kern_priv.c): the
+      single choke point every "is this thread allowed to do X" privilege
+      question passes through (PRIV_* names), and how jail and MAC get a
+      say there. Then the MAC framework (security/mac): how it turns the
+      kernel's access-control decisions into a series of hooks
+      (mac_framework.c dispatch), how a policy module (mac_policy.h)
+      registers to label subjects/objects and vote on operations, and how
+      the labeled-object hooks interpose on process and VFS operations
+      (mac_process.c, mac_vfs.c). Use a shipped policy or two as concrete
+      examples (mac_bsdextended/ugidfw for rule-based file access, MLS/Biba
+      for multilevel labels). Frame the whole chapter as "the layer jails
+      and Capsicum stand on."
+    key_questions:
+      - "What is struct ucred, and how does it flow and change across fork, exec, and setuid — who shares a credential and who gets a fresh copy?"
+      - "What is priv_check(9), and why does funneling every privilege decision through one function matter for jails and MAC?"
+      - "How does the MAC framework let a loadable policy module interpose on an operation — what does a hook look like, and how do multiple policies compose their verdicts?"
+      - "How do jails and Capsicum reduce to operations on this substrate (a ucred field, a credential flag) rather than being separate access-control systems?"
+    mermaid: class
 
   - title: "bhyve — VMM Kernel Module and Hypervisor"
     family: "virt-observability"
@@ -846,6 +1440,75 @@ chapters:
       - "How does an ECB connect a probe to an action, and how do aggregations produce summary statistics without per-event userspace traffic?"
       - "What is the role of fasttrap, and how does it instrument userspace processes?"
     mermaid: class
+
+  - title: "Kernel Debugging and Crash Analysis — KDB, DDB, dumps, and KTR"
+    family: "virt-observability"
+    related:
+      - "DTrace — Dynamic Tracing Framework"
+      - "Kernel Core — Structure and Entry Point"
+      - "Locking Primitives — Mutexes, sx, rmlocks, and Atomics"
+    output_file: "sys/kern/README_kdb.md"
+    source_dirs:
+      - "sys/kern"
+      - "sys/ddb"
+      - "sys/sys"
+    # subr_kdb.c is the debugger backend framework (kdb_enter, backend
+    # registration, the panic/trap entry into the debugger); ddb/* is the
+    # in-kernel interactive debugger (db_command.c dispatch, db_examine.c
+    # memory/register inspection, db_ps.c the canonical "show processes").
+    # kern_shutdown.c owns panic() and the reboot/dump path; kern_dump.c
+    # writes the crash dump to the dump device; subr_prf.c is
+    # printf/log/tprintf; kern_ktr.c is the KTR ring-buffer event tracer.
+    source_files:
+      - "sys/kern/subr_kdb.c"
+      - "sys/ddb/db_command.c"
+      - "sys/ddb/db_examine.c"
+      - "sys/ddb/db_ps.c"
+      - "sys/kern/kern_shutdown.c"
+      - "sys/kern/kern_dump.c"
+      - "sys/kern/subr_prf.c"
+      - "sys/kern/kern_ktr.c"
+    # DTrace is the *live, production, dynamic* tracing tool; this chapter
+    # is the *interactive debugger + post-mortem* toolchain. They are
+    # complementary — say so explicitly and do NOT re-explain providers,
+    # DIF, or fbt here. WITNESS/lock diagnostics are the Locking chapter's;
+    # reference how "show lockchain"/"show alllocks" surface them in DDB.
+    scope_guard: >
+      This chapter owns the interactive debugger and post-mortem
+      toolchain: KDB (the backend framework), DDB (the in-kernel
+      debugger), the panic/reboot/crash-dump path, savecore/kgdb analysis,
+      and KTR. Do NOT re-explain DTrace — it is the complementary
+      *live/dynamic* tracing tool; state the division of labor (DTrace for
+      production instrumentation of a running system; DDB/dumps for a
+      wedged or panicked one) and link. Do NOT re-derive the WITNESS lock
+      verifier (Locking chapter) — show how its state is surfaced via DDB
+      commands (show lockchain, show alllocks) but defer the mechanism.
+      Keep printf/console detail (subr_prf.c) to what matters for
+      debugging: log levels, the message buffer, and why printf is unsafe
+      in some contexts.
+    focus: >
+      Document how a FreeBSD developer inspects a wedged or crashed
+      kernel. KDB (subr_kdb.c): the debugger backend framework — how
+      kdb_enter is reached from a panic, a trap, a watchdog, or a console
+      break, and how backends register. DDB (sys/ddb): the in-kernel
+      interactive debugger — command dispatch (db_command.c), memory and
+      register examination (db_examine.c), stack tracing, and the "show"
+      commands (db_ps.c and friends) that decode live kernel state
+      (processes, locks, mbufs). The crash path: panic() and the
+      reboot/dump sequence in kern_shutdown.c, writing a dump to the dump
+      device (kern_dump.c), and post-mortem analysis with savecore + kgdb
+      against the vmcore. KTR (kern_ktr.c): the low-overhead ring-buffer
+      event tracer for reconstructing what happened just before a hang or
+      race. And subr_prf.c: printf/log/the message buffer and why some
+      contexts forbid them. Position the whole chapter as the
+      complement to DTrace: DTrace observes a healthy running system;
+      this toolchain dissects a broken one.
+    key_questions:
+      - "What paths lead into KDB (panic, trap, console break, watchdog), and what can you actually do once DDB has the console?"
+      - "What happens between panic() and a saved crash dump — the kern_shutdown.c reboot path, kern_dump.c writing to the dump device, and savecore recovering it on reboot?"
+      - "How do you analyze a vmcore after the fact with kgdb, and what do DDB 'show' commands (show lockchain, show alllocks, ps) tell you about a deadlock?"
+      - "When do you reach for KTR or DDB versus DTrace — what can each see that the other cannot?"
+    mermaid: sequence
 
   - title: "netgraph — Graph-based Networking Framework"
     family: "networking"
