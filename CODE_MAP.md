@@ -229,7 +229,7 @@ the repo, the source tree, or a copy of the script. Do not SSH into
 them to launch jobs. Current endpoints:
 
 - `framework`  → `http://192.168.100.7:8080/v1`
-- `framework2` → `http://192.168.100.136:8080/v1`
+- `framework2` → `http://192.168.100.8:8080/v1`
 
 Parallelism is N `generate-doc.py` processes on `bigone`, each
 pointed at a different `OPENAI_BASE_URL`. The script itself only

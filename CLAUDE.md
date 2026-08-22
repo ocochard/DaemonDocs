@@ -17,7 +17,7 @@ are remote llama-servers — used purely as compute, no repo / source
 tree / script there:
 
 - `framework`  → `http://192.168.100.7:8080/v1`
-- `framework2` → `http://192.168.100.136:8080/v1`
+- `framework2` → `http://192.168.100.8:8080/v1`
 
 Set `OPENAI_BASE_URL` to one of those and `OPENAI_MODEL=Qwen3.6-35B-A3B-UD-Q8_K_XL`
 (the current model served at both). Do not SSH into the endpoints
