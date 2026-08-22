@@ -83,8 +83,15 @@ export FREEBSD_SRC=$HOME/freebsd-src
 export BOOKS_DIR=$HOME/books
 export FREEBSD_DOC=$HOME/freebsd-doc/documentation/content/en
 
-# 2. Install dependencies
-python3 -m pip install --user -r requirements.txt
+# 2. Install dependencies into a local virtualenv.
+#    Uses whatever `python3` is the system default — no version is hardcoded
+#    anywhere in the project (the script's shebang is `#!/usr/bin/env python3`).
+#    A venv keeps deps self-contained and avoids the split-interpreter trap
+#    that `pip install --user` causes when several python3.x are installed.
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+#    Then run every command below as `.venv/bin/python generate-doc.py ...`
+#    (or `. .venv/bin/activate` once, then plain `python generate-doc.py ...`).
 
 # 3. Verify the LLM endpoint
 curl -s http://localhost:8080/v1/models | grep qwen36-coder

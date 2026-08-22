@@ -9,6 +9,9 @@
 __pycache__/
 *.pyc
 
+# Local virtualenv (created with the system default python3 — see README)
+.venv/
+
 # Generated output (rebuildable via --index-only). The generated chapter
 # READMEs live in $FREEBSD_SRC, not here; the index follows the same rule.
 CHAPTER_INDEX.md
