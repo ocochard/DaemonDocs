@@ -186,10 +186,16 @@ if isinstance(proc_result, tuple):
 else:
     proc_issues = proc_result
 issue_text = " ".join(proc_issues)
+# Each issue is "struct NAME: bogus, fields (real fields are: ...)". Only the
+# part before "(real fields are:" names fields as WRONG — the parenthetical is
+# the authoritative list handed to the writer so it can fix them in one step
+# instead of looping (see _verify_struct_bodies). Match on the bogus half only,
+# or every real field name trivially "appears in the issues".
+bogus_text = " ".join(i.split("(real fields are:")[0] for i in proc_issues)
 check(
     "real macro-bodied fields not flagged",
-    "p_list" not in issue_text and "p_threads" not in issue_text
-    and "p_flag" not in issue_text and "p_pid" not in issue_text,
+    "p_list" not in bogus_text and "p_threads" not in bogus_text
+    and "p_flag" not in bogus_text and "p_pid" not in bogus_text,
     f"issues={proc_issues}",
 )
 check(

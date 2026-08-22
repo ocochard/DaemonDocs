@@ -104,6 +104,41 @@ MODEL_CONFIG = {
     "timeout": float(os.environ.get("DAEMONDOCS_LLM_TIMEOUT", "600")),
 }
 
+# Whether the WRITER gets the model's reasoning channel. Default ON.
+#
+# Disabling it looks like an obvious win per-call — 3x faster, and the
+# discarded reasoning_content is pure waste since smolagents reads only
+# `content`. It is not. Measured 2026-08-22, ch3 run twice concurrently,
+# same model and prompt, writer thinking the ONLY variable:
+#
+#            stages                                    max_steps  input tokens
+#   OFF   draft->rev1->rev2, 3 reviews                      2       1,138,316
+#   ON    draft, 1 review (PASS first pass)                 0          82,580
+#
+# 13.8x more input tokens with thinking off. Without the reasoning channel
+# the writer substitutes tool calls for deliberation: it burns the whole
+# 80-step draft budget re-reading the same files (24x resolve_c_definition
+# on one symbol, 22x read of one file in the earlier ch3 failure), produces
+# a draft the reviewer rejects, and then needs two revision rounds. The
+# per-call saving is swamped by the extra calls.
+#
+# This is why the first 2026-08-22 queue run died: ch3/ch4/ch5/ch6 all hit
+# max_steps=80 at 3-4M input tokens each. Do not disable this again without
+# re-running the same two-arm experiment — per-call latency is the wrong
+# unit to optimize, total tokens to a finished chapter is the right one.
+WRITER_THINKING = os.environ.get("DAEMONDOCS_WRITER_THINKING", "1") != "0"
+
+# Whether the REVIEWER gets the model's reasoning channel. The reviewer is
+# a separate question: it does multi-criteria
+# judgment against injected ground truth (a plausible use for deliberation),
+# but the ch11 runaway that forced max_steps 15->5 on 2026-05-03 was 121K
+# tokens of thinking with no parsed code, i.e. this exact channel.
+#
+# Env-var gated so one endpoint can run reviewer-thinking ON and the other
+# OFF against a shared chapter queue, giving a real A/B within a single run
+# instead of an assumption. Set DAEMONDOCS_REVIEWER_THINKING=0 to disable.
+REVIEWER_THINKING = os.environ.get("DAEMONDOCS_REVIEWER_THINKING", "1") != "0"
+
 # Resolved at startup by resolve_model_provenance(); cached for the run.
 RESOLVED_PROVENANCE: Optional[Dict[str, str]] = None
 
@@ -462,6 +497,12 @@ def build_book_corpus(books_dir: str, force: bool = False) -> str:
     if not force and corpus_file.exists():
         previous_corpus = corpus_file.read_text(encoding="utf-8", errors="ignore")
 
+    # Unfiltered snapshot of what is on disk right now, used only to decide
+    # whether the final write is a no-op. Kept separate from previous_corpus,
+    # which is "" under --force and is further filtered by drop_sources below.
+    corpus_on_disk = (corpus_file.read_text(encoding="utf-8", errors="ignore")
+                      if corpus_file.exists() else None)
+
     # Sources we don't want carried over from the previous corpus:
     #   - books being re-extracted (will be re-appended below with fresh text)
     #   - books that have been deleted from books_dir (should disappear entirely)
@@ -490,7 +531,14 @@ def build_book_corpus(books_dir: str, force: bool = False) -> str:
     for book_name, page_text in all_entries:
         new_corpus_parts.append(f"\n\n### SOURCE: {book_name} ###\n\n")
         new_corpus_parts.append(page_text)
-    _atomic_write(str(corpus_file), "".join(new_corpus_parts))
+    # Only write when the bytes changed. _atomic_write renames into place,
+    # which always produces a fresh mtime — and get_or_build_index treats a
+    # corpus newer than the index as stale, so an unconditional write here
+    # forced a full ~100MB TF-IDF rebuild on every single run. It also made
+    # two concurrent runners (one per LLM endpoint) race on the same .npy.
+    new_corpus = "".join(new_corpus_parts)
+    if new_corpus != corpus_on_disk:
+        _atomic_write(str(corpus_file), new_corpus)
 
     # Atomic write — a Ctrl-C mid-write would otherwise leave a truncated JSON
     # that crashes the next run before it can rebuild.
@@ -830,22 +878,39 @@ def extract_freebsd_docs(src_root: str, corpus_file: str) -> int:
         old_content = Path(corpus_file).read_text(encoding="utf-8", errors="ignore")
         # Remove existing FreeBSD-sourced entries (man9, paper, Handbook, git log, kerneldoc, sys/README)
         segments = re.split(r"### SOURCE: (.+?) ###", old_content)
-        kept = [segments[0]] if segments else []  # leading text before first source
+        kept = [segments[0].rstrip("\n")] if segments else []
         freebsd_prefixes = ("FreeBSD man9:", "FreeBSD paper:", "FreeBSD Handbook:",
                             "FreeBSD git log:", "FreeBSD kerneldoc:", "FreeBSD sys/")
         for i in range(1, len(segments), 2):
             src = segments[i].strip()
             if not any(src.startswith(p) for p in freebsd_prefixes):
-                kept.append(segments[i])
-                if i + 1 < len(segments):
-                    kept.append(segments[i + 1])
+                # Re-emit the delimiter, not just the label. re.split() strips
+                # the "### SOURCE: X ###" markers out, so reassembling from the
+                # bare capture groups silently destroyed the header of every
+                # retained (book) segment — after one cycle the whole book
+                # corpus was a single unlabeled blob, un-prunable by
+                # build_book_corpus's drop_sources and unattributable by
+                # search_books.
+                body = segments[i + 1] if i + 1 < len(segments) else ""
+                kept.append(f"\n\n### SOURCE: {src} ###\n\n{body.strip(chr(10))}")
         old_content = "".join(kept) if kept else ""
 
-        with open(corpus_file, "w", encoding="utf-8") as f:
-            f.write(old_content)
-            for label, text in all_entries:
-                f.write(f"\n\n### SOURCE: {label} ###\n\n")
-                f.write(text)
+        # Build the new corpus in memory and only write when the bytes
+        # actually change. Each segment is normalized to exactly one blank
+        # line before its header; previously the strip left the old
+        # separator in place and the re-append added another, growing the
+        # corpus by 2 bytes per run forever (observed at 100 stacked
+        # newlines). That churn changed the file every run, so
+        # get_or_build_index always saw "corpus newer than index" and
+        # rebuilt the ~100MB TF-IDF matrix — and two concurrent runners
+        # (one per LLM endpoint) would race to write the same .npy.
+        new_content = old_content + "".join(
+            f"\n\n### SOURCE: {label} ###\n\n{text.strip(chr(10))}"
+            for label, text in all_entries
+        )
+        if new_content != Path(corpus_file).read_text(encoding="utf-8",
+                                                      errors="ignore"):
+            Path(corpus_file).write_text(new_content, encoding="utf-8")
     else:
         with open(corpus_file, "a", encoding="utf-8") as f:
             for label, text in all_entries:
@@ -3312,6 +3377,29 @@ def create_writer_agent(index: TfidfIndex):
         client_kwargs={"timeout": MODEL_CONFIG["timeout"]},
         temperature=0.6,
         top_p=0.95,
+        # Reasoning channel, default ON — see WRITER_THINKING in the
+        # Configuration banner for the two-arm measurement that settled
+        # this. Short version: disabling it is ~3x faster PER CALL and
+        # 13.8x more expensive PER CHAPTER, because the writer substitutes
+        # tool calls for deliberation and stops converging. Per-call
+        # latency is the wrong unit; total tokens to a finished chapter is
+        # the right one.
+        #
+        # `reasoning_effort: "none"` is the SDK-native equivalent and gives
+        # byte-identical output; `/no_think` in the prompt is IGNORED on
+        # this build (still emitted 653 chars of reasoning).
+        #
+        # This instance is reused for draft / revise / fact-fix, so all
+        # three writer stages share the setting. The reviewer is gated
+        # separately — see create_reviewer_agent.
+        #
+        # MUST go through `extra_body`: the openai SDK validates keyword
+        # arguments against Completions.create()'s signature and raises
+        # TypeError on unknown ones, so passing chat_template_kwargs at the
+        # top level fails every call before it reaches the wire.
+        # `extra_body` is merged into the JSON request body unvalidated,
+        # which is the only way to reach a llama.cpp-specific parameter.
+        extra_body={"chat_template_kwargs": {"enable_thinking": WRITER_THINKING}},
     )
 
     return CodeAgent(
@@ -3361,6 +3449,13 @@ def create_writer_agent(index: TfidfIndex):
 def create_reviewer_agent(index: TfidfIndex):
     """Create the reviewer agent — critiques drafts, no source tools needed."""
     # Same pinning as the writer — see create_writer_agent for rationale.
+    #
+    # Reasoning is gated by REVIEWER_THINKING (env DAEMONDOCS_REVIEWER_THINKING)
+    # so the two llama-server endpoints can run opposite settings against the
+    # shared chapter queue and be compared directly. Unlike the writer — where
+    # thinking is always off, because transcription doesn't benefit from it and
+    # the extra headroom invites fabrication — the reviewer's value here is
+    # genuinely unmeasured. See the REVIEWER_THINKING comment in Configuration.
     model = OpenAIServerModel(
         model_id=MODEL_CONFIG["model_id"],
         api_base=MODEL_CONFIG["api_base"],
@@ -3368,6 +3463,9 @@ def create_reviewer_agent(index: TfidfIndex):
         client_kwargs={"timeout": MODEL_CONFIG["timeout"]},
         temperature=0.6,
         top_p=0.95,
+        # via extra_body — see create_writer_agent for why the top-level
+        # kwarg does not work with the openai SDK.
+        extra_body={"chat_template_kwargs": {"enable_thinking": REVIEWER_THINKING}},
     )
 
     return CodeAgent(
@@ -3570,6 +3668,11 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
     print(f"  Chapter: {title}")
     print(f"  Output:  {output_path}")
     print(f"  Revisions: up to {max_revisions}")
+    # Logged (not written into the chapter footer, which is public-facing)
+    # so a finished run can be split by reviewer-thinking arm after the fact.
+    print(f"  Endpoint: {MODEL_CONFIG['api_base']}")
+    print(f"  Writer thinking:   {'on' if WRITER_THINKING else 'off'}")
+    print(f"  Reviewer thinking: {'on' if REVIEWER_THINKING else 'off'}")
     print(f"{'=' * 70}")
 
     if dry_run:
@@ -4758,6 +4861,16 @@ _FREEBSD_TOP_DIRS = (
 )
 
 
+# Extensionless filenames common in a FreeBSD checkout. Without these the
+# directory branch below would skip `Makefile` and `COPYING`, which is how
+# `gnu/Makefile` slipped past the extension-based extractors.
+_EXTENSIONLESS_FILES = frozenset({
+    'Makefile', 'Makefile.inc', 'Makefile.inc1', 'Makefile.libcompat',
+    'COPYING', 'COPYING.LIB', 'README', 'Kyuafile', 'LICENSE',
+    'MAINTAINERS', 'UPDATING', 'ObsoleteFiles.inc',
+})
+
+
 def _extract_file_paths(text: str) -> List[str]:
     """Extract claimed FreeBSD source file paths from markdown text."""
     # Match paths like sys/vm/vm_page.c, share/man/man9/foo.9, etc.
@@ -4784,6 +4897,46 @@ def _extract_file_paths(text: str) -> List[str]:
         p = m.group(1).strip()
         if p not in paths:
             paths.append(p)
+
+    # Directory paths and extensionless files. Both branches above require a
+    # file extension, so `gnu/`, `librescue`, `src/tests/bin`, and
+    # `gnu/Makefile` were never extracted and therefore never verified —
+    # ch1 (Source Tree, almost entirely directory prose) shipped 9 bogus
+    # paths on 2026-04-30 while fact-check reported clean. `gnu/` in
+    # particular was retired upstream (134a4c78d070 "Retire the GNU
+    # subtree"), the same stale-training-data failure mode as fabricated
+    # struct fields.
+    #
+    # Deliberately NOT gated on _FREEBSD_TOP_DIRS: that tuple still lists
+    # `gnu/`, so filtering through it would whitelist exactly the retired
+    # directory we need to catch. Instead take any backticked slash-path
+    # and let _verify_file_paths decide, with the exemptions below removing
+    # the shapes that are legitimately absent from a source checkout.
+    for m in re.finditer(r'`([A-Za-z0-9_][A-Za-z0-9_./+-]*)`', text):
+        raw = m.group(1)
+        # A trailing slash is the writer explicitly marking a directory
+        # (`librescue/`, `gnu/`). Note this BEFORE stripping it, otherwise
+        # single-segment directory claims become indistinguishable from
+        # bare words and get skipped by the separator test below.
+        marked_dir = raw.endswith('/')
+        p = raw.rstrip('/')
+        if not p or p in paths:
+            continue
+        # Absolute paths name installed-system locations (/boot/kernel,
+        # /usr/bin, /etc/rc.d). Correct prose in a layout chapter, and
+        # legitimately not present in the source tree.
+        if p.startswith('/'):
+            continue
+        # Needs to look like a path (contains a separator) or be a
+        # well-known extensionless file. A bare word is far more likely to
+        # be a command, variable, or struct field than a directory.
+        if '/' not in p and not marked_dir and p not in _EXTENSIONLESS_FILES:
+            continue
+        # Skip things already covered by the extension-based branches.
+        if os.path.splitext(p)[1] and p in paths:
+            continue
+        paths.append(p)
+
     return list(set(paths))
 
 
@@ -5037,14 +5190,62 @@ def _verify_file_paths(paths: List[str], src_root: str) -> List[str]:
         full = os.path.join(src_root, p)
         if os.path.exists(full):
             continue
+        # Paths written relative to /usr/src: "src/bin/cp" is "<src>/bin/cp".
+        # Common in layout prose and not a hallucination.
+        if p.startswith('src/') and os.path.exists(
+                os.path.join(src_root, p[len('src/'):])):
+            continue
+        # Kernel-relative paths. Chapters about kernel subsystems write
+        # include paths the way C does — `sys/proc.h` for <sys/proc.h>
+        # (really sys/sys/proc.h), `vm/uma.h`, `netinet/ip_fw.h` — and
+        # bare directory names like "kern" or "amd64" for sys/kern and
+        # sys/amd64. All are correct prose. Flagging them would burn
+        # fact-fix steps on accurate text, the failure mode
+        # _FACT_CHECK_IGNORE exists to prevent, and the glob fallback
+        # below makes it worse by "correcting" sys/proc.h to an
+        # arch-specific sys/powerpc/include/proc.h.
+        # Note this exemption necessarily swallows a real error class: a
+        # claim about a retired TOP-LEVEL directory whose name still exists
+        # under sys/ (bare `gnu` vs the retired top-level `gnu/`) resolves
+        # to sys/gnu and passes. Using the writer's trailing slash to tell
+        # the two apart was tried and reverted — chapters write `kern/`,
+        # `vm/`, `amd64/` with slashes too, so it turned ~20 correct
+        # kernel-relative claims into false positives to catch one real
+        # one. Better to miss that case than to spend the writer's
+        # fact-fix budget rewriting accurate prose.
+        if any(os.path.exists(os.path.join(src_root, parent, p))
+               for parent in ('sys', 'sys/dev', 'include', 'lib',
+                              'share', 'usr.bin', 'usr.sbin')):
+            continue
+        # `machine/foo.h` is the per-architecture include alias: at build
+        # time machine/ points at sys/<arch>/include/. It never exists as
+        # a literal path, so resolve it against the arch directories
+        # instead of reporting a real header as fabricated.
+        if p.startswith('machine/'):
+            leaf = p[len('machine/'):]
+            if glob.glob(os.path.join(src_root, 'sys', '*', 'include', leaf)):
+                continue
         # Try glob fallback
         pattern = os.path.join(src_root, p.split('/')[0], '**', p.split('/')[-1])
         matches = list(glob.glob(pattern, recursive=True))
         # Filter to candidates that actually exist on disk. Glob already
         # returns existing entries, but be defensive against symlinks or
         # races between glob and the os.path.exists() recheck below.
+        # isfile would reject directory corrections, which this function
+        # now also verifies — use a plain existence check.
+        # Require the correction to share the claimed path's parent
+        # directory name, not merely its basename. Matching on basename
+        # alone across the whole tree produces confident nonsense —
+        # `sys/conf/config` "corrected" to `sys/contrib/openzfs/config`,
+        # which sends the writer to rewrite correct-ish prose into a
+        # genuinely unrelated file. A wrong correction is worse than no
+        # correction: the writer trusts it.
+        want_parent = os.path.basename(os.path.dirname(p)) if '/' in p else ''
         candidate = next(
-            (m for m in matches if os.path.exists(m) and os.path.isfile(m)),
+            (m for m in matches
+             if os.path.exists(m)
+             and (not want_parent
+                  or os.path.basename(os.path.dirname(m)) == want_parent)),
             None,
         )
         if candidate is not None:
@@ -6384,7 +6585,25 @@ def _verify_struct_bodies(
             continue  # verification unavailable — don't flag
         bogus = [f for f in dict.fromkeys(claimed) if f not in real]
         if bogus:
-            bogus_issues.append(f"struct {name}: {', '.join(bogus)}")
+            # Include the REAL field list, not just the rejected names.
+            # "these fields don't exist, go read the header" is not
+            # actionable: on 2026-08-22 ch3 the writer looped for dozens of
+            # steps insisting `si_sub`/`si_order`/`si_func` were right
+            # ("the fact-checking says they don't exist. This is very
+            # confusing.") because read_freebsd_source truncates the large
+            # sys/sys/kernel.h before reaching the definition. We already
+            # parsed the real fields to detect the mismatch — handing them
+            # over turns a loop into a one-step edit. Sorted for stable
+            # output; capped because a wide struct would otherwise crowd
+            # out the other fact-check issues in the prompt.
+            real_list = sorted(real)
+            shown = ", ".join(real_list[:24])
+            if len(real_list) > 24:
+                shown += f", ... ({len(real_list)} fields total)"
+            bogus_issues.append(
+                f"struct {name}: {', '.join(bogus)} "
+                f"(real fields are: {shown})"
+            )
 
         # Overlap-threshold check. The original failure mode (mbuf,
         # 2026-05-01) was a draft body that named ~2 fields, none of
@@ -6760,10 +6979,12 @@ def _build_fact_check_prompt(chapter: dict, draft: str, facts: dict) -> str:
             "Struct field names that do not exist in the real struct: "
             + "; ".join(facts['struct_fields_bogus'])
             + ". The struct itself is real but the fields you listed are "
-            "not. Read the defining header with `read_freebsd_source` and "
-            "quote the real field list verbatim — do not paraphrase. You "
-            "may elide fields with `/* ... */` but must not rename or "
-            "retype the ones you keep."
+            "not — they are almost always stale names from an older "
+            "version of the tree. The real field list is given in "
+            "parentheses above: use exactly those names. Do NOT re-derive "
+            "them by reading the header; that list came from the current "
+            "source and is authoritative. You may elide fields with "
+            "`/* ... */` but must not rename or retype the ones you keep."
         )
     if facts.get('struct_bodies_abridged'):
         # Each entry is `"struct NAME (real definition has N top-level
@@ -7769,6 +7990,14 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"  Done: {ok}/{len(to_run)} chapters generated")
     print(f"{'=' * 60}")
+
+    # Exit non-zero when nothing was produced. A misconfiguration that makes
+    # every LLM call fail (e.g. an unsupported kwarg rejected by the openai
+    # SDK before it reaches the wire) otherwise still exits 0, so a queue
+    # runner reads it as success and burns the rest of the queue at ~60s per
+    # chapter with no output. 2026-08-22 lost 4 chapters that way.
+    if ok == 0 and to_run:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

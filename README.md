@@ -51,6 +51,17 @@ The script talks to an OpenAI-compatible local server. Defaults are set in `MODE
 | Model id | `qwen36-coder` |
 | API key | `none` (llama-server ignores it) |
 
+These are the built-in defaults; override with `OPENAI_BASE_URL` /
+`OPENAI_MODEL` for whatever your llama-server actually serves.
+
+**If the model has a reasoning mode, leave it on.** Both agents pass
+`extra_body={"chat_template_kwargs": {"enable_thinking": …}}`, default
+on. Disabling it is faster per call and dramatically more expensive per
+chapter — the writer replaces deliberation with tool calls and stops
+converging. Measurements are in `FUTURE_IMPROVEMENTS.md`; override per
+agent with `DAEMONDOCS_WRITER_THINKING` / `DAEMONDOCS_REVIEWER_THINKING`
+only to re-run that experiment.
+
 The `model_id` must match exactly what `llama-server` advertises at `/v1/models`. A mismatch causes the request to fail or to silently route to whichever model is loaded — the output looks plausible but quality drops.
 
 ### Optional sysctl fact-check

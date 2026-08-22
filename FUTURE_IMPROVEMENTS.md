@@ -17,6 +17,121 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-08-22] Disabling the writer's reasoning channel made it stop converging (61x token cost)
+
+Qwen3.8-27B is a reasoning model: it emits into `reasoning_content`, a
+field smolagents never reads (it uses `content` only). Every thinking
+token is therefore generated, paid for, and discarded. Turning it off
+measured as an unambiguous win on a single call:
+
+    thinking on : 205 completion tokens, 32.6s, 263 chars of content
+    thinking off:  72 completion tokens, 10.6s, 381 chars of content
+
+~3x faster, *more* delivered content. It was shipped for the writer on
+that basis and it was wrong. The first queue run had ch3, ch4, ch5 and ch6
+all hit `max_steps=80` with 3–4M input tokens each, still calling tools
+sensibly at step 80 but never producing a final answer.
+
+The controlled test — ch3 run twice concurrently, same model, same prompt,
+same hardware, writer thinking the only variable:
+
+| | thinking OFF | thinking ON |
+|---|---|---|
+| stages | draft → rev1 → rev2, 3 reviews | draft, 1 review (PASS first pass) |
+| writer `max_steps` hits | 2 | 0 |
+| tool calls | 234 | — |
+| **input tokens** | **1,192,420** | **19,461** |
+
+**61x.** Without the reasoning channel the writer substitutes tool calls
+for deliberation: 24 `resolve_c_definition` calls on one symbol, 22
+re-reads of one file, the whole 80-step draft budget spent, then a draft
+the reviewer rejects and two revision rounds to repair.
+
+**The lesson is the unit of measurement.** Per-call latency is the wrong
+one; total tokens to a *finished chapter* is the right one. Any future
+"make the model cheaper per call" change needs the same two-arm test
+before it goes near a queue.
+
+Writer and reviewer reasoning are now separately env-gated
+(`DAEMONDOCS_WRITER_THINKING`, `DAEMONDOCS_REVIEWER_THINKING`, both
+default on) so the experiment is repeatable and so the two endpoints can
+run opposite *reviewer* arms against the shared queue — the reviewer case
+is still unmeasured, and it is a genuinely open question, because the
+ch11 runaway that forced reviewer `max_steps` 15→5 was 121K tokens of
+thinking with no parsed code.
+
+**Mechanism trap worth remembering:** `chat_template_kwargs` must be
+passed inside `extra_body={...}`. The openai SDK validates keyword
+arguments against `Completions.create()`'s signature and raises
+`TypeError` on unknown names, so the top-level form fails *every call
+before it reaches the wire*. It still appears in `model.kwargs`, so
+inspecting that proves nothing. This cost 4 chapters: each failed in ~60s
+while the script exited 0, so the queue runner read it as success and
+kept popping. Two guards were added — `generate-doc.py` now exits
+non-zero when it produced no chapter, and `runner.sh` aborts after 2
+consecutive failures rather than draining the queue.
+
+### [DONE — shipped 2026-08-22] Path fact-check never looked at directories; ch1 shipped 9 bad paths as "clean"
+
+`_extract_file_paths` required a trailing file extension
+(`\.(?:c|h|s|rs|md|9|4|5|7|8)`), so directory claims and extensionless
+files were never extracted and so never verified. This matters most
+exactly where it hurts most: ch1 (Source Tree — Layout and Conventions)
+is almost entirely directory prose.
+
+Measured on the K4 ch1 (`README_internals.md`, 2026-04-30):
+
+| | count |
+|---|---|
+| backticked paths in the chapter | 106 |
+| genuinely absent from the tree | 9 |
+| **extracted by the pipeline** | **3** |
+| **flagged by the pipeline** | **0** |
+
+Among the misses was `gnu/` — a subtree FreeBSD *retired upstream*
+(`134a4c78d070 "Retire the GNU subtree"`). The chapter documented a
+directory that no longer exists, which is the same stale-training-data
+failure mode as fabricated struct fields, and the fact-checker reported
+clean. A verifier that silently skips a whole claim class is worse than
+no verifier: it produces a false PASS.
+
+Extraction now also takes directory-shaped tokens and known extensionless
+filenames (`Makefile`, `COPYING`, `Kyuafile`, …). The hard part was not
+extraction but **staying quiet**: the first attempt flagged 44 paths on
+ch1, mostly correct prose. Verification therefore exempts absolute paths
+(installed-system locations, legitimately absent from a checkout),
+`src/`-relative paths, kernel-relative paths (`sys/proc.h` is really
+`sys/sys/proc.h`; bare `kern`/`vm`/`amd64` resolve under `sys/`), and the
+`machine/` per-arch include alias.
+
+Two attempts were reverted, both caught by testing against real chapters
+rather than synthetic strings:
+
+- **Basename-only glob correction.** Produced `sys/conf/config →
+  sys/contrib/openzfs/config`. A wrong correction is worse than none —
+  the writer trusts it and rewrites correct-ish prose into an unrelated
+  file. Corrections must now share the claimed parent directory.
+- **Trailing slash as a "top-level directory" signal.** Intended to
+  separate the retired top-level `gnu/` from `sys/gnu`. Chapters write
+  `kern/`, `vm/`, `amd64/` with slashes too, so it took ch1 from 9 flags
+  to 29. Reverted, with the miss documented rather than papered over.
+
+Final state across all 28 existing chapters: **397 paths extracted, 13
+flagged, all 13 verified genuine, zero false positives.** Regression
+tests in `test_path_factcheck.py` pin both the catches and the
+exemptions, including the deliberate `gnu` miss.
+
+**Still open — the class none of this reaches:** every verifier in the
+pipeline is *symbol-shaped* (does this name exist?). The phantom
+`boot1 (GPT)` boot stage survived the 2026-08-22 ch2 regen and spread
+into the Mermaid diagram, because every token in "UEFI Firmware → boot1
+(GPT boot code) → loader.efi → kernel" names something real — only the
+*ordering* is fabricated. Catching that needs a sequence verifier
+checking claimed orderings against the real call graph
+(codebase-memory-mcp already has CALLS edges and `trace_path`), with
+"no path from A to B" reported as *suspect* rather than *hallucinated*,
+the same conservative framing the sysctl checker uses.
+
 ### [DONE — shipped 2026-08-20] Sysctl OID paths were unverifiable by grep; added optional graph-backed fact-check
 
 Sysctl OIDs (`net.inet.tcp.*`, `vm.pmap.pde.mappings`, `kern.ipc.maxsockbuf`)

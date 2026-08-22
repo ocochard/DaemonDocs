@@ -27,8 +27,16 @@ The file is divided by `# ---` banner comments. In source order:
    `SYSCTL_GRAPH_TIMEOUT`.
 2. **Book corpus extraction** — PDF/CHM/EPUB → text; FreeBSD
    handbook + man pages + git logs. Builds the searchable corpus.
+   **Invariant: an unchanged corpus must be byte-identical run to
+   run.** Two functions write it (`build_book_corpus`, then
+   `extract_freebsd_docs` which strips and re-appends the FreeBSD
+   entries); both compare against what is on disk and skip the
+   write when nothing changed. See "Corpus/index invariants" below
+   — violating this is silent and expensive.
 3. **TF-IDF index** — `class TfidfIndex`, `get_or_build_index`.
    Persistent on-disk index used by the `search_books` tool.
+   Staleness is decided by **mtime** against the corpus, which is
+   why the invariant above matters.
 4. **Smolagents tools** — `ReadFreeBSDSource`, `SearchBooks`,
    `ExploreTree`, `DirectoryMap`, `ResolveCDefinition`. The fixed
    tool set the writer agent runs against. `DirectoryMap` returns
@@ -121,9 +129,11 @@ pattern.
 | Add a new fact-check verifier | Banner **Fact-checking** | Pair: `_extract_FOO(text) -> List` and `_verify_FOO(items, src_root, extra_search_dirs=None) -> List[missing]`. Use `_verify_with_cache` if the verifier is a grep over `sys/` (free re-runs via `_FACT_CHECK_CACHE`). Wire into `fact_check_draft` and `_build_fact_check_prompt`. Existing examples: structs, functions, kernel options, DTrace probes, MALLOC_DEFINE tags, sysctl OIDs (graph-backed — see next row). |
 | Add a **graph-backed** verifier (something grep can't check) | Banner **Fact-checking**, model on the sysctl OID pair | `_extract_sysctls` + `_verify_sysctls_via_graph` query the `codebase-memory-mcp` graph via its `cli <tool>` subcommand instead of grep — sysctl OIDs (`vm.pmap.pde.mappings`) are assembled from `SYSCTL_*` macros and exist nowhere as a literal, so grep provably can't verify them; the indexer reconstructs the OID tree into `Sysctl` nodes. The backend is OPTIONAL: gate every graph call on `_sysctl_graph_available()` (cached probe that prints ONE warning when off) and return `[]` when unavailable so the pipeline never blocks. Cache per-item in a dedicated dict (`_SYSCTL_GRAPH_CACHE`), NOT the grep `_FACT_CHECK_CACHE` (different backend + key space). "Not found" is reported as *suspect* not *hallucinated* because ~1/3 of OID nodes are `resolved:false`. Config + probe live in the **Configuration** banner (`SYSCTL_GRAPH`, `_sysctl_graph_available`). |
 | Verify symbols outside `sys/` (e.g. `stand/`) | `chapters.yaml` `extra_search_dirs:` | Per-chapter list of additional grep roots, joined to `~/freebsd-src`. `_resolve_search_roots` always includes `<src>/sys` and appends each existing extra. The cache key embeds a sorted-tuple suffix so widening roots for one chapter does NOT poison the sys-only cache for others. Use this when a chapter's subject (boot loader, userland tool) lives outside `sys/`. |
+| Verify a claimed **path** (file or directory) | `_extract_file_paths` + `_verify_file_paths` | Extraction has three branches: backticked-with-extension, bare-with-extension, and (added 2026-08-22) directories + extensionless files from `_EXTENSIONLESS_FILES`. A single-segment claim only counts as a directory if the writer wrote the trailing slash (`` `librescue/` ``); bare words are skipped or every backticked command becomes a "path". Verification carries four exemptions that keep it quiet, and **all four are load-bearing** — see the "Things that look weird" note. Do NOT gate extraction on `_FREEBSD_TOP_DIRS`: that tuple still lists `gnu/`, a subtree FreeBSD retired, so filtering through it whitelists exactly the hallucination you want to catch. |
 | Catch struct bodies hallucinated wholesale | `_verify_struct_bodies` returns `(bogus, abridged)` | The bogus-field check (per-field grep) misses bodies where every claimed field is fabricated together. The overlap-threshold layer flags any non-abridged body whose claimed-field set has zero overlap with the real top-level fields (≥4 real fields). `_struct_body_is_abridged` recognizes `...`, `\u2026`, and comments containing `elided`/`omitted`/`for brevity`/etc — writers can opt out by elision. Wired into `fact_check_draft` as `struct_bodies_abridged`. |
 | Catch arity-mismatched function signatures ("verified hallucination") | `_extract_function_signatures` + `_real_function_signature` + `_verify_function_signatures`, wired as `func_sigs_mismatch` | Names of real FreeBSD functions can be combined with stale 2022-era arg lists from the model's training data — every existing check passes (name, paths, fields) while the chapter teaches the wrong API. The new pass parses fenced ```c definitions only (call-site arity is too noisy), counts top-level commas with `_count_c_args` (skipping `void`, K&R-style, and nested parens for function-pointer args), and compares against the real definition arity grepped from the source tree. Cache: `_FUNC_SIG_CACHE` keyed `(cache_root, func_name)`. Returns `None` whenever lookup or parse is uncertain so we never false-flag. Skips names already in `funcs_not_found` to avoid double-reporting. |
-| Change sampler params | `create_writer_agent` / `create_reviewer_agent` | Pass kwargs to `OpenAIServerModel(...)`. They land on every API call via `self.kwargs` in smolagents' `Model._prepare_completion_kwargs`. |
+| Change sampler params | `create_writer_agent` / `create_reviewer_agent` | Pass kwargs to `OpenAIServerModel(...)`. They land on every API call via `self.kwargs` in smolagents' `Model._prepare_completion_kwargs`. **Only for parameters the openai SDK knows.** Anything provider-specific (`chat_template_kwargs`, llama.cpp extensions) must go inside `extra_body={...}` — the SDK validates kwargs against `Completions.create()`'s signature and raises `TypeError` on unknown names, so a top-level pass fails every call *before it reaches the wire*. It still shows up in `model.kwargs`, so inspecting that proves nothing; test end-to-end against a live endpoint. |
+| Turn model reasoning on/off per agent | `WRITER_THINKING` / `REVIEWER_THINKING` (Configuration banner) | Env-gated (`DAEMONDOCS_WRITER_THINKING`, `DAEMONDOCS_REVIEWER_THINKING`), both default on, applied via `extra_body={"chat_template_kwargs": {"enable_thinking": …}}`. Writer reasoning must stay **on** — see the post-mortem in FUTURE_IMPROVEMENTS.md. The two gates exist so the endpoints can run opposite reviewer arms against a shared queue for a real A/B. |
 | Add a new chapter | `chapters.yaml` only | Schema is documented in the YAML's header comment. `output_file` must NOT collide with an upstream-shipped FreeBSD file; if it does, use a sibling name (see chapter 1's `README_internals.md` rationale). Set `family:` (one of the 7 tags) so the new chapter shows up in the right family-mate "Related" sidebars by default; add `related:` only if family-mates aren't right. |
 | Change which chapters appear as "Related" in a sidebar | `chapters.yaml` (`related:` field) | The chapter relationship map is derived from `chapters.yaml` by `_build_chapter_rels` — `related:` wins, family-mates are the fallback. Do NOT reintroduce a hand-maintained `CHAPTER_RELS` dict in `generate-doc.py` — that duplication was the bug fixed by this design (rename in YAML, dict goes silently stale). |
 | Add a writer tool | Banner **Smolagents tools** + `create_writer_agent` `tools=[...]` | `additional_authorized_imports` is **deliberately minimal** (`re`, `json`). Do not add `os` or `pathlib` — see the comment in `create_writer_agent` for why. Also add a regex to `_STATS_TOOL_PATTERNS` so the per-chapter tool-use banner counts the new tool. |
@@ -178,6 +188,44 @@ pattern.
   ("a `bi_module` structure"). Bare-prose "data structure" / "tree
   structure" is rejected because it lacks the backticks; the
   writer's backticks are the load-bearing signal.
+- **`_verify_file_paths` exempts four path shapes, and each one
+  was earned.** Absolute paths (`/boot/kernel`, `/usr/bin`) name
+  installed-system locations and are legitimately absent from a
+  source checkout; `src/`-prefixed paths are relative to
+  `/usr/src`; kernel-relative paths are how chapters write C
+  include paths (`sys/proc.h` is really `sys/sys/proc.h`,
+  `vm/uma.h` is `sys/vm/uma.h`) and bare subdir names (`kern`,
+  `amd64`); `machine/foo.h` is the per-arch alias resolved at
+  build time to `sys/<arch>/include/`. Without them the verifier
+  flags ~30 correct claims per chapter and burns the writer's
+  fact-fix budget rewriting accurate prose. One consequence is
+  accepted: a retired top-level directory whose name still exists
+  under `sys/` (bare `gnu` vs `sys/gnu`) escapes. Using the
+  writer's trailing slash to separate the two was tried and
+  reverted — chapters write `kern/`, `vm/`, `amd64/` the same
+  way, so it cost ~20 false positives to gain one true one.
+- **Glob "corrections" must share the claimed parent directory.**
+  `_verify_file_paths` emits `wrong → right` suggestions from a
+  glob fallback. Matching on basename alone across the whole tree
+  produced `sys/conf/config → sys/contrib/openzfs/config`, which
+  sends the writer to rewrite prose into an unrelated file. A
+  wrong correction is worse than no correction: the writer trusts
+  it.
+- **Fact-check messages carry the ANSWER, not just the verdict.**
+  `_verify_struct_bodies` already parses the real field list in
+  order to detect a mismatch, so the flag string includes it:
+  `struct sysinit: si_sub, si_order (real fields are: func, next,
+  order, subsystem, udata)`. Before this, "these fields do not
+  exist, read the defining header" was unactionable —
+  `read_freebsd_source` truncates large headers like
+  `sys/sys/kernel.h` before reaching the definition, and on
+  2026-08-22 ch3 the writer looped ~24 steps insisting the stale
+  names were right ("the fact-checking says they don't exist.
+  This is very confusing."). Any new verifier that computes ground
+  truth to detect an error should hand that ground truth over.
+  Note `test_struct_factcheck.py` matches on the text *before*
+  `(real fields are:` — otherwise every real field name trivially
+  "appears in the issues".
 - **`_FACT_CHECK_CACHE` is process-global, keyed by
   `(kind, src_root, symbol)`** — same symbol verified once per
   run regardless of which chapter or revision round asked for it.
@@ -216,6 +264,38 @@ pattern.
   source text. Also: `agent.run(reset=True)` (the default) wipes
   `agent.memory` at the start of every call, so stats MUST be
   collected inside `_run_agent` before the next stage runs.
+
+---
+
+## Corpus/index invariants — two bugs live here
+
+Both were found on 2026-08-22, both were silent, and both are
+easy to reintroduce with an "obviously harmless" edit.
+
+**1. The `### SOURCE: X ###` delimiter must survive a strip
+cycle.** `extract_freebsd_docs` removes stale FreeBSD entries with
+`re.split(r"### SOURCE: (.+?) ###", ...)`. `re.split` *consumes*
+the delimiter and returns only the capture group, so reassembling
+from the pieces without re-emitting `### SOURCE: … ###` silently
+destroys the header of every retained segment. It did: all 9 books
+collapsed into one unlabeled blob (0 book headers in an 18 MB
+corpus). Consequences are indirect and therefore easy to miss —
+`build_book_corpus`'s `drop_sources` can no longer prune a book,
+and `search_books` can no longer attribute a hit. A clean
+`--reindex` after the fix took the index from 2031 to 6521 chunks
+(12 656 → 28 597 terms): the writer had been searching roughly a
+third of the intended corpus.
+
+**2. Never write the corpus unconditionally.** `get_or_build_index`
+treats "corpus mtime > index mtime" as stale, and `_atomic_write`
+renames into place, which always freshens mtime. An unconditional
+write therefore rebuilds the ~100 MB TF-IDF matrix on *every run*,
+and with two concurrent runners (one per endpoint) both rebuild
+and race on the same `.npy`. The same strip/re-append also grew
+the corpus 2 bytes per run forever by stacking separators — found
+at 100 consecutive newlines, i.e. ~50 accumulated rebuilds. Fix
+was to normalize separators and compare content before writing;
+if you add a third corpus writer, it needs the same guard.
 
 ---
 
