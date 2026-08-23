@@ -26,9 +26,11 @@ SSH into the endpoints to launch jobs. See `CODE_MAP.md` "Execution
 topology."
 
 **The model is a reasoning model** and both agents keep reasoning
-enabled. Do not "optimize" it away: it is ~3x faster per call and 61x
-more tokens per chapter, because the writer stops converging. The
-post-mortem with the measurements is in `FUTURE_IMPROVEMENTS.md`.
+enabled. Do not "optimize" it away: it is ~3x faster per call and far
+more expensive per chapter, because the writer substitutes tool calls
+for deliberation and stops converging (with thinking off it hit
+`max_steps` twice and called one symbol 24 times; with it on, zero and
+never above 2x). The post-mortem is in `FUTURE_IMPROVEMENTS.md`.
 
 **Do not commit or push.** The user manages git themselves.
 Suggest commit messages as text only.

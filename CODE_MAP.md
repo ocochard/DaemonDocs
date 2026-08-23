@@ -129,6 +129,7 @@ pattern.
 | Add a new fact-check verifier | Banner **Fact-checking** | Pair: `_extract_FOO(text) -> List` and `_verify_FOO(items, src_root, extra_search_dirs=None) -> List[missing]`. Use `_verify_with_cache` if the verifier is a grep over `sys/` (free re-runs via `_FACT_CHECK_CACHE`). Wire into `fact_check_draft` and `_build_fact_check_prompt`. Existing examples: structs, functions, kernel options, DTrace probes, MALLOC_DEFINE tags, sysctl OIDs (graph-backed — see next row). |
 | Add a **graph-backed** verifier (something grep can't check) | Banner **Fact-checking**, model on the sysctl OID pair | `_extract_sysctls` + `_verify_sysctls_via_graph` query the `codebase-memory-mcp` graph via its `cli <tool>` subcommand instead of grep — sysctl OIDs (`vm.pmap.pde.mappings`) are assembled from `SYSCTL_*` macros and exist nowhere as a literal, so grep provably can't verify them; the indexer reconstructs the OID tree into `Sysctl` nodes. The backend is OPTIONAL: gate every graph call on `_sysctl_graph_available()` (cached probe that prints ONE warning when off) and return `[]` when unavailable so the pipeline never blocks. Cache per-item in a dedicated dict (`_SYSCTL_GRAPH_CACHE`), NOT the grep `_FACT_CHECK_CACHE` (different backend + key space). "Not found" is reported as *suspect* not *hallucinated* because ~1/3 of OID nodes are `resolved:false`. Config + probe live in the **Configuration** banner (`SYSCTL_GRAPH`, `_sysctl_graph_available`). |
 | Verify symbols outside `sys/` (e.g. `stand/`) | `chapters.yaml` `extra_search_dirs:` | Per-chapter list of additional grep roots, joined to `~/freebsd-src`. `_resolve_search_roots` always includes `<src>/sys` and appends each existing extra. The cache key embeds a sorted-tuple suffix so widening roots for one chapter does NOT poison the sys-only cache for others. Use this when a chapter's subject (boot loader, userland tool) lives outside `sys/`. |
+| Diagnose a chapter that stops with no output | Nothing — it is automatic | `install_hang_detector()` runs from `main()`. When the main thread stops calling `beat()` for `DAEMONDOCS_HANG_DUMP_SEC` (default 1800s, `0` disables), a daemon thread prints the main thread's stack to the chapter log and keeps going. It never kills anything. Wrap a new long phase in `with heartbeat("label"):` so the dump names it, and call `beat()` inside long loops. Works even when stuck in a C-level regex, which a Python-level timeout cannot interrupt. **Before dumping it asks the endpoint whether the model is actually decoding** — see the note below. Startup prints which mode is active; if it says "WITHOUT endpoint liveness", restart llama-server with `--metrics`. |
 | Verify a claimed **path** (file or directory) | `_extract_file_paths` + `_verify_file_paths` | Extraction has three branches: backticked-with-extension, bare-with-extension, and (added 2026-08-22) directories + extensionless files from `_EXTENSIONLESS_FILES`. A single-segment claim only counts as a directory if the writer wrote the trailing slash (`` `librescue/` ``); bare words are skipped or every backticked command becomes a "path". Verification carries four exemptions that keep it quiet, and **all four are load-bearing** — see the "Things that look weird" note. Do NOT gate extraction on `_FREEBSD_TOP_DIRS`: that tuple still lists `gnu/`, a subtree FreeBSD retired, so filtering through it whitelists exactly the hallucination you want to catch. |
 | Catch struct bodies hallucinated wholesale | `_verify_struct_bodies` returns `(bogus, abridged)` | The bogus-field check (per-field grep) misses bodies where every claimed field is fabricated together. The overlap-threshold layer flags any non-abridged body whose claimed-field set has zero overlap with the real top-level fields (≥4 real fields). `_struct_body_is_abridged` recognizes `...`, `\u2026`, and comments containing `elided`/`omitted`/`for brevity`/etc — writers can opt out by elision. Wired into `fact_check_draft` as `struct_bodies_abridged`. |
 | Catch arity-mismatched function signatures ("verified hallucination") | `_extract_function_signatures` + `_real_function_signature` + `_verify_function_signatures`, wired as `func_sigs_mismatch` | Names of real FreeBSD functions can be combined with stale 2022-era arg lists from the model's training data — every existing check passes (name, paths, fields) while the chapter teaches the wrong API. The new pass parses fenced ```c definitions only (call-site arity is too noisy), counts top-level commas with `_count_c_args` (skipping `void`, K&R-style, and nested parens for function-pointer args), and compares against the real definition arity grepped from the source tree. Cache: `_FUNC_SIG_CACHE` keyed `(cache_root, func_name)`. Returns `None` whenever lookup or parse is uncertain so we never false-flag. Skips names already in `funcs_not_found` to avoid double-reporting. |
@@ -188,6 +189,21 @@ pattern.
   ("a `bi_module` structure"). Bare-prose "data structure" / "tree
   structure" is rejected because it lacks the backticks; the
   writer's backticks are the load-bearing signal.
+- **The hang detector asks the LLM endpoint before crying wolf, and it
+  reads `n_decode_total` — not `tokens_predicted_total`.** A wall-clock
+  threshold cannot separate "model thinking hard" from "process wedged":
+  llama-server decodes at ~7 tok/s here, so a long reasoning block is
+  many minutes of legitimate silence. `_endpoint_is_decoding()` samples
+  llama-server's `/metrics` twice, 8s apart, and suppresses the dump only
+  if the counter advanced. `tokens_predicted_total` looks like the
+  obvious choice and is wrong — it only rolls up when a request
+  *completes*, so it stays frozen for the entire generation you are
+  trying to observe (measured: frozen at 191310 while `n_decode_total`
+  climbed 135 per 20s). The probe is deliberately conservative: no
+  `/metrics`, unreachable host, or a flat counter all read as "not
+  decoding" so the detector still fires. That direction matters because
+  the bug it exists for — a local CPU spin with the endpoint idle —
+  presents as exactly a flat decode counter.
 - **`_verify_file_paths` exempts four path shapes, and each one
   was earned.** Absolute paths (`/boot/kernel`, `/usr/bin`) name
   installed-system locations and are legitimately absent from a
@@ -223,7 +239,7 @@ pattern.
   names were right ("the fact-checking says they don't exist.
   This is very confusing."). Any new verifier that computes ground
   truth to detect an error should hand that ground truth over.
-  Note `test_struct_factcheck.py` matches on the text *before*
+  Note `tests/test_struct_factcheck.py` matches on the text *before*
   `(real fields are:` — otherwise every real field name trivially
   "appears in the issues".
 - **`_FACT_CHECK_CACHE` is process-global, keyed by

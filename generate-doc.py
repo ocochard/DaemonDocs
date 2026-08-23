@@ -32,6 +32,7 @@ Requirements:
 """
 
 import argparse
+import faulthandler
 import glob
 import hashlib
 import json
@@ -43,6 +44,9 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
+import time
+import traceback
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
@@ -104,6 +108,221 @@ MODEL_CONFIG = {
     "timeout": float(os.environ.get("DAEMONDOCS_LLM_TIMEOUT", "600")),
 }
 
+# ---------------------------------------------------------------------------
+# Hang detector
+# ---------------------------------------------------------------------------
+#
+# On 2026-08-22 a chapter that had ALREADY been written wedged in
+# fact-checking: `_extract_fenced_function_defs` hit catastrophic regex
+# backtracking and spun one CPU at 99% for 6.8 hours. Nothing caught it.
+# The runner's log-mtime watchdog eventually killed the process, but a
+# kill tells you only THAT something hung — diagnosing WHERE cost hours
+# of bisecting extractors by hand.
+#
+# This installs a watchdog thread that dumps every thread's Python stack
+# when the main thread stops checking in. Two properties matter:
+#
+#   * It uses `faulthandler.dump_traceback()`, which works even when the
+#     main thread is stuck inside a C-level loop (a regex, a big sort).
+#     A pure-Python timer cannot interrupt those; this can still print
+#     from another thread.
+#   * It is advisory. It never kills anything — it makes the failure
+#     legible in the chapter log so the next hang takes minutes to
+#     diagnose instead of hours. Killing stays the runner's job, where a
+#     human set the policy.
+#
+# Usage: wrap any long phase in `heartbeat("label")` and call
+# `beat()` inside its loops. Phases that never call `beat()` are still
+# covered by the outer per-stage heartbeat in run_chapter.
+# Quiet time before a stack dump. Must sit ABOVE legitimate LLM latency:
+# a reasoning model can think for many minutes before emitting its first
+# token, and a single measured legitimate step has reached 1164s. The
+# first version used 300s and fired on a perfectly healthy draft — a
+# detector that cries wolf is worse than none, because the next dump gets
+# ignored. 1800s is ~1.5x the slowest step ever observed here; the
+# pathological case it exists for ran for 6.8 HOURS, so there is no need
+# to sit close to the legitimate ceiling.
+_HANG_DUMP_AFTER_SEC = float(os.environ.get("DAEMONDOCS_HANG_DUMP_SEC", "1800"))
+_hb_lock = threading.Lock()
+_hb_last = time.monotonic()
+_hb_label = "startup"
+_hb_dumped_for: Optional[str] = None
+
+
+def beat(label: Optional[str] = None) -> None:
+    """Record progress. Cheap enough to call inside tight loops."""
+    global _hb_last, _hb_label, _hb_dumped_for
+    with _hb_lock:
+        _hb_last = time.monotonic()
+        if label is not None and label != _hb_label:
+            _hb_label = label
+            _hb_dumped_for = None  # new phase — allow one dump for it
+
+
+class heartbeat:
+    """Context manager marking a named phase for the hang detector."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self._prev: Optional[str] = None
+
+    def __enter__(self):
+        global _hb_label
+        with _hb_lock:
+            self._prev = _hb_label
+        beat(self.label)
+        return self
+
+    def __exit__(self, *exc):
+        beat(self._prev or "idle")
+        return False
+
+
+_DECODE_PROBE_GAP_SEC = 8.0
+
+
+def _endpoint_decode_count() -> Optional[int]:
+    """Read llama-server's cumulative decode counter, or None.
+
+    None means "cannot tell" — no /metrics endpoint (llama-server needs
+    `--metrics`), a non-llama.cpp backend, or an unreachable host. Callers
+    must treat None as "assume NOT decoding" so the detector still fires.
+    """
+    base = MODEL_CONFIG["api_base"].rstrip("/")
+    # /v1 is the OpenAI-compatible prefix; /metrics sits at the server root.
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    try:
+        with urllib.request.urlopen(f"{base}/metrics", timeout=5) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    for line in body.splitlines():
+        if line.startswith("llamacpp:n_decode_total "):
+            try:
+                return int(float(line.split()[1]))
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def _endpoint_is_decoding() -> bool:
+    """True only if the model demonstrably produced tokens just now.
+
+    Samples `n_decode_total` twice. Conservative by construction: any
+    uncertainty (metrics unavailable, counter flat) returns False so the
+    hang detector still dumps. A local CPU spin with an idle endpoint —
+    the 6.8-hour regex hang — reads as flat and is correctly reported.
+    """
+    first = _endpoint_decode_count()
+    if first is None:
+        return False
+    time.sleep(_DECODE_PROBE_GAP_SEC)
+    second = _endpoint_decode_count()
+    if second is None:
+        return False
+    return second > first
+
+
+def _hang_watchdog() -> None:
+    """Dump stacks when the main thread goes quiet for too long."""
+    global _hb_dumped_for
+    while True:
+        time.sleep(15)
+        with _hb_lock:
+            quiet = time.monotonic() - _hb_last
+            label = _hb_label
+            already = _hb_dumped_for == label
+        if quiet < _HANG_DUMP_AFTER_SEC or already:
+            continue
+
+        # Before crying wolf, ask the endpoint whether the MODEL is busy.
+        # A wall-clock threshold alone cannot tell "wedged" from "thinking
+        # hard": llama-server decodes at ~7 tok/s here, so a long reasoning
+        # block is many minutes of silence from a perfectly healthy run.
+        # That miscalibration produced a false dump on 2026-08-23.
+        #
+        # `n_decode_total` is the right signal — it advances per token in
+        # real time. (`tokens_predicted_total` looks tempting and is NOT:
+        # it only rolls up when a request COMPLETES, so it sits frozen for
+        # the entire generation you are trying to observe.)
+        #
+        # This only suppresses the dump when the endpoint is provably
+        # working. Unreachable metrics, no --metrics flag, or a stalled
+        # counter all fall through to the dump: the detector must fail
+        # loud, since the bug it exists for (a local CPU spin with the
+        # endpoint idle) shows up as exactly "no decode progress".
+        if _endpoint_is_decoding():
+            with _hb_lock:
+                _hb_last = time.monotonic()  # credit the model's progress
+            print(f"  [hang-detector] {quiet:.0f}s quiet in '{label}', but "
+                  f"the endpoint is still decoding — not a hang, waiting.",
+                  flush=True)
+            continue
+
+        with _hb_lock:
+            _hb_dumped_for = label
+        print(
+            f"\n{'=' * 70}\n"
+            f"  HANG DETECTOR: no progress for {quiet:.0f}s in phase "
+            f"'{label}'\n"
+            f"  Dumping thread stacks. The deepest frame in MainThread is\n"
+            f"  where it is stuck. This is advisory — nothing is killed.\n"
+            f"{'=' * 70}",
+            flush=True,
+        )
+        # Print the main thread's stack explicitly first — that is the one
+        # that is stuck, and faulthandler leads with the *calling* (i.e.
+        # watchdog) thread, which is pure noise. Fall back to faulthandler
+        # if frame introspection is unavailable for any reason.
+        try:
+            main_id = threading.main_thread().ident
+            frame = sys._current_frames().get(main_id)
+            if frame is not None:
+                print("  MainThread (deepest frame last):", flush=True)
+                for line in traceback.format_stack(frame):
+                    print("    " + line.rstrip(), flush=True)
+        except Exception:
+            pass
+        try:
+            faulthandler.dump_traceback()
+        except Exception as exc:  # never let the watchdog kill the run
+            print(f"  (stack dump unavailable: {exc})")
+        # Chapter logs are redirected to a file, so stdout is block-
+        # buffered. Without this flush the dump can sit in the buffer
+        # until the process is killed — i.e. exactly never, which is
+        # the failure mode this whole thing exists to prevent.
+        sys.stdout.flush()
+
+
+def install_hang_detector() -> None:
+    """Start the watchdog thread. Safe to call once from main()."""
+    if _HANG_DUMP_AFTER_SEC <= 0:
+        print("  [hang-detector] disabled (DAEMONDOCS_HANG_DUMP_SEC=0)")
+        return
+
+    # Report which mode we are in at startup. Without /metrics the
+    # detector still works, but it degrades to a pure wall-clock timeout
+    # that cannot tell "model thinking hard" from "process wedged" — and
+    # a silent degradation is how you end up trusting a check that isn't
+    # really checking. llama-server needs to be started with `--metrics`.
+    count = _endpoint_decode_count()
+    if count is None:
+        print(f"  [hang-detector] on, {_HANG_DUMP_AFTER_SEC:.0f}s threshold "
+              f"— WITHOUT endpoint liveness")
+        print(f"                  {MODEL_CONFIG['api_base']} exposes no "
+              f"/metrics; restart llama-server with --metrics to let the")
+        print(f"                  detector tell a slow model apart from a "
+              f"real hang (expect occasional false dumps until then).")
+    else:
+        print(f"  [hang-detector] on, {_HANG_DUMP_AFTER_SEC:.0f}s threshold, "
+              f"endpoint liveness via /metrics (n_decode_total={count})")
+
+    t = threading.Thread(target=_hang_watchdog, name="hang-watchdog",
+                         daemon=True)
+    t.start()
+
+
 # Whether the WRITER gets the model's reasoning channel. Default ON.
 #
 # Disabling it looks like an obvious win per-call — 3x faster, and the
@@ -111,21 +330,26 @@ MODEL_CONFIG = {
 # `content`. It is not. Measured 2026-08-22, ch3 run twice concurrently,
 # same model and prompt, writer thinking the ONLY variable:
 #
-#            stages                                    max_steps  input tokens
-#   OFF   draft->rev1->rev2, 3 reviews                      2       1,138,316
-#   ON    draft, 1 review (PASS first pass)                 0          82,580
+#            stages                                 max_steps  repeat calls
+#   OFF   draft->rev1->rev2, 3 reviews                   2      24x one symbol
+#   ON    draft, 1 review (PASS first pass)              0      none above 2x
 #
-# 13.8x more input tokens with thinking off. Without the reasoning channel
-# the writer substitutes tool calls for deliberation: it burns the whole
-# 80-step draft budget re-reading the same files (24x resolve_c_definition
-# on one symbol, 22x read of one file in the earlier ch3 failure), produces
-# a draft the reviewer rejects, and then needs two revision rounds. The
-# per-call saving is swamped by the extra calls.
+# Without the reasoning channel the writer substitutes tool calls for
+# deliberation: it burns the whole 80-step draft budget re-reading the
+# same files, produces a draft the reviewer rejects, then needs two
+# revision rounds. The per-call saving is swamped by the extra calls.
+#
+# Token-total ratios are deliberately NOT quoted here. An earlier version
+# of this comment claimed 13.8x; that comparison was contaminated by the
+# _extract_fenced_function_defs backtracking hang, which held processes
+# open for hours after the writer had finished, so the totals were
+# measuring different things. The max_steps and repeat-call columns are
+# what the conclusion rests on — they need no totals.
 #
 # This is why the first 2026-08-22 queue run died: ch3/ch4/ch5/ch6 all hit
-# max_steps=80 at 3-4M input tokens each. Do not disable this again without
-# re-running the same two-arm experiment — per-call latency is the wrong
-# unit to optimize, total tokens to a finished chapter is the right one.
+# max_steps=80. Do not disable this again without re-running the two-arm
+# experiment on a quiet machine — per-call latency is the wrong unit to
+# optimize, total tokens to a finished chapter is the right one.
 WRITER_THINKING = os.environ.get("DAEMONDOCS_WRITER_THINKING", "1") != "0"
 
 # Whether the REVIEWER gets the model's reasoning channel. The reviewer is
@@ -3340,7 +3564,15 @@ def _run_agent(agent, label: str, prompt: str,
     are merged in under `label`. Memory is reset on the next `agent.run()`,
     so collection happens here while it's still fresh.
     """
-    result = agent.run(prompt)
+    # Name the phase for the hang detector. Without this every agent stage
+    # runs under the stale label from whatever ran last ("startup" on the
+    # initial draft), so a dump misattributes the stall. agent.run() is a
+    # single blocking call — smolagents drives its own step loop inside —
+    # so there is no inner point to beat() from; the label is what makes
+    # the dump readable, and the long quiet timeout is what keeps normal
+    # multi-minute LLM latency from tripping it.
+    with heartbeat(f"agent:{label}"):
+        result = agent.run(prompt)
     cap = getattr(agent, "max_steps", None)
     used = _agent_step_count(agent)
     if isinstance(cap, int) and isinstance(used, int) and used >= cap:
@@ -3380,7 +3612,7 @@ def create_writer_agent(index: TfidfIndex):
         # Reasoning channel, default ON — see WRITER_THINKING in the
         # Configuration banner for the two-arm measurement that settled
         # this. Short version: disabling it is ~3x faster PER CALL and
-        # 13.8x more expensive PER CHAPTER, because the writer substitutes
+        # far more expensive PER CHAPTER, because the writer substitutes
         # tool calls for deliberation and stops converging. Per-call
         # latency is the wrong unit; total tokens to a finished chapter is
         # the right one.
@@ -3879,10 +4111,14 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
         # ---- Fact-checking pass ----
         print("  [fact-check] verifying paths, structs, funcs, options, "
               "dtrace probes ...")
-        facts = fact_check_draft(
-            draft, SRC_ROOT,
-            extra_search_dirs=chapter.get("extra_search_dirs"),
-        )
+        # Named phase so a hang-detector dump says "fact-check" rather
+        # than just showing a stack. This is the phase that wedged for
+        # 6.8 hours on 2026-08-22 with no output at all.
+        with heartbeat(f"fact-check: {title}"):
+            facts = fact_check_draft(
+                draft, SRC_ROOT,
+                extra_search_dirs=chapter.get("extra_search_dirs"),
+            )
         fact_check_clean = facts['total_issues'] == 0
         fact_fix_failed = False
 
@@ -5136,9 +5372,33 @@ def _extract_function_names(text: str) -> List[str]:
 # (DOTALL) but cannot contain `;` or `{`. A trailing `\s*\{` requires
 # the body-opening brace, which is what distinguishes a definition from
 # a prototype.
+# Wall-clock ceiling for the fenced-block scan in
+# _extract_fenced_function_defs. Generous: the whole scan is ~0.001s on a
+# 20KB draft once the regex is linear, so tripping this means something
+# is wrong, not merely large.
+_FENCED_SCAN_BUDGET_SEC = 20.0
+
+# The type-token group is ATOMIC and BOUNDED, and both matter.
+#
+# The original `(?:[A-Za-z_]\w*\s*\**\s+)+` backtracked catastrophically:
+# it is ambiguous with the `\*?\s*` that follows (both can absorb the
+# pointer stars and the whitespace), so when the trailing `\{` fails to
+# match the engine re-splits the same run of type tokens exponentially
+# many ways. On a real 20KB ch3 draft this never returned — the process
+# spun at 99% CPU for 6.8 hours with the LLM endpoint completely idle,
+# holding a chapter hostage after the writer had already finished it
+# (2026-08-22). Every other extractor on the same draft ran in <0.1s.
+#
+# `(?>...)` commits to the longest match of each type token and never
+# re-divides it, which removes the exponential blowup. `{1,8}` bounds
+# the worst case regardless: no real C declaration needs more than a
+# handful of type/qualifier tokens ("static const struct foo *" is 4).
+#
+# Keep both. The atomic group is the actual fix; the bound is the
+# seatbelt for whatever ambiguity a future edit reintroduces.
 _FENCED_FUNC_DEF_RE = re.compile(
     r"^"
-    r"(?:[A-Za-z_]\w*\s*\**\s+)+"
+    r"(?>(?:[A-Za-z_]\w*\s*\**\s+){1,8})"
     r"\*?\s*([A-Za-z_]\w*)\s*"
     r"\([^;{]*?\)\s*"
     r"(?:__\w+(?:\s*\([^)]*\))?\s*)*"
@@ -5162,7 +5422,22 @@ def _extract_fenced_function_defs(text: str) -> List[str]:
     tree) for precisely this reason.
     """
     found: set = set()
+    # Wall-clock budget across all fenced blocks. _FENCED_FUNC_DEF_RE was
+    # fixed (see its atomic group) after backtracking exponentially on a
+    # real draft and spinning one CPU for 6.8 hours with no log output —
+    # the chapter was already written, and the pipeline simply never came
+    # back. re.finditer cannot be interrupted from Python, so this budget
+    # cannot stop a single pathological match; what it does is stop the
+    # *loop* from compounding across blocks and make the failure visible
+    # in the log instead of silent. Anything slow enough to trip this is
+    # a bug worth seeing.
+    deadline = time.monotonic() + _FENCED_SCAN_BUDGET_SEC
     for block in _FENCED_BLOCK_RE.finditer(text):
+        if time.monotonic() > deadline:
+            print(f"  [fact-check] warning: fenced-function scan exceeded "
+                  f"{_FENCED_SCAN_BUDGET_SEC}s — remaining ```c blocks "
+                  f"skipped (report this; the regex should be linear)")
+            break
         body = block.group(1)
         # Strip C comments so a name in `/* foo() */` doesn't promote
         # to a definition claim.
@@ -7882,6 +8157,11 @@ def main():
         help="Rebuild CHAPTER_INDEX.md (TOC, glossary, cross-refs) only.",
     )
     args = parser.parse_args()
+
+    # Advisory stack-dumper for silent hangs. Costs one sleeping thread;
+    # turns "the chapter stopped and nobody knows why" into a stack trace
+    # in the log. Disable with DAEMONDOCS_HANG_DUMP_SEC=0.
+    install_hang_detector()
 
     # Validate environment
     if not os.path.isdir(SRC_ROOT):

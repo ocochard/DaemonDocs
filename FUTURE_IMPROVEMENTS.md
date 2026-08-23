@@ -17,7 +17,7 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
-### [DONE — shipped 2026-08-22] Disabling the writer's reasoning channel made it stop converging (61x token cost)
+### [DONE — shipped 2026-08-22] Disabling the writer's reasoning channel made it stop converging
 
 Qwen3.8-27B is a reasoning model: it emits into `reasoning_content`, a
 field smolagents never reads (it uses `content` only). Every thinking
@@ -38,19 +38,33 @@ same hardware, writer thinking the only variable:
 | | thinking OFF | thinking ON |
 |---|---|---|
 | stages | draft → rev1 → rev2, 3 reviews | draft, 1 review (PASS first pass) |
-| writer `max_steps` hits | 2 | 0 |
+| writer `max_steps` hits | **2** | **0** |
+| repeated identical tool calls | **24x** one symbol, 22x one file | none above 2x |
 | tool calls | 234 | — |
-| **input tokens** | **1,192,420** | **19,461** |
 
-**61x.** Without the reasoning channel the writer substitutes tool calls
-for deliberation: 24 `resolve_c_definition` calls on one symbol, 22
-re-reads of one file, the whole 80-step draft budget spent, then a draft
-the reviewer rejects and two revision rounds to repair.
+**Read the qualitative columns, not a token ratio.** An earlier version of
+this entry claimed "61x" from a 19,461-vs-1,192,420 token comparison.
+That number does not survive scrutiny and has been removed: the 19,461
+figure came from a run whose completion was inferred from a stage list
+rather than confirmed, both arms shared two endpoints concurrently, and —
+decisively — every later ch3 run was contaminated by the
+`_extract_fenced_function_defs` backtracking hang (documented below),
+which held processes open for hours after the writer had finished. Token
+totals across those runs were measuring different things.
 
-**The lesson is the unit of measurement.** Per-call latency is the wrong
-one; total tokens to a *finished chapter* is the right one. Any future
-"make the model cheaper per call" change needs the same two-arm test
-before it goes near a queue.
+What survives is unambiguous and does not depend on totals: with thinking
+off the writer hit `max_steps` twice and called `resolve_c_definition` 24
+times on a single symbol; with thinking on it hit `max_steps` zero times
+and never repeated a call more than twice. It substitutes tool calls for
+deliberation, exhausts the 80-step draft budget, and produces a draft the
+reviewer rejects.
+
+**The lesson is the unit of measurement** — and the meta-lesson is not to
+publish a ratio until the pipeline it was measured through is known
+sound. Per-call latency is the wrong unit; tokens to a *finished chapter*
+is the right one. Any future "make the model cheaper per call" change
+needs a two-arm test, on a quiet machine, with both arms confirmed to
+have actually completed.
 
 Writer and reviewer reasoning are now separately env-gated
 (`DAEMONDOCS_WRITER_THINKING`, `DAEMONDOCS_REVIEWER_THINKING`, both
@@ -70,6 +84,97 @@ while the script exited 0, so the queue runner read it as success and
 kept popping. Two guards were added — `generate-doc.py` now exits
 non-zero when it produced no chapter, and `runner.sh` aborts after 2
 consecutive failures rather than draining the queue.
+
+### [DONE — shipped 2026-08-23] Catastrophic regex backtracking wedged a finished chapter for 6.8 hours
+
+`_FENCED_FUNC_DEF_RE` in `_extract_fenced_function_defs` used
+`(?:[A-Za-z_]\w*\s*\**\s+)+` for the return-type token run. That group is
+ambiguous with the `\*?\s*` that follows it — both can absorb the pointer
+stars and the whitespace — so whenever the trailing `\{` failed to match,
+the engine re-split the same token run exponentially many ways.
+
+The observed failure, on ch3:
+
+    python:   state R, 99% CPU, 414 min CPU time, 1.1 GB RSS
+    endpoint: requests_processing 0        <- the LLM was idle
+    log:      silent for 6.8 hours
+
+The writer had **already finished the chapter** — a complete draft with
+real symbols and a full See Also section, at step 31. The pipeline then
+entered fact-checking and never came back. Every other extractor handled
+the same 20KB draft in under 0.1s.
+
+Two things made this expensive out of proportion to the bug:
+
+- **It looked like slowness, not a hang.** The process was at 99% CPU, so
+  every check said "working". It took bisecting extractors by hand to find
+  the real culprit, and in the meantime the token counts it corrupted led
+  to a wrong published conclusion (see the reasoning-channel entry above).
+- **The runner's watchdog only kills.** A log-mtime watchdog eventually
+  SIGTERMs the process, which tells you *that* something hung and nothing
+  about *where*.
+
+Fixes:
+
+1. **Atomic group + bound**: `(?>(?:[A-Za-z_]\w*\s*\**\s+){1,8})`. The
+   atomic group commits to each token and never re-divides it, removing
+   the exponential blowup; the `{1,8}` bound caps the worst case whatever
+   a future edit does to the surrounding pattern. 6.8 hours → 0.000s on
+   the exact input that hung, with all seven definition shapes still
+   matched and both negative cases still rejected.
+2. **A general hang detector** (`install_hang_detector`, `heartbeat`,
+   `beat` in the Configuration banner). A daemon thread dumps every
+   thread's Python stack when the main thread stops checking in
+   (`DAEMONDOCS_HANG_DUMP_SEC`, default 1800s, 0 disables). It uses
+   `sys._current_frames()` plus `faulthandler`, so it still prints when
+   the main thread is stuck inside a C-level regex loop — a pure-Python
+   timer cannot interrupt those. It is **advisory**: it never kills
+   anything, it just makes the failure legible in the chapter log.
+   Killing stays the runner's job, where a human set the policy.
+   Output is explicitly flushed, because chapter logs are redirected to
+   files and a block-buffered dump would never reach disk before the
+   process was killed — the exact failure it exists to prevent.
+3. **A scan budget** in `_extract_fenced_function_defs` so the per-block
+   loop cannot compound across a document, with a warning in the log.
+   Note this cannot interrupt a single pathological match; the atomic
+   group is the actual fix, this is the seatbelt.
+
+**The detector's own false positive, worth recording.** Shipped at a
+300s threshold, it fired within minutes on a perfectly healthy draft.
+The dump showed the main thread blocked in `openai/_streaming.py` — the
+writer simply waiting on the model. Two mistakes: 300s was below
+legitimate LLM latency (a single real step had already been measured at
+1164s earlier the same day, and I failed to apply my own number), and
+the phase label read `'startup'` because agent stages never called
+`beat()`. A detector that cries wolf is worse than none, because the
+next dump gets ignored.
+
+That led to the better design: **ask the endpoint instead of guessing.**
+`_endpoint_is_decoding()` samples llama-server's `/metrics` twice and
+suppresses the dump only when the model demonstrably produced tokens in
+between, so wall-clock time stopped being the sole signal. Use
+`n_decode_total`, NOT `tokens_predicted_total` — the latter only rolls
+up when a request completes, so it sits frozen for the whole generation
+(measured: frozen at 191310 while `n_decode_total` climbed 135 per 20s).
+The probe fails safe: no `/metrics`, unreachable host, or flat counter
+all read as "not decoding" so the detector still fires — the original
+bug was a local CPU spin with the endpoint *idle*, which is exactly a
+flat counter. `install_hang_detector()` prints at startup which mode is
+active, because a silent degradation to pure-timeout is how you end up
+trusting a check that is not really checking. llama-server needs
+`--metrics` for the good mode.
+
+Regression tests in `tests/test_regex_hang.py`, including the real 20KB
+draft as a committed fixture (`tests/testdata/ch3-fenced-hang.md`) — a
+repro that lives in `/tmp` is not a regression test — plus a guard that
+the threshold stays above observed legitimate latency and that the probe
+reads the right counter.
+
+**Generalizable lesson:** every user-content-driven regex in the
+fact-checker is a potential wedge. The ones with nested quantifiers under
+a `+` or `*` are the candidates worth auditing; `re` has no backtracking
+limit and no timeout, so a bad pattern is an unbounded hang, not a slow
+match.
 
 ### [DONE — shipped 2026-08-22] Path fact-check never looked at directories; ch1 shipped 9 bad paths as "clean"
 
@@ -118,7 +223,7 @@ rather than synthetic strings:
 
 Final state across all 28 existing chapters: **397 paths extracted, 13
 flagged, all 13 verified genuine, zero false positives.** Regression
-tests in `test_path_factcheck.py` pin both the catches and the
+tests in `tests/test_path_factcheck.py` pin both the catches and the
 exemptions, including the deliberate `gnu` miss.
 
 **Still open — the class none of this reaches:** every verifier in the
@@ -180,7 +285,7 @@ so a genuine OID among them would be reported "not found". That is the SAFE
 failure direction for a hallucination gate (over-flag, never under-flag),
 and the fact-fix prompt reflects it: it tells the writer the OID is
 *suspect — confirm against the registering `SYSCTL_*` macro or `sysctl(8)`*,
-not that it is definitely invented. Tests in `test_sysctl_factcheck.py`
+not that it is definitely invented. Tests in `tests/test_sysctl_factcheck.py`
 (extractor tests always run; graph-verify tests auto-skip when the backend
 is absent).
 
@@ -328,7 +433,7 @@ post-mortem fixture): the hallucinated body
 const char *name; }` now FAILs fact-check with
 `struct sysinit: void, data, si_sub, si_order, name` while a
 verbatim-correct claim passes clean. Test harness:
-`test_struct_factcheck.py`.
+`tests/test_struct_factcheck.py`.
 
 Fixes (2)–(4) — verbatim-quote enforcement, catalog-injected
 field lists, and function-call shape verification — remain on
@@ -410,7 +515,7 @@ catch a semantic clash.
 **Reproduction:** open the original file in any Mermaid renderer
 (GitHub web view, mermaid live editor); the diagram displays
 "Setting Userland as parent of Userland would create a cycle"
-and refuses to render. Test harness: `test_mermaid_sanitizer.py`
+and refuses to render. Test harness: `tests/test_mermaid_sanitizer.py`
 (16 sub-checks, includes an end-to-end test against the actual
 `sys/netgraph/README.md`).
 
@@ -473,7 +578,7 @@ candidates and have to drop the line. Tail-2 narrows that to one
 without a parent hint stays ambiguous and gets dropped — correct
 behaviour; we won't guess.
 
-Test harness: `test_link_sanitizer.py` (18 sub-checks: the
+Test harness: `tests/test_link_sanitizer.py` (18 sub-checks: the
 real-corpus bug, idempotence, ambiguous targets, anchor
 preservation, inline-prose-vs-list-item handling, dedup, and
 end-to-end against the actual on-disk corpus).
@@ -1344,7 +1449,7 @@ What's still open:
   test run failed accuracy on the real `struct preloaded_file` (K&R
   brace in `stand/common/bootstrap.h:230`). Forward declarations and
   pointer uses are still rejected. Regression test added to
-  `test_hallucination_factcheck.py` (Test 11b).
+  `tests/test_hallucination_factcheck.py` (Test 11b).
 - **Comparison-section claims.** ~~`_strip_comparison_section`
   deliberately exempts that section. ch2's NetBSD/Linux/macOS
   comparison rows still ship without verification.~~ **Resolved

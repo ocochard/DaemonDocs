@@ -19,8 +19,9 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)  # tests/ lives one level below the repo root
 spec = importlib.util.spec_from_file_location(
-    "gendoc", os.path.join(HERE, "generate-doc.py")
+    "gendoc", os.path.join(REPO, "generate-doc.py")
 )
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
