@@ -147,6 +147,50 @@ check("probe reads n_decode_total, not tokens_predicted_total",
       "n_decode_total" in src and "tokens_predicted_total" not in src)
 
 print()
+
+# --- 5) writer generation cap --------------------------------------------
+print("5) writer max_tokens cap")
+
+# Nothing capped per-call generation before 2026-08-23 — not the script,
+# not smolagents, not llama-server — so one step could generate to the
+# 131k context limit. ch3 spent 87% of its wall clock in three steps of
+# ~21-40k tokens each. Endpoint metrics ruled out prefill (0 prefill
+# tokens during a slow step, 96% cache hits): it is pure generation.
+
+
+class _FakeIndex:
+    pass
+
+
+saved_cap = mod.WRITER_MAX_TOKENS
+try:
+    mod.WRITER_MAX_TOKENS = 8192
+    w = mod.create_writer_agent(_FakeIndex())
+    check("cap is applied to the writer",
+          w.model.kwargs.get("max_tokens") == 8192,
+          f"max_tokens={w.model.kwargs.get('max_tokens')}")
+
+    # 0 must OMIT the parameter. Passing max_tokens=0 would tell the
+    # server to generate nothing at all — a silent, total breakage.
+    mod.WRITER_MAX_TOKENS = 0
+    w0 = mod.create_writer_agent(_FakeIndex())
+    check("0 omits max_tokens entirely (not max_tokens=0)",
+          "max_tokens" not in w0.model.kwargs,
+          f"kwargs={ {k: v for k, v in w0.model.kwargs.items() if 'token' in k} }")
+finally:
+    mod.WRITER_MAX_TOKENS = saved_cap
+
+# The reviewer is bounded by max_steps=5 and is deliberately left alone.
+r = mod.create_reviewer_agent(_FakeIndex())
+check("reviewer is not capped", "max_tokens" not in r.model.kwargs)
+
+# A cap below a full chapter draft (~6-8k tokens of markdown) would
+# truncate legitimate output every time.
+check("default cap clears a full chapter draft",
+      saved_cap == 0 or saved_cap >= 8192,
+      f"{saved_cap} (a 20KB draft is roughly 6-8k tokens)")
+
+print()
 if failures:
     print(f"{len(failures)} FAILURE(S): " + ", ".join(failures))
     sys.exit(1)

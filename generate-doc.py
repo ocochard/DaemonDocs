@@ -323,6 +323,41 @@ def install_hang_detector() -> None:
     t.start()
 
 
+# Per-call generation ceiling for the WRITER, in tokens. 0 = unlimited.
+#
+# Nothing capped this before: not the script, not smolagents (no default),
+# not llama-server (`n_predict` unset). A single step could therefore
+# generate until it exhausted the 131072-token context — 5.4 hours at the
+# ~6.8 tok/s this hardware sustains.
+#
+# It did. ch3 on 2026-08-23, 16 steps of a draft over 4h47m:
+#
+#     step  5   3782s   (~26k tokens)
+#     step 11   5942s   (~40k tokens)
+#     step 14   3162s   (~21k tokens)
+#     ---------------------------------------------
+#     3 steps = 12,886s of 14,863s total = 87% of wall clock
+#
+# The other 13 steps averaged 152s. Endpoint metrics rule out prefill as
+# the cause: during a slow step the server reported 0 prefill tokens and
+# 0 prefill seconds (96% prompt-cache hit rate) while decoding steadily at
+# 6.8 tok/s. It is pure generation — almost certainly runaway reasoning,
+# the same shape as the ch11 reviewer runaway (121K tokens of thinking
+# with no parsed code) that forced reviewer max_steps 15->5. `max_steps`
+# does not help here: the problem is ONE step, not many.
+#
+# 8192 is sized from measurement, not intuition. Normal steps run 30-180s
+# = roughly 200-1200 tokens; a complete chapter draft is ~20KB of markdown
+# = roughly 6-8k tokens. So this clears every legitimate generation while
+# cutting a 40k-token runaway at about a fifth of its length.
+#
+# Tradeoff, stated honestly: a truncated step can yield a malformed action
+# and cost a retry. That is still far cheaper than 99 minutes, and
+# `_looks_like_stub` plus best-draft tracking already absorb bad output.
+# Set DAEMONDOCS_WRITER_MAX_TOKENS=0 to restore the old unbounded
+# behaviour if a chapter turns out to need it.
+WRITER_MAX_TOKENS = int(os.environ.get("DAEMONDOCS_WRITER_MAX_TOKENS", "8192"))
+
 # Whether the WRITER gets the model's reasoning channel. Default ON.
 #
 # Disabling it looks like an obvious win per-call — 3x faster, and the
@@ -3600,6 +3635,13 @@ def create_writer_agent(index: TfidfIndex):
     # chapter) on the secondary endpoint that did not reproduce on the
     # primary, traceable to differing /props defaults. These values match
     # the model's recommended sampling for instruction-following.
+    # Per-call generation ceiling — see WRITER_MAX_TOKENS in Configuration
+    # for the measurement. Passed as a dict so 0 means "send no max_tokens
+    # at all" (genuinely unlimited) rather than "max_tokens=0", which the
+    # server would read as generate-nothing.
+    cap = ({"max_tokens": WRITER_MAX_TOKENS}
+           if WRITER_MAX_TOKENS > 0 else {})
+
     model = OpenAIServerModel(
         model_id=MODEL_CONFIG["model_id"],
         api_base=MODEL_CONFIG["api_base"],
@@ -3609,6 +3651,7 @@ def create_writer_agent(index: TfidfIndex):
         client_kwargs={"timeout": MODEL_CONFIG["timeout"]},
         temperature=0.6,
         top_p=0.95,
+        **cap,
         # Reasoning channel, default ON — see WRITER_THINKING in the
         # Configuration banner for the two-arm measurement that settled
         # this. Short version: disabling it is ~3x faster PER CALL and
@@ -3904,6 +3947,8 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
     # so a finished run can be split by reviewer-thinking arm after the fact.
     print(f"  Endpoint: {MODEL_CONFIG['api_base']}")
     print(f"  Writer thinking:   {'on' if WRITER_THINKING else 'off'}")
+    print(f"  Writer max_tokens: "
+          f"{WRITER_MAX_TOKENS if WRITER_MAX_TOKENS > 0 else 'unlimited'}")
     print(f"  Reviewer thinking: {'on' if REVIEWER_THINKING else 'off'}")
     print(f"{'=' * 70}")
 

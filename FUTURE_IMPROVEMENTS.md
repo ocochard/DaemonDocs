@@ -85,6 +85,62 @@ kept popping. Two guards were added — `generate-doc.py` now exits
 non-zero when it produced no chapter, and `runner.sh` aborts after 2
 consecutive failures rather than draining the queue.
 
+### [DONE — shipped 2026-08-23] Nothing capped per-step generation; three steps ate 87% of a chapter's wall clock
+
+ch3 spent 4h47m on 16 steps of a draft. The distribution, not the total,
+is the story:
+
+    step  5   3782s   (~26k tokens)
+    step 11   5942s   (~40k tokens)
+    step 14   3162s   (~21k tokens)
+    -------------------------------------------
+    3 steps = 12,886s of 14,863s = 87% of wall clock
+
+The other 13 steps averaged 152s. Two candidate causes — prompt-cache
+misses (a config fix) versus runaway generation (a different fix) — and
+llama-server's `/metrics` separated them in minutes:
+
+    during a slow step:  prefill 0 tokens, 0 seconds
+                         decode  306 tokens in 45s = 6.8 tok/s
+    cumulative:          prefill 113 tok/s (15% of time)
+                         decode  6.7 tok/s (85% of time)
+                         prompt cache 96% hit rate
+
+Pure generation. Prefill was already fully cached, so `--cache-reuse` and
+friends would have bought nothing.
+
+**Nothing capped it at any layer**: `generate-doc.py` never set
+`max_tokens`, smolagents has no default, and llama-server's `n_predict`
+was unset. One step could therefore generate until it exhausted the
+131072-token context — 5.4 hours at this hardware's 6.8 tok/s.
+
+This is the writer-side twin of the ch11 reviewer runaway (121K tokens of
+thinking, no parsed code). That one was bounded indirectly by dropping
+reviewer `max_steps` 15→5. `max_steps` cannot help here: the problem is
+one step, not many.
+
+Fix: `WRITER_MAX_TOKENS` (env `DAEMONDOCS_WRITER_MAX_TOKENS`, default
+8192, `0` restores unbounded). Sized from measurement — normal steps are
+200-1200 tokens and a complete chapter draft is ~6-8k — so it clears
+every legitimate generation while cutting a 40k-token runaway at about a
+fifth of its length. Verified end-to-end against a live endpoint
+(`completion_tokens: 64`, `finish_reason: length` with a test cap of 64),
+because a kwarg that merely appears in `model.kwargs` is not proof it
+reaches the wire — see the `extra_body` trap in the reasoning entry.
+
+**Tradeoff, stated plainly:** a truncated step can produce a malformed
+action and cost a retry. That is still far cheaper than 99 minutes, and
+`_looks_like_stub` plus best-draft tracking already absorb bad output.
+Note also this is one chapter's data — ch1 and ch2 averaged 96-126s/step
+with no outliers at all, so the cap is insurance against a pathological
+case rather than a fix for a universal one.
+
+**Question this answers:** "should we split chapters into sub-sections to
+spend less time per chapter?" No. Splitting reduces steps per chapter and
+does nothing about a single step generating 40k tokens; it would add a
+draft/review/fact-check cycle per split while leaving the cost driver
+untouched. Measure the distribution before restructuring.
+
 ### [DONE — shipped 2026-08-23] Catastrophic regex backtracking wedged a finished chapter for 6.8 hours
 
 `_FENCED_FUNC_DEF_RE` in `_extract_fenced_function_defs` used
