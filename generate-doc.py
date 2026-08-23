@@ -346,17 +346,27 @@ def install_hang_detector() -> None:
 # with no parsed code) that forced reviewer max_steps 15->5. `max_steps`
 # does not help here: the problem is ONE step, not many.
 #
-# 8192 is sized from measurement, not intuition. Normal steps run 30-180s
-# = roughly 200-1200 tokens; a complete chapter draft is ~20KB of markdown
-# = roughly 6-8k tokens. So this clears every legitimate generation while
-# cutting a 40k-token runaway at about a fifth of its length.
+# 16384 is sized from measurement, not intuition. Normal steps run 30-180s
+# = roughly 200-1200 tokens. Measured real chapters: README_internals.md
+# 22076 B (~6.1k tokens), the ch2 loader chapter 24006 B (~6.7k), the ch3
+# draft 20906 B (~5.8k). So the largest legitimate output observed is
+# ~6.7k and this cap sits at ~2.4x that.
+#
+# It does NOT need to sit close to the legitimate ceiling to work: the
+# runaways were 21k-40k tokens, 3-6x any real chapter, so a generous cap
+# still cuts them at a third to a half while leaving ample headroom for a
+# chapter larger than any produced so far. An earlier 8192 would also have
+# worked, but left only ~20% margin over the biggest real draft — and the
+# failure mode of a too-tight cap is bad: every draft truncates, best-draft
+# tracking keeps shipping the least-bad partial, and nothing looks broken.
+# Prefer headroom; the cap is insurance, not a tuning knob.
 #
 # Tradeoff, stated honestly: a truncated step can yield a malformed action
 # and cost a retry. That is still far cheaper than 99 minutes, and
 # `_looks_like_stub` plus best-draft tracking already absorb bad output.
 # Set DAEMONDOCS_WRITER_MAX_TOKENS=0 to restore the old unbounded
 # behaviour if a chapter turns out to need it.
-WRITER_MAX_TOKENS = int(os.environ.get("DAEMONDOCS_WRITER_MAX_TOKENS", "8192"))
+WRITER_MAX_TOKENS = int(os.environ.get("DAEMONDOCS_WRITER_MAX_TOKENS", "16384"))
 
 # Whether the WRITER gets the model's reasoning channel. Default ON.
 #
@@ -3581,6 +3591,51 @@ def _looks_like_stub(text: str) -> bool:
     return False
 
 
+def _finish_reason(step) -> Optional[str]:
+    """Pull the API finish_reason out of one smolagents memory step."""
+    msg = getattr(step, "model_output_message", None)
+    raw = getattr(msg, "raw", None) if msg is not None else None
+    choices = getattr(raw, "choices", None)
+    if not choices:
+        # Some backends hand back a plain dict rather than an SDK object.
+        if isinstance(raw, dict):
+            try:
+                return raw["choices"][0].get("finish_reason")
+            except (KeyError, IndexError, AttributeError, TypeError):
+                return None
+        return None
+    try:
+        return getattr(choices[0], "finish_reason", None)
+    except (IndexError, TypeError):
+        return None
+
+
+def _warn_on_token_truncation(agent, label: str) -> None:
+    """Warn when a step was cut off by WRITER_MAX_TOKENS.
+
+    Truncation is otherwise SILENT: the server returns
+    `finish_reason: "length"`, smolagents drops it, and the pipeline just
+    sees a short response. If the cap is set too low for a chapter, every
+    draft truncates, best-draft tracking dutifully ships the least-bad
+    partial, and nothing in the log looks wrong — a quiet quality
+    regression, which is the worst kind. Say so instead.
+
+    Best-effort by design: `finish_reason` plumbing varies by backend, so
+    anything unreadable is skipped rather than guessed at.
+    """
+    if WRITER_MAX_TOKENS <= 0:
+        return
+    steps = getattr(getattr(agent, "memory", None), "steps", None) or []
+    hits = sum(1 for s in steps if _finish_reason(s) == "length")
+    if not hits:
+        return
+    print(f"  ⚠ {label}: {hits} step(s) hit the {WRITER_MAX_TOKENS}-token "
+          f"generation cap (finish_reason=length) — output was cut mid-"
+          f"stream.")
+    print(f"     If this repeats, the chapter needs more room: raise "
+          f"DAEMONDOCS_WRITER_MAX_TOKENS (0 disables the cap).")
+
+
 def _run_agent(agent, label: str, prompt: str,
                stats: Optional[dict] = None) -> str:
     """Run an agent and warn if it hit its step cap.
@@ -3612,6 +3667,7 @@ def _run_agent(agent, label: str, prompt: str,
     used = _agent_step_count(agent)
     if isinstance(cap, int) and isinstance(used, int) and used >= cap:
         print(f"  ⚠ {label}: hit max_steps={cap} — output may be truncated")
+    _warn_on_token_truncation(agent, label)
     if stats is not None:
         _merge_tool_stats(stats, _collect_tool_stats(agent), label)
     if result is None:

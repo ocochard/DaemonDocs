@@ -120,13 +120,27 @@ reviewer `max_steps` 15→5. `max_steps` cannot help here: the problem is
 one step, not many.
 
 Fix: `WRITER_MAX_TOKENS` (env `DAEMONDOCS_WRITER_MAX_TOKENS`, default
-8192, `0` restores unbounded). Sized from measurement — normal steps are
-200-1200 tokens and a complete chapter draft is ~6-8k — so it clears
-every legitimate generation while cutting a 40k-token runaway at about a
-fifth of its length. Verified end-to-end against a live endpoint
-(`completion_tokens: 64`, `finish_reason: length` with a test cap of 64),
-because a kwarg that merely appears in `model.kwargs` is not proof it
-reaches the wire — see the `extra_body` trap in the reasoning entry.
+16384, `0` restores unbounded). Sized from measured chapters, not
+estimates: `README_internals.md` 22076 B (~6.1k tokens), the ch2 loader
+chapter 24006 B (~6.7k), the ch3 draft 20906 B (~5.8k). The cap sits at
+~2.4x the largest real output. It does not need to sit close to that
+ceiling to work — the runaways were 21k-40k tokens, 3-6x any real
+chapter — and the failure mode of a too-tight cap is nasty: every draft
+truncates, best-draft tracking ships the least-bad partial, and nothing
+looks broken. Prefer headroom.
+
+Verified end-to-end against a live endpoint (`completion_tokens: 64`,
+`finish_reason: length` with a test cap of 64), because a kwarg that
+merely appears in `model.kwargs` is not proof it reaches the wire — see
+the `extra_body` trap in the reasoning entry.
+
+**Truncation is reported, not silent.** `_warn_on_token_truncation`
+inspects `finish_reason` on every step after each agent run and prints a
+warning naming the cap and the env var to raise. Without it, hitting the
+cap is invisible — the server says `length`, smolagents drops it, and
+the pipeline just sees a short response. Verified both directions
+against the live endpoint: `length` at a 32-token cap produces the
+warning, `stop` at 2048 stays silent.
 
 **Tradeoff, stated plainly:** a truncated step can produce a malformed
 action and cost a retry. That is still far cheaper than 99 minutes, and

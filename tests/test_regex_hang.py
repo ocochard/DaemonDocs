@@ -164,10 +164,10 @@ class _FakeIndex:
 
 saved_cap = mod.WRITER_MAX_TOKENS
 try:
-    mod.WRITER_MAX_TOKENS = 8192
+    mod.WRITER_MAX_TOKENS = 16384
     w = mod.create_writer_agent(_FakeIndex())
     check("cap is applied to the writer",
-          w.model.kwargs.get("max_tokens") == 8192,
+          w.model.kwargs.get("max_tokens") == 16384,
           f"max_tokens={w.model.kwargs.get('max_tokens')}")
 
     # 0 must OMIT the parameter. Passing max_tokens=0 would tell the
@@ -184,11 +184,73 @@ finally:
 r = mod.create_reviewer_agent(_FakeIndex())
 check("reviewer is not capped", "max_tokens" not in r.model.kwargs)
 
-# A cap below a full chapter draft (~6-8k tokens of markdown) would
-# truncate legitimate output every time.
-check("default cap clears a full chapter draft",
-      saved_cap == 0 or saved_cap >= 8192,
-      f"{saved_cap} (a 20KB draft is roughly 6-8k tokens)")
+# A cap below a full chapter draft truncates legitimate output on EVERY
+# run — and does it quietly, because best-draft tracking then ships the
+# least-bad partial and nothing looks broken. Largest real chapter
+# measured: 24006 B ~= 6.7k tokens. Require 2x that as headroom, since a
+# future chapter may legitimately exceed anything produced so far.
+check("default cap clears a full chapter draft with margin",
+      saved_cap == 0 or saved_cap >= 13400,
+      f"{saved_cap} (largest real chapter ~6.7k tokens; want >=2x)")
+
+print()
+
+# --- 6) truncation is reported, not silent -------------------------------
+print("6) token-cap truncation warning")
+
+# Without this, hitting the cap is invisible: the server returns
+# finish_reason="length", smolagents drops it, and best-draft tracking
+# ships the least-bad partial while the log looks clean.
+
+
+def _fake_step(reason):
+    raw = {"choices": [{"finish_reason": reason}]}
+    msg = type("Msg", (), {"raw": raw})()
+    return type("Step", (), {"model_output_message": msg})()
+
+
+def _fake_agent(*reasons):
+    steps = [_fake_step(r) for r in reasons]
+    return type("A", (), {"memory": type("M", (), {"steps": steps})()})()
+
+
+check("finish_reason parsed from a dict-shaped response",
+      mod._finish_reason(_fake_step("length")) == "length")
+check("normal completion parses as stop",
+      mod._finish_reason(_fake_step("stop")) == "stop")
+check("unreadable response yields None, not a crash",
+      mod._finish_reason(type("S", (), {"model_output_message": None})()) is None)
+
+import io
+import contextlib
+
+saved = mod.WRITER_MAX_TOKENS
+try:
+    mod.WRITER_MAX_TOKENS = 16384
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod._warn_on_token_truncation(_fake_agent("stop", "stop"), "draft")
+    check("silent when nothing truncated", buf.getvalue() == "",
+          repr(buf.getvalue()[:60]))
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod._warn_on_token_truncation(_fake_agent("stop", "length"), "draft")
+    out = buf.getvalue()
+    check("warns when a step hit the cap",
+          "16384-token generation cap" in out and "1 step(s)" in out,
+          repr(out[:80]))
+    check("warning names the escape hatch",
+          "DAEMONDOCS_WRITER_MAX_TOKENS" in out)
+
+    # With the cap disabled there is nothing to warn about.
+    mod.WRITER_MAX_TOKENS = 0
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod._warn_on_token_truncation(_fake_agent("length"), "draft")
+    check("silent when the cap is disabled", buf.getvalue() == "")
+finally:
+    mod.WRITER_MAX_TOKENS = saved
 
 print()
 if failures:
