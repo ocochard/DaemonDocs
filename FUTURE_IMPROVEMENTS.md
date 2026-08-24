@@ -296,16 +296,37 @@ flagged, all 13 verified genuine, zero false positives.** Regression
 tests in `tests/test_path_factcheck.py` pin both the catches and the
 exemptions, including the deliberate `gnu` miss.
 
-**Still open — the class none of this reaches:** every verifier in the
-pipeline is *symbol-shaped* (does this name exist?). The phantom
-`boot1 (GPT)` boot stage survived the 2026-08-22 ch2 regen and spread
-into the Mermaid diagram, because every token in "UEFI Firmware → boot1
-(GPT boot code) → loader.efi → kernel" names something real — only the
-*ordering* is fabricated. Catching that needs a sequence verifier
-checking claimed orderings against the real call graph
-(codebase-memory-mcp already has CALLS edges and `trace_path`), with
-"no path from A to B" reported as *suspect* rather than *hallucinated*,
-the same conservative framing the sysctl checker uses.
+**Still open in principle — ordering claims:** every verifier in the
+pipeline is *symbol-shaped* (does this name exist?). None can check a
+claim about *sequence*, where each named thing is real and only the
+order between them is wrong. A sequence verifier would extract ordered
+claims (`A → B`, "first X then Y", Mermaid participant chains) and test
+them against the call graph via `trace_path`, reporting "no path from A
+to B" as *suspect* rather than *hallucinated* — the conservative framing
+the sysctl checker uses.
+
+**It is NOT yet built, deliberately, because the motivating example
+turned out to be wrong.** The `boot1 (GPT)` stage in ch2 was scored as a
+phantom for several runs. Checked against the tree on 2026-08-24:
+
+    stand/efi/boot1/            exists, and is BUILT
+                                (stand/efi/Makefile: SUBDIR.yes+= boot1)
+    proto.c:129 load_loader()   calls mod->load(PATH_LOADER_EFI, ...)
+    common/paths.h:34           PATH_LOADER_EFI = "/boot/loader.efi"
+
+So `boot1 → loader.efi` is a real, traversable code path and the marker
+in `check_ch2.sh` was a false positive (now downgraded to informational).
+The residual criticism is far narrower and not mechanically checkable: a
+typical UEFI install has the firmware load `loader.efi` directly from the
+ESP, with boot1 used when booting from a UFS/ZFS partition without an ESP
+entry — so presenting boot1 as *the* path rather than *one* path is
+oversimplification, not hallucination.
+
+Build this when a genuine ordering hallucination appears in a run, not
+before. A verifier written against a hypothetical is how you get a check
+nobody trusts — see the 300s hang-detector threshold in the entry below,
+which fired on healthy work because it was calibrated by intuition rather
+than measurement.
 
 ### [DONE — shipped 2026-08-20] Sysctl OID paths were unverifiable by grep; added optional graph-backed fact-check
 

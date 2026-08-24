@@ -588,6 +588,112 @@ queue emptied):
 
 ---
 
+## run4 — 2026-08-23 → (in progress)
+
+**Pipeline state at time of run:**
+
+- New model: `Qwen3.8-27B` (see below). First run on a **reasoning
+  model** — output arrives in `reasoning_content`, which smolagents
+  discards.
+- 38 chapters in `chapters.yaml` (up from 28 — 10 subsystem
+  chapters added 2026-05).
+- Corpus corruption fixed 2026-08-22: `extract_freebsd_docs` was
+  destroying every book's `### SOURCE:` header on each run. A clean
+  reindex took the TF-IDF index from 2031 → **6521 chunks**
+  (12656 → 28597 terms), so `search_books` had been querying about a
+  third of the intended corpus in runs 1–3. Treat run1–3 retrieval
+  quality as degraded relative to this run.
+- Index no longer rebuilds every run (corpus is byte-stable), which
+  also removes a `.npy` write race between the two runners.
+- Directory-aware path fact-check (2026-08-22).
+- **Writer `max_tokens` = 16384** (2026-08-23). Previously uncapped
+  at every layer.
+- Hang detector with endpoint-liveness probe (2026-08-23).
+- Watchdog 1200s → 2400s, and made metrics-aware (2026-08-23).
+
+**Model used (both endpoints, identical):**
+
+- **GGUF**: `Qwen3.8-27B-UD-Q8_K_XL.gguf` (27.3B params). Note
+  llama.cpp reports `ftype: Q4_K - Medium` despite the Q8 in the
+  filename.
+- **llama.cpp build**: `b10553-cd26896c1`
+- **Context**: 131072 (`n_ctx_train` 262144)
+- **Metrics**: both endpoints now started with `--metrics`, which
+  the watchdog and hang detector depend on.
+
+### Throughput — where the time actually goes
+
+This is the headline measurement of run4 and it settles a recurring
+design question: **the pipeline is decode-bound, not retrieval-bound.**
+
+| endpoint | prefill | decode | decode share |
+|---|---|---|---|
+| .7 | 1,297,940 tok / 10,986s = **118 tok/s** | 741,760 tok / 110,933s = **6.7 tok/s** | **91%** |
+| .8 | 1,015,580 tok / 10,903s = **93 tok/s** | 620,792 tok / 92,164s = **6.7 tok/s** | **89%** |
+
+Prompt cache is working: 2.83e7 cached prompt tokens on .7, 1.61e7 on
+.8. During a slow step the endpoint reports **0 prefill tokens and 0
+prefill seconds** while decoding steadily — there is no prefill left to
+optimise away.
+
+Tool calls are not the bottleneck either. Per-chapter counts:
+
+    ch3: 29 resolve_c_definition, 18 read_freebsd_source,
+         17 search_books, 8 directory_map        = 72 calls / 53 steps
+    ch4: 54 read_freebsd_source, 13 resolve_c_definition,
+         12 explore_tree, 7 directory_map, 5 search_books
+                                                 = 91 calls / 70 steps
+
+~1.3 tool calls per step, and step time is essentially all of wall
+clock (ch3: 53 steps totalling 15,259s against a 15,301s wall clock).
+
+**Implication for tooling decisions:** context/retrieval layers that
+reduce tool calls or prompt tokens (Graft, embedding indexes, bigger
+caches) target the ~10% that is prefill, already 96% cache-hit. The
+lever that matters is **decode speed** — quantization, speculative
+decoding (`spec_decode_num_draft_tokens_total` is currently 0, i.e.
+off), or batching. Evaluated `nanonets/graft` on 2026-08-24 and
+declined it for this reason, plus its C support being generic
+tree-sitter tier rather than the full-fidelity tier it gives
+TS/Python/Go/Java.
+
+### Per-chapter results (partial — run ongoing)
+
+| ch | endpoint | reviewer thinking | duration | result | output |
+|---|---|---|---|---|---|
+| 1 | .7 | on | 6841s (1h54m) | rc=0 | 22076 B |
+| 2 | .8 | off | 8281s (2h18m) | rc=0 | 24006 B |
+| 3 | .7 | on | 15301s (4h15m) | rc=0 | 18333 B |
+| 4 | .8 | off | 38592s (10h43m) | rc=0 | 26354 B |
+
+Mean of the four: ~4.9h/chapter. With two endpoints in parallel the
+remaining 32 chapters project to roughly **5 days** of continuous
+running.
+
+Step-duration distribution matters more than the mean. ch4's slowest
+four steps were 2416s, 2414s, 2413s, 2394s — clustered within 25
+seconds of each other, which looks like a ceiling rather than natural
+variation (unexplained as of this writing). ch3 pre-cap had steps of
+3782s, 5942s and 3162s; three steps were 87% of its wall clock.
+
+### Failure modes observed
+
+- **Writer non-convergence on wide chapters.** ch5 reached step 74/80
+  of its *draft* at 2,778,239 input tokens. Reasoning was on and the
+  token cap was active, so neither addresses it. `max_steps=80` is the
+  only bound.
+- **Catastrophic regex backtracking** wedged a finished chapter for
+  6.8 hours (99% CPU, endpoint idle). Fixed; see FUTURE_IMPROVEMENTS.
+- **Watchdog killed a healthy chapter** at step 11 because it judged
+  liveness from log mtime alone. Fixed by consulting
+  `llamacpp:n_decode_total`; the fix demonstrably saved ch4, which went
+  quiet past 2400s and finished `rc=0` 31 minutes later.
+- **Reviewer-thinking A/B is still unmeasured.** Two earlier attempts
+  died on bugs common to both arms. Chapters are labelled above so the
+  comparison can be made once enough have landed.
+
+---
+
 ## How to add a new run
 
 When generating a corpus with a different model (or a meaningfully
