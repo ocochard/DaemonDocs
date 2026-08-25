@@ -1814,3 +1814,126 @@ chapters:
       - "How do pfil_hooks let pf, ipfw, and ipsec interpose on the IP path without each having to patch ip_input/ip_output?"
     mermaid: flowchart
 
+
+  - title: "Sound — pcm Channels, Feeder Chains, and Mixers"
+    family: "devices-interrupts"
+    related:
+      - "Character Devices and the TTY Layer — cdev, devfs, and terminals"
+      - "Device Driver Framework — newbus and devclass"
+      - "USB and Thunderbolt — Host Controllers, Enumeration, and Device Classes"
+    output_file: "sys/dev/sound/README.md"
+    source_dirs:
+      - "sys/dev/sound/pcm"
+      - "sys/dev/sound/pci/hda"
+      - "sys/dev/sound/usb"
+    # sound.c is the driver-registration/attach side (pcm_register and the
+    # snddev_info lifecycle); channel.c is the core channel abstraction
+    # every playback/record stream flows through; feeder.c is the format-
+    # conversion chain that makes an arbitrary client format fit the
+    # hardware's; dsp.c is the /dev/dsp* cdev face (open/read/write/ioctl);
+    # mixer.c is the mixer control layer; vchan.c is virtual-channel mixing
+    # (how several clients share one physical device). hdaa.c is the HDA
+    # audio-function driver — the widget/association parsing that makes
+    # laptop codecs work — and uaudio.c is the USB Audio Class driver, the
+    # two most consequential real backends. sound.h/channel.h are the KPIs.
+    source_files:
+      - "sys/dev/sound/pcm/sound.c"
+      - "sys/dev/sound/pcm/channel.c"
+      - "sys/dev/sound/pcm/feeder.c"
+      - "sys/dev/sound/pcm/dsp.c"
+      - "sys/dev/sound/pcm/mixer.c"
+      - "sys/dev/sound/pcm/vchan.c"
+      - "sys/dev/sound/pcm/sound.h"
+      - "sys/dev/sound/pcm/channel.h"
+      - "sys/dev/sound/pci/hda/hdaa.c"
+      - "sys/dev/sound/usb/uaudio.c"
+    # virtual_oss(8) lives in usr.sbin, outside sys/, so its symbols would
+    # be flagged as hallucinated without this. Same mechanism the Boot
+    # Process chapter uses for stand/efi/loader.
+    extra_search_dirs:
+      - "usr.sbin/virtual_oss"
+      - "lib/virtual_oss"
+    focus: >
+      The channel/feeder/mixer architecture: how one hardware device
+      serves many clients at different sample rates and formats, and where
+      each conversion actually happens.
+    # The cdev face (/dev/dsp) is the Character Devices chapter's
+    # abstraction — reference it rather than re-deriving cdevsw. newbus
+    # attach belongs to the Device Driver chapter.
+    scope_guard: >
+      This chapter owns the sound subsystem: pcm channel lifecycle,
+      feeder chains and format conversion, vchan mixing, the mixer
+      control layer, and how a hardware backend (HDA, USB audio) plugs
+      in. Do NOT re-derive the cdevsw/make_dev machinery behind
+      /dev/dsp* (Character Devices chapter) or newbus attachment (Device
+      Driver Framework chapter) — reference both. Cover virtual_oss(8)
+      only as the userland consumer of /dev/dsp: say what it does and why
+      it exists, without walking its internals.
+    key_questions:
+      - "What is a pcm channel, and what does the channel lock actually protect against — which paths run from an interrupt handler and which from a syscall?"
+      - "How does a feeder chain get built for a given client format vs. hardware format, and where does the conversion cost land?"
+      - "How does vchan let several applications play at once when the hardware has one stream, and what is lost versus exclusive access?"
+      - "What does hdaa.c have to infer from HDA widget/association data, and why does that inference make laptop audio fragile?"
+      - "Where does the userland virtual_oss(8) daemon sit relative to /dev/dsp, and what does it enable that the kernel path cannot?"
+    mermaid: flowchart
+
+  - title: "USB and Thunderbolt — Host Controllers, Enumeration, and Device Classes"
+    family: "devices-interrupts"
+    related:
+      - "Device Driver Framework — newbus and devclass"
+      - "DMA and busdma — Tags, Maps, and Bounce Buffers"
+      - "Sound — pcm Channels, Feeder Chains, and Mixers"
+    output_file: "sys/dev/usb/README.md"
+    source_dirs:
+      - "sys/dev/usb"
+      - "sys/dev/usb/controller"
+      - "sys/dev/thunderbolt"
+    # usb_device.c is enumeration and the device/config/interface model;
+    # usb_hub.c is hub and port handling (where attach/detach storms
+    # happen); usb_transfer.c is the transfer engine every driver submits
+    # through; usb_request.c is control-request plumbing; usb_process.c is
+    # the per-bus taskqueue that makes USB callbacks sleepable.
+    # usb_controller.c + xhci.c are the host-controller layer. uvideo.c and
+    # umass.c are two device-class drivers with very different transfer
+    # shapes (isochronous video vs bulk storage). Thunderbolt: nhi.c is the
+    # host-interface driver, router.c the fabric routing, tb_pcib.c the
+    # PCIe tunnelling bridge.
+    source_files:
+      - "sys/dev/usb/usb_device.c"
+      - "sys/dev/usb/usb_hub.c"
+      - "sys/dev/usb/usb_transfer.c"
+      - "sys/dev/usb/usb_request.c"
+      - "sys/dev/usb/usb_process.c"
+      - "sys/dev/usb/usbdi.h"
+      - "sys/dev/usb/controller/usb_controller.c"
+      - "sys/dev/usb/controller/xhci.c"
+      - "sys/dev/usb/video/uvideo.c"
+      - "sys/dev/usb/storage/umass.c"
+      - "sys/dev/thunderbolt/nhi.c"
+      - "sys/dev/thunderbolt/router.c"
+      - "sys/dev/thunderbolt/tb_pcib.c"
+    focus: >
+      The path from a physical port to an attached driver: enumeration,
+      the transfer model, and how a device class plugs in. Thunderbolt is
+      covered as the adjacent PCIe-tunnelling fabric that USB4 converges
+      with, not as a separate story.
+    # busdma is where USB transfer buffers actually get mapped —
+    # reference it. newbus is how usbus and its children attach.
+    scope_guard: >
+      This chapter owns the USB stack — enumeration, the
+      device/config/interface/endpoint model, the transfer engine and its
+      four transfer types, hub/port handling, the host-controller
+      interface (xHCI), and how a class driver binds — plus the
+      Thunderbolt/USB4 fabric (NHI, router, PCIe tunnelling). Do NOT
+      re-derive busdma tag/map mechanics (DMA and busdma chapter) or
+      newbus attachment (Device Driver Framework chapter); reference
+      both. Do NOT explain CAM: umass is covered only as far as where it
+      hands off (CAM chapter owns the rest). Audio-class devices belong
+      to the Sound chapter beyond the transfer layer.
+    key_questions:
+      - "What exactly happens between a device being plugged in and a class driver attaching, and which of those steps can sleep?"
+      - "Why does USB need its own per-bus process (usb_process.c) rather than running callbacks in the interrupt handler?"
+      - "How do the four transfer types differ in scheduling guarantees, and why does isochronous (uvideo) need different handling from bulk (umass)?"
+      - "What does xHCI change versus earlier host controllers, and how much of that leaks into the driver-facing KPI?"
+      - "How does Thunderbolt's router/NHI model tunnel PCIe, and what security exposure does that create that plain USB does not?"
+    mermaid: sequence
