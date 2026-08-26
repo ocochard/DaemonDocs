@@ -226,7 +226,11 @@ def _endpoint_is_decoding() -> bool:
 
 def _hang_watchdog() -> None:
     """Dump stacks when the main thread goes quiet for too long."""
-    global _hb_dumped_for
+    # _hb_last is assigned below (to credit endpoint progress), which without
+    # this declaration would make it local to the whole function and turn the
+    # read at the top of the loop into an UnboundLocalError on the very first
+    # tick. That is exactly what happened on ch17, 2026-08-26.
+    global _hb_dumped_for, _hb_last
     while True:
         time.sleep(15)
         with _hb_lock:

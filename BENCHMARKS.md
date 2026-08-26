@@ -651,11 +651,110 @@ clock (ch3: 53 steps totalling 15,259s against a 15,301s wall clock).
 reduce tool calls or prompt tokens (Graft, embedding indexes, bigger
 caches) target the ~10% that is prefill, already 96% cache-hit. The
 lever that matters is **decode speed** — quantization, speculative
-decoding (`spec_decode_num_draft_tokens_total` is currently 0, i.e.
-off), or batching. Evaluated `nanonets/graft` on 2026-08-24 and
+decoding, or batching. Evaluated `nanonets/graft` on 2026-08-24 and
 declined it for this reason, plus its C support being generic
 tree-sitter tier rather than the full-fidelity tier it gives
 TS/Python/Go/Java.
+
+Acting on that: speculative decoding was enabled mid-run on `.7` and is
+the one change that moved the number — **2.6×**, see the two subsections
+below. Quantization turned out to be a wash.
+
+### Enabling MTP speculative decoding (2026-08-26)
+
+Two tests, run separately on `.7` so the variables stayed isolated, with
+`.8` left on the original model throughout as a control.
+
+**Test 1 — quantization alone.** `ggml-org/Qwen3.8-27B-GGUF` `Q8_0`
+(28.6 GB uniform) replacing `unsloth` `UD-Q8_K_XL` (31.5 GB, Unsloth
+Dynamic: imatrix-guided per-layer mixed precision, `_XL` = more tensors
+held above the nominal level). Strix Halo is memory-bandwidth bound, so
+2.9 GB less to stream per pass should in principle be faster. It was
+not: ch13 ran at 7.13 tok/s against a 6.7 baseline, i.e. **a wash**.
+Useful anyway — a neutral quant means any change from test 2 is cleanly
+attributable to MTP.
+
+**Test 2 — MTP.** Flags verified against `llama-server --help` on build
+`b10553-cd26896c1` rather than guessed:
+
+    --spec-type draft-mtp
+    --spec-draft-model /path/to/mtp-Qwen3.8-27B-Q8_0.gguf
+    --spec-draft-n-max 3        # default; Strix Halo reportedly prefers 3
+
+Two traps worth knowing:
+
+- **The flag was renamed.** `--spec-type mtp` is wrong; it is
+  `--spec-type draft-mtp` (renamed 2026-05-13). Several people in the
+  HF discussion concluded MTP was broken after hitting this.
+- **MTP weights are a SEPARATE file**, not embedded in the main quant —
+  despite claims to the contrary in that discussion. Verified via the
+  HF API: `unsloth/Qwen3.8-27B-GGUF` carries
+  `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` in a subdirectory, and
+  `ggml-org/Qwen3.8-27B-GGUF` ships three matched-precision drafts
+  (`mtp-…-Q4_0` 1.68 GB, `mtp-…-Q8_0` 3.16 GB, `mtp-…-BF16` 5.95 GB)
+  alongside its `Q4_K_M` / `Q8_0` / `BF16` mains. The one-to-one size
+  pairing is the only pairing guidance available — the ggml-org README
+  is a stub that never mentions MTP.
+
+Pair matched precision. A Q8 target with the Q4_0 draft would be the
+widest available gap, and draft accuracy loss shows up directly as
+rejections. `mtp-Q8_0` against `Q8_0` gave 74.8% acceptance.
+
+Confirm it actually loaded — a silent no-op looks identical to a model
+that ignores the flag:
+
+    # server log
+    common_speculative_init_result: loading draft model '…mtp-…Q8_0.gguf'
+    # after one request
+    curl -s http://HOST:8080/metrics | grep spec_decode   # must be non-zero
+
+### Reading llama.cpp's metrics — the counter that lies under speculation
+
+**Use `tokens_predicted_total` for throughput. NOT `n_decode_total`.**
+Its own HELP text says why:
+
+    llamacpp:tokens_predicted_total       Number of generation tokens processed
+    llamacpp:n_decode_total               Total number of llama_decode() calls,
+                                          EXCLUDING speculative decoding and
+                                          multimodal decoding
+
+With speculative decoding on, one `llama_decode()` call emits several
+tokens, and the excluded speculative work is exactly the work you are
+trying to measure. Dividing `n_decode_total` by
+`tokens_predicted_seconds_total` therefore *undercounts* a speculative
+endpoint while counting a non-speculative one correctly — so the metric
+that looks like a like-for-like comparison inverts the answer.
+
+Measured 2026-08-26, same model on both, MTP the only difference:
+
+| | `tokens_predicted` | `n_decode` (wrong) |
+|---|---|---|
+| .7 MTP | **17.41 tok/s** | 5.40 tok/s |
+| .8 control | 6.69 tok/s | 6.77 tok/s |
+
+Read the wrong column and MTP looks 20% *slower*; read the right one and
+it is **2.6× faster**. Note the built-in tell: on a non-speculative
+endpoint the two metrics agree (6.69 vs 6.77), and on a speculative one
+they diverge by roughly the speedup factor. If they disagree, you are
+looking at speculation — not at a slowdown.
+
+Per-request timings from the API are a good cross-check and were the
+first hint the counter was wrong: the `timings` block in a
+`/v1/chat/completions` response carries `predicted_per_second` (16.50 on
+a smoke test), plus `draft_n` / `draft_n_accepted` for that one request.
+
+Acceptance rate — `spec_decode_num_accepted_tokens_total /
+spec_decode_num_draft_tokens_total` — is the other number worth
+watching. Published rules of thumb: >60% good, <40% means fix the draft
+pairing or turn speculation off, because drafting and verifying cost time
+that low acceptance throws away. Observed here: 58.8% on a 64-token
+smoke test, **74.8% on real 300k-token chapter prompts** — acceptance got
+*better* at scale, the opposite of the concern that large prompts would
+hurt it.
+
+Speculative decoding does not change output: a drafted token is kept only
+if the target model would have produced it. Acceptance affects speed,
+never content.
 
 ### Per-chapter results (partial — run ongoing)
 

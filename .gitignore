@@ -15,3 +15,6 @@ __pycache__/
 # Generated output (rebuildable via --index-only). The generated chapter
 # READMEs live in $FREEBSD_SRC, not here; the index follows the same rule.
 CHAPTER_INDEX.md
+
+# Ad-hoc working files (endpoint patch scripts etc.), not part of the tool
+.scratch/

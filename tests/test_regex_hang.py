@@ -14,9 +14,11 @@ Two things are pinned here:
 
 Run: `python3 test_regex_hang.py`. Exits non-zero on any failure.
 """
+import ast
 import importlib.util
 import os
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +108,59 @@ check("detector is disablable",
       os.environ.get("DAEMONDOCS_HANG_DUMP_SEC") is not None
       or mod._HANG_DUMP_AFTER_SEC > 0,
       "DAEMONDOCS_HANG_DUMP_SEC=0 turns it off")
+
+# Actually RUN the watchdog loop. Everything above only inspects the
+# variables a dump would read, which is how the 2026-08-26 bug shipped:
+# `_hb_last` was assigned inside `_hang_watchdog` without a `global`
+# declaration, so Python made it function-local and the very first tick
+# raised UnboundLocalError. threading swallows that into a stderr
+# traceback and the thread dies — the run continues with NO hang
+# detection at all, silently, which is worse than not having it. Every
+# chapter from 2026-08-23 to 2026-08-26 ran unprotected.
+#
+# One tick is enough: the bug was on the read at the top of the loop.
+_wd_errors = []
+_orig_excepthook = threading.excepthook
+threading.excepthook = lambda args: _wd_errors.append(args)
+_saved_thresh = mod._HANG_DUMP_AFTER_SEC
+try:
+    # Keep the threshold high so the loop takes the "still quiet, keep
+    # waiting" path rather than dumping stacks into the test output.
+    mod._HANG_DUMP_AFTER_SEC = 10_000.0
+    mod.beat("watchdog-smoke")
+    t = threading.Thread(target=mod._hang_watchdog, daemon=True,
+                         name="hang-watchdog-test")
+    t.start()
+    # The loop sleeps 15s per iteration; poll until it has plainly
+    # completed at least one full tick past its first read.
+    deadline = time.monotonic() + 25.0
+    while time.monotonic() < deadline and not _wd_errors:
+        time.sleep(0.25)
+        if not t.is_alive():
+            break
+finally:
+    mod._HANG_DUMP_AFTER_SEC = _saved_thresh
+    threading.excepthook = _orig_excepthook
+
+check("watchdog thread survives its first tick",
+      not _wd_errors and t.is_alive(),
+      "; ".join(f"{a.exc_type.__name__}: {a.exc_value}" for a in _wd_errors)
+      or ("thread exited early" if not t.is_alive() else ""))
+
+# Pin the specific defect: every module-level name the watchdog assigns
+# must be declared global inside it. This catches the same class of bug
+# in any future edit without waiting 15s for a tick.
+_src = open(os.path.join(REPO, "generate-doc.py"), encoding="utf-8").read()
+_fn = next(n for n in ast.walk(ast.parse(_src))
+           if isinstance(n, ast.FunctionDef) and n.name == "_hang_watchdog")
+_assigned = {x.id for b in ast.walk(_fn) if isinstance(b, ast.Assign)
+             for tg in b.targets for x in ast.walk(tg)
+             if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)}
+_declared = {nm for b in ast.walk(_fn) if isinstance(b, ast.Global)
+             for nm in b.names}
+_undeclared = sorted(n for n in _assigned - _declared if n.startswith("_hb"))
+check("watchdog declares every _hb global it assigns",
+      not _undeclared, f"missing global: {_undeclared}")
 
 # The first version used 300s and fired on a healthy draft: a reasoning
 # model can think for many minutes before its first token, and a single
