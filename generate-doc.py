@@ -3053,6 +3053,56 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
                 + "\n\n"
             )
 
+    # Undefined-jargon block. Computed here from the draft rather than
+    # threaded in from `fact_check_draft`, matching how this builder already
+    # derives its path/symbol verification: the scan needs no source tree
+    # and is pure string work, so recomputing is cheaper than changing the
+    # signature and every call site.
+    #
+    # This exists because criterion 8 ("Rationale") passed ch12 while it
+    # used `KVM` five times without defining it. Asking the model to
+    # simulate a junior reader does not work; handing it an explicit list
+    # does. Phrased as a checklist the reviewer must account for, not as
+    # advice it can weigh.
+    unglossed = _extract_unglossed_jargon(draft)
+    unexpanded = _extract_unexpanded_acronyms(draft)
+    jargon_block = ""
+    if unglossed or unexpanded:
+        jargon_block = (
+            "## Undefined Terms Detected (mechanical scan — trust this list)\n\n"
+            "A deterministic scan found the following terms used in this\n"
+            "draft's prose with no definition nearby. The scan masks fenced\n"
+            "code blocks, so every term below is used in *prose* that a\n"
+            "junior reader has to parse. These are NOT hallucinations — the\n"
+            "terms are real and correctly used. The problem is that the\n"
+            "draft never says what they mean.\n\n"
+        )
+        if unglossed:
+            jargon_block += (
+                "Jargon used without a gloss on first use:\n"
+                + "\n".join(f"- `{t}`" for t in unglossed)
+                + "\n\n"
+            )
+        if unexpanded:
+            jargon_block += (
+                "Acronyms used repeatedly but never expanded:\n"
+                + "\n".join(f"- `{a}`" for a in unexpanded)
+                + "\n\n"
+            )
+        jargon_block += (
+            "For the Accessibility criterion (5) you MUST account for every\n"
+            "term listed above: either FAIL the criterion and name the terms\n"
+            "in `issues`, or explain per term why a gloss is genuinely\n"
+            "unnecessary here. Do not pass Accessibility while silently\n"
+            "ignoring this list.\n\n"
+            "A gloss is one clause on first use — `KVM (the kernel's virtual\n"
+            "address space)` — not a paragraph. Where the term names a\n"
+            "*choice* the kernel offers (two modes, two flags, two\n"
+            "allocators), the gloss must also say WHY both exist and when a\n"
+            "caller picks each; that is criterion 8, and a definition alone\n"
+            "does not satisfy it.\n\n"
+        )
+
     # Pre-validate kernel-config options, DTrace SDT probes, and
     # MALLOC_DEFINE tags the same way as structs/functions. Same
     # rationale: the reviewer can't grep, so it either hedges (waste)
@@ -3180,6 +3230,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         {verified_block}
         {symbol_block}
         {macro_block}
+        {jargon_block}
         {scope_guard_block}
         ## How You Operate (Sandbox Rules)
 
@@ -3232,6 +3283,12 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         5. **Accessibility** — Is the tone educational? Does it explain
            WHY things work, not just WHAT they do? Are there analogies or
            connections to OS theory?
+           Also: is every piece of jargon defined on first use? If an
+           "Undefined Terms Detected" section appears above, every term in
+           it must be accounted for here — FAIL and name them, or justify
+           each omission. Judge as a competent C programmer with no kernel
+           experience would: a term you personally recognize still needs a
+           gloss for that reader.
 
         6. **Structure** — Does the draft have ALL {section_count} required
            sections with substantive content? Check for each:
@@ -6310,6 +6367,356 @@ def _verify_sysctls_via_graph(oids: List[str]) -> List[str]:
     return missing
 
 
+# --- Undefined jargon (first-use gloss check) ------------------------------
+#
+# THE PROBLEM THIS SOLVES. Every other verifier in this file asks "is this
+# symbol real?". This one asks "will a junior reader understand this
+# sentence?" — a different failure mode entirely, and one the reviewer
+# rubric demonstrably does not catch on its own.
+#
+# The canonical example (ch12, buffer cache, 2026-08-27):
+#
+#     "The `BIO_UNMAPPED` flag indicates that the data pages are not
+#      mapped into KVM and must be mapped before the I/O can proceed."
+#
+# `KVM` appears five times in that chapter and is never defined. Worse, the
+# chapter then invented a reason for the two modes ("because the pageout
+# daemon has paged them out" — wrong; unmapped I/O exists so a device can
+# DMA straight from physical pages without spending KVM and pmap/TLB work).
+# Undefined jargon and confabulated rationale are the SAME defect: the
+# writer treated "the flag exists" as sufficient and never engaged with why.
+#
+# Reviewer criterion 8 ("Rationale") already asks for the why, and passed
+# this chapter anyway. Three structural reasons, all of which argue for
+# doing the check in Python instead of asking the model harder:
+#   1. Its trigger examples are VM-flavoured (shadow chains, UMA kegs, NUMA
+#      domains) so a *flag* never reads as a "non-obvious mechanism".
+#   2. It is one binary verdict over a ~25 KB draft: find rationale for
+#      three big things and five undefined terms ride along.
+#   3. It asks the model to simulate a junior reader. A model that knows
+#      what KVM is does not experience `KVM` as needing a definition.
+#
+# So: enumerate deterministically here, and hand the reviewer a list it
+# cannot rationalize away — exactly how `structs_not_found` works.
+#
+# DESIGN. Two independent scans:
+#   (a) curated terms — a hand-maintained set of FreeBSD/OS-internals terms
+#       that need a gloss on first use. Curated on purpose: a generic
+#       "hard word" heuristic would drown the writer in noise.
+#   (b) unexpanded acronyms — any `[A-Z]{2,}` token that never appears
+#       expanded anywhere in the chapter. Catches terms not on list (a),
+#       which is the whole point: the curated list will always lag.
+#
+# Both scans only look at PROSE. Fenced code blocks are masked out: a term
+# appearing in a struct definition or a DTrace script is not "use in prose"
+# and demanding a gloss there would be wrong.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO. It cannot tell a correct rationale
+# from a plausible invented one — verifying a *why* claim is not
+# symbol-shaped, so grep has no purchase on it. The `BIO_UNMAPPED`
+# pageout-daemon confabulation above would still ship today. That is the
+# same open gap as unverifiable ordering claims; see FUTURE_IMPROVEMENTS.md
+# ("Rationale correctness is unverifiable"). This checker raises the floor
+# (the term gets defined at all); it does not make the definition true.
+
+# Terms that need a gloss on first prose use. Keep this list curated and
+# ordered roughly by subsystem — it is meant to be read and edited by hand.
+#
+# Inclusion test: would a competent C programmer with no kernel experience
+# have to go look this up? If yes, it belongs here. Terms a working C
+# programmer already knows (pointer, struct, mutex, cache, syscall) must
+# NOT be added: every entry costs writer attention, and a noisy list is
+# how this check gets ignored.
+#
+# Multi-word entries are matched case-insensitively as phrases; short
+# all-caps entries are matched case-sensitively as whole words so `KVM`
+# does not fire on "kvm" inside an identifier.
+_JARGON_TERMS: Tuple[str, ...] = (
+    # Virtual memory / address space
+    "KVM", "KVA", "pmap", "TLB shootdown", "superpage", "copy-on-write",
+    "shadow chain", "page fault", "wired page", "resident set",
+    "vm_object", "anonymous memory", "backing store",
+    # Allocation
+    # `zone` alone is dropped: it collides with UMA zones, jail zones and
+    # DNS zones. `UMA zone` as a phrase is covered by `UMA` + `keg`.
+    "UMA", "slab", "keg", "M_NOWAIT", "M_WAITOK", "malloc type",
+    # Synchronization
+    "turnstile", "witness", "epoch", "read-mostly lock", "lock order",
+    "priority propagation", "memory barrier", "atomic",
+    # I/O and storage
+    "bio", "DMA", "MAXPHYS", "unmapped I/O", "strategy routine",
+    "scatter-gather", "bounce buffer", "write-back", "write-through",
+    # VFS
+    # `vfs` alone is dropped: it matches the subsystem name in ordinary
+    # prose ("the vfs layer") far more often than a term needing a gloss.
+    "vnode", "namei", "mountpoint", "dirent", "inode",
+    # Scheduling / process
+    "kproc", "kthread", "thread0", "curthread", "context switch",
+    "run queue", "preemption", "critical section",
+    # Kernel infrastructure. `sysctl` is deliberately absent: it appears in
+    # nearly every chapter, the reader meets it in chapter 1, and it is
+    # already in `_ACRONYM_GLOSS_EXEMPT` — keeping it here fired ~1 finding
+    # per chapter for a term nobody is confused by.
+    "sbuf", "kld", "sysinit", "devclass", "newbus",
+    "capability mode", "jail", "vnet",
+    # Networking
+    "mbuf", "pcb", "netisr", "if_snd",
+)
+
+# Acronyms that are common-knowledge enough not to need expansion, or that
+# are FreeBSD-universal (a reader of this document set meets them in
+# chapter 1). Without this set the acronym scan is unusably noisy.
+_ACRONYM_GLOSS_EXEMPT: frozenset = frozenset({
+    # General computing
+    "CPU", "RAM", "ROM", "I/O", "IO", "OS", "API", "ABI", "FIFO", "LIFO",
+    "LRU", "MRU", "ASCII", "UTF", "URL", "URI", "XML", "JSON", "YAML",
+    "HTTP", "HTTPS", "TCP", "UDP", "IP", "IPV4", "IPV6", "MAC", "DNS",
+    "SSH", "TLS", "SSL", "USB", "PCI", "PCIE", "SCSI", "SATA", "NVME",
+    "GPU", "MMU", "TLB", "NUMA", "SMP", "ISA", "BIOS", "UEFI", "EFI",
+    "GPT", "MBR", "DVD", "CD", "SSD", "HDD", "KB", "MB", "GB", "TB",
+    "KIB", "MIB", "GIB", "TIB", "BSD", "GNU", "GPL", "AI", "ID", "OK",
+    # FreeBSD-universal
+    "VFS", "VM", "UFS", "ZFS", "NFS", "GEOM", "UMA", "KLD", "SYSCTL",
+    "DTRACE", "SDT", "PID", "UID", "GID", "TTY", "FD", "ELF", "KVM",
+    # Structural noise from markdown/code that survives masking
+    "NOTE", "TODO", "FIXME", "WARNING", "IMPORTANT", "N", "C",
+    "README", "SEE", "ALSO", "WHY", "HOW", "AND", "OR", "NOT", "ALL",
+    # Direction / position abbreviations. Universally understood in a
+    # driver context and expanding them ("transmit", "receive") adds
+    # nothing a reader of a NIC chapter needs.
+    "TX", "RX", "IN", "OUT", "UP", "DOWN", "SRC", "DST",
+    # Protocol STATE names, not acronyms. These are literal identifiers
+    # from the TCP state machine; "expanding" them is meaningless.
+    "SYN", "ACK", "FIN", "RST", "LISTEN", "ESTABLISHED", "CLOSED",
+    "CLOSING", "TIME", "WAIT", "LAST", "SENT", "RCVD",
+    # Common network/hardware acronyms a reader of these chapters already
+    # has. Kept narrow: only ones that appeared as noise in the 31-chapter
+    # sweep, not a blanket networking dictionary.
+    "ICMP", "ARP", "VLAN", "MTU", "MSS", "RTT", "RTO", "NIC", "PHY",
+    "MII", "MSI", "MSIX", "IRQ", "APIC", "IOMMU", "MMIO", "MSR", "DMA",
+    "FIB", "RSS", "TSO", "LRO", "GSO", "CRC", "TTL", "QOS",
+    # SCSI/CAM command and field names appear in caps because that is how
+    # the spec writes them; they are literals, not abbreviations.
+    "READ", "WRITE", "INQUIRY", "CAPACITY", "SENSE", "CDB", "LUN",
+    "REQUEST", "MODE", "START", "STOP", "TEST", "UNIT", "READY",
+    # BSD queue/tree macros.
+    "TAILQ", "STAILQ", "SLIST", "LIST", "RB", "SPLAY",
+    # Architecture names.
+    "ARM64", "AMD64", "I386", "RISCV", "POWERPC", "AARCH64",
+})
+
+# Model / revision tokens: `T4`, `T5`, `VT`, `SVM` and similar are chip or
+# extension names, not acronyms with an expansion. A short token that is
+# mostly digits, or a 2-letter token, carries no expandable meaning.
+_ACRONYM_MODEL_RE = re.compile(r"^[A-Z]{1,2}[0-9]+$|^[A-Z]{2}$")
+
+# A term is considered glossed if a definitional cue appears within this
+# many characters after its first prose use. Tuned generously: the writer
+# often defines a term in the sentence *following* first use, and a false
+# "already glossed" is much cheaper than nagging about a defined term.
+_GLOSS_WINDOW_CHARS = 400
+
+# Phrases that mark an actual definition rather than mere use.
+#
+# Split into two tiers, because a single permissive pattern does not work.
+# The first version of this check accepted a bare `(` or `:` anywhere in the
+# 400-char window, and consequently found ch12's `KVM` "glossed" by an
+# unrelated parenthetical 90 characters later — passing the synthetic tests
+# while missing the exact document that motivated the checker. Punctuation
+# is only a gloss when it is ADJACENT to the term.
+#
+# Tier 1: verbal cues, valid anywhere in the look-ahead window. These are
+# unambiguous ("stands for", "is a") and the writer often puts them in the
+# sentence after first use.
+_GLOSS_CUE_RE = re.compile(
+    r"(?:"
+    r"\bis\s+(?:a|an|the)\b|\bare\s+(?:a|an|the)\b|"
+    r"\bstands?\s+for\b|\brefers?\s+to\b|\bmeans?\b|"
+    r"\bknown\s+as\b|\bi\.e\.|\bnamely\b|"
+    r"\bin\s+other\s+words\b|\bshort\s+for\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Tier 2: punctuation gloss, only valid immediately after the term —
+# "KVM (kernel virtual address space)", "KVM — the kernel's address
+# space", "KVM: the kernel's address space". Anchored at position 0 of the
+# post-term text, and the gloss body must contain at least two words so a
+# bare cross-reference like "KVM (see below)" does not count.
+_GLOSS_ADJACENT_RE = re.compile(
+    r"^\s*(?:"
+    r"\(\s*(?P<paren>[^)]{6,120})\)|"
+    r"[—–]\s*(?P<dash>[^.;\n]{6,120})|"
+    r":\s+(?P<colon>[^.;\n]{6,120})"
+    r")",
+)
+
+# A tier-2 gloss body must look like an explanation, not a pointer.
+_GLOSS_BODY_REJECT_RE = re.compile(
+    r"^\s*(?:see|cf\.|section|chapter|below|above|figure|table|note)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_gloss(post_term_text: str) -> bool:
+    """True if `post_term_text` opens with, or soon contains, a definition.
+
+    `post_term_text` is the draft text immediately following a term's first
+    prose use. Tier-2 punctuation cues are checked at offset 0 only; tier-1
+    verbal cues are accepted anywhere in the window.
+    """
+    adj = _GLOSS_ADJACENT_RE.match(post_term_text)
+    if adj:
+        body = next(g for g in (adj.group("paren"), adj.group("dash"),
+                                adj.group("colon")) if g is not None)
+        if (len(body.split()) >= 2
+                and not _GLOSS_BODY_REJECT_RE.match(body)):
+            return True
+    return bool(_GLOSS_CUE_RE.search(post_term_text))
+
+
+def _mask_fenced_blocks(text: str) -> str:
+    """Blank out fenced code blocks, preserving byte offsets.
+
+    Offsets must survive because the jargon scan reports first-use
+    positions and measures a look-ahead window against them. Replacing
+    each block with same-length spaces keeps every later offset valid
+    while making the block's content invisible to the scanners.
+    """
+    def _blank(m: "re.Match") -> str:
+        # Keep newlines so line-oriented cues (and any future
+        # line-number reporting) stay aligned.
+        return "".join("\n" if c == "\n" else " " for c in m.group(0))
+
+    return _FENCED_BLOCK_RE.sub(_blank, text)
+
+
+def _strip_inline_code(text: str) -> str:
+    """Blank out inline `code` spans, preserving offsets.
+
+    Used only for the acronym scan. An acronym inside backticks is
+    nearly always an identifier (`BIO_UNMAPPED`, `M_NOWAIT`) rather than
+    prose the reader must parse, and the curated-term scan handles the
+    ones that genuinely matter. Without this, every macro name in the
+    chapter reads as an unexpanded acronym.
+    """
+    return re.sub(
+        r"`[^`\n]*`",
+        lambda m: " " * len(m.group(0)),
+        text,
+    )
+
+
+def _find_glossary_section(text: str) -> str:
+    """Return the body of a `## Glossary` section, or "".
+
+    A term defined in an explicit Glossary counts as glossed no matter
+    where else it appears, so the check must not nag about terms the
+    chapter already lists there.
+    """
+    m = re.search(
+        r"^##+\s*Glossary\s*$(.*?)(?=^##\s|\Z)",
+        text, re.MULTILINE | re.DOTALL,
+    )
+    return m.group(1) if m else ""
+
+
+def _term_pattern(term: str) -> "re.Pattern":
+    """Build a whole-word matcher for a curated jargon term.
+
+    Short all-caps terms (KVM, KVA, DMA, UMA) match case-sensitively so
+    they don't fire on unrelated lowercase substrings; everything else
+    matches case-insensitively because prose capitalisation varies
+    ("Copy-on-write" at the start of a sentence).
+
+    Hyphens and spaces in multi-word terms are treated interchangeably:
+    the writer may render "copy-on-write" or "copy on write", and both
+    are the same term.
+    """
+    flexible = re.escape(term).replace(r"\-", r"[-\s]").replace(r"\ ", r"[-\s]")
+    if term.isupper() and len(term) <= 5:
+        return re.compile(rf"\b{flexible}\b")
+    return re.compile(rf"\b{flexible}\b", re.IGNORECASE)
+
+
+def _extract_unglossed_jargon(text: str) -> List[str]:
+    """Find curated jargon terms used in prose without a nearby gloss.
+
+    Returns a sorted list of terms whose first prose use has no
+    definitional cue within `_GLOSS_WINDOW_CHARS` and which are not
+    defined in an explicit `## Glossary` section.
+    """
+    prose = _mask_fenced_blocks(text)
+    glossary = _find_glossary_section(text)
+
+    unglossed = []
+    for term in _JARGON_TERMS:
+        pat = _term_pattern(term)
+        # Already defined in the Glossary section? Nothing to report.
+        if glossary and pat.search(glossary):
+            continue
+        m = pat.search(prose)
+        if not m:
+            continue  # term not used in this chapter
+        window = prose[m.end():m.end() + _GLOSS_WINDOW_CHARS]
+        if not _has_gloss(window):
+            unglossed.append(term)
+    return sorted(set(unglossed))
+
+
+# Matches a candidate acronym in prose: 2+ consecutive capitals, allowing
+# embedded digits (IPv6 handled via the exempt set, PML4, AMD64).
+_ACRONYM_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,})\b")
+
+
+def _extract_unexpanded_acronyms(text: str) -> List[str]:
+    """Find acronyms used in prose that are never expanded in the chapter.
+
+    An acronym counts as expanded if the chapter contains a parenthetical
+    or adjacent expansion whose initials match it — e.g. "kernel virtual
+    memory (KVM)" or "KVM (kernel virtual memory)". This is the safety
+    net for terms missing from `_JARGON_TERMS`; the curated list will
+    always lag the source tree.
+
+    Conservative by construction: inline code is masked, a broad exempt
+    set is applied, and anything appearing fewer than twice is ignored
+    (a one-off mention is rarely load-bearing).
+    """
+    prose = _strip_inline_code(_mask_fenced_blocks(text))
+
+    counts: Dict[str, int] = {}
+    for m in _ACRONYM_RE.finditer(prose):
+        tok = m.group(1)
+        counts[tok] = counts.get(tok, 0) + 1
+
+    unexpanded = []
+    for tok, n in counts.items():
+        if n < 2 or tok.upper() in _ACRONYM_GLOSS_EXEMPT:
+            continue
+        if _ACRONYM_MODEL_RE.match(tok):
+            continue  # chip/model/extension token, nothing to expand
+        # Expansion adjacent to the acronym, either order.
+        paren_after = re.search(
+            rf"\b{re.escape(tok)}\b\s*\(([^)]{{4,80}})\)", prose)
+        paren_before = re.search(
+            rf"\(([^)]{{0,4}})?\s*{re.escape(tok)}\s*\)", prose)
+        expanded = False
+        if paren_after:
+            initials = "".join(w[0] for w in re.findall(
+                r"[A-Za-z]+", paren_after.group(1)))
+            if tok.lower() in initials.lower() or len(
+                    paren_after.group(1).split()) >= 2:
+                expanded = True
+        if paren_before:
+            # "kernel virtual memory (KVM)" — words immediately before.
+            head = prose[max(0, paren_before.start() - 80):paren_before.start()]
+            if len(re.findall(r"[A-Za-z]+", head)) >= 2:
+                expanded = True
+        if not expanded:
+            unexpanded.append(tok)
+    return sorted(unexpanded)
+
+
 # --- Struct-body field verification ---------------------------------------
 #
 # Writers paraphrase struct definitions from training-data memory: they
@@ -7259,7 +7666,17 @@ def fact_check_draft(draft: str, src_root: str,
           a no-op rather than blocking the pipeline. Reported as "suspect,
           verify against sysctl(8)" not "hallucinated", because ~1/3 of OID
           nodes have an unresolved parent chain (false-negative risk).
-        - 'total_issues': count of all issues
+        - 'jargon_unglossed': list of curated jargon terms (see
+          `_JARGON_TERMS`) used in prose with no definitional cue within
+          `_GLOSS_WINDOW_CHARS` of first use and not defined in a
+          `## Glossary` section. A READABILITY finding, not an accuracy
+          one — the term is real, it just isn't explained. Motivated by
+          ch12 using `KVM` five times without ever defining it.
+        - 'acronyms_unexpanded': list of acronyms used 2+ times in prose
+          that are never expanded anywhere in the chapter. Safety net for
+          terms missing from the curated list.
+        - 'total_issues': count of all issues. EXCLUDES the two readability
+          keys above by design — see the comment at the return statement.
 
     Any legacy `## Comparison` section is stripped before extraction
     (the section was removed from the pipeline in 2026-05; new drafts
@@ -7283,6 +7700,12 @@ def fact_check_draft(draft: str, src_root: str,
     dtrace_probes = _extract_dtrace_probes(fact_text)
     malloc_tags = _extract_malloc_tags(fact_text)
     sysctls = _extract_sysctls(fact_text)
+    # Readability, not existence: terms used in prose with no definition
+    # nearby. Unlike every other check here this one needs no source tree,
+    # so it runs unconditionally and never fails open. See the section
+    # comment above `_JARGON_TERMS` for the ch12 `KVM` post-mortem.
+    unglossed_jargon = _extract_unglossed_jargon(fact_text)
+    unexpanded_acronyms = _extract_unexpanded_acronyms(fact_text)
 
     paths_missing = _verify_file_paths(file_paths, src_root)
     paths_corrected = [x for x in paths_missing if ' → ' in x]
@@ -7340,6 +7763,17 @@ def fact_check_draft(draft: str, src_root: str,
         'dtrace_probes_not_found': dtrace_probes_missing,
         'malloc_tags_not_found': malloc_tags_missing,
         'sysctls_not_found': sysctls_missing,
+        # Readability findings. Deliberately NOT in `total_issues`: that
+        # count gates the fact-fix loop, whose prompt is about removing
+        # hallucinated symbols. An undefined term is not a false claim, and
+        # forcing a fact-fix round for one would (a) change when that loop
+        # runs on nearly every chapter and (b) mix "delete this lie" with
+        # "explain this term" in one instruction — the exact prompt-blending
+        # that FUTURE_IMPROVEMENTS.md records as having backfired before.
+        # These are surfaced to the REVIEWER instead, which already owns
+        # accessibility (criterion 5) and rationale (criterion 8).
+        'jargon_unglossed': unglossed_jargon,
+        'acronyms_unexpanded': unexpanded_acronyms,
         'total_issues': (len(paths_missing) + len(paths_corrected) +
                          len(structs_missing) + len(struct_fields_bogus) +
                          len(struct_bodies_abridged) +

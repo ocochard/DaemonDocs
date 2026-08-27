@@ -17,6 +17,195 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [PARTIALLY DONE — step 1 shipped 2026-08-27] Jargon goes undefined: every verifier asks "is this symbol real?", none asks "will the reader understand it?"
+
+Reported by the user against `sys/vm/README_bcache.md` (ch12):
+
+> The `BIO_UNMAPPED` flag indicates that the data pages are not mapped
+> into KVM and must be mapped before the I/O can proceed.
+
+`KVM` appears five times in that chapter and is never defined. The text
+also never answers the obvious follow-up — *why do both modes exist?* It
+states a mechanism ("must be mapped before the I/O can proceed") and
+omits the point: unmapped I/O exists so a device can DMA straight from
+physical pages without spending KVM and pmap/TLB work. KVM is finite on
+32-bit and contended even on amd64.
+
+Worse, line 253 of that chapter **invented** a rationale:
+
+> If they are not (for example, because the pageout daemon has paged them
+> out), the buffer must be "imported" back into KVM
+
+Wrong. An unmapped buffer is unmapped because the caller asked for
+`BIO_UNMAPPED`, not because the pagedaemon evicted anything. This is the
+key insight from the post-mortem: **undefined jargon and confabulated
+rationale are the same defect.** The writer treated "the flag exists" as
+sufficient, never engaged with why two modes exist, and when the reviewer
+pushed for rationale it produced something plausible instead of something
+true. Any fix that only adds definitions leaves the confabulation intact.
+
+**Why the existing mechanisms did not catch it.** Two already existed:
+
+- A per-chapter `Glossary` section in `_SECTION_CATALOG`. Opt-in, and
+  **1 of 40 chapters uses it** (the VM chapter). Only 2 chapters override
+  `sections` at all, so the opt-in is effectively dead.
+- Reviewer criterion 8, "Rationale", which asks almost exactly the user's
+  question: "does it explain WHY the design exists — what engineering
+  problem it solves". It graded ch12 PASS.
+
+Criterion 8 fails structurally, not by accident:
+
+1. **Its trigger examples are VM-flavoured** — shadow chains, inactive
+   queues, UMA kegs vs zones, copy-on-write, witness, turnstiles, NUMA
+   domains. Nothing cues the reviewer to treat a *flag* as a non-obvious
+   mechanism, and the model pattern-matches the examples it was given.
+2. **It is one binary verdict over a ~25 KB draft.** Find rationale for
+   three big things and five undefined terms ride along inside one PASS.
+   There is no per-term accounting.
+3. **It asks the model to simulate a junior reader.** A model that knows
+   what KVM is does not *experience* `KVM` as needing a definition. This
+   is the same reason the reviewer cannot be trusted to guess whether a
+   path exists — and the fix is the same: compute it in Python and hand
+   over a list it cannot rationalize away.
+
+#### Step 1 — jargon-density check in Python [SHIPPED 2026-08-27]
+
+`_extract_unglossed_jargon` and `_extract_unexpanded_acronyms`, wired into
+`fact_check_draft` and surfaced to the reviewer as an "Undefined Terms
+Detected" block. Two independent scans:
+
+- **Curated terms** (`_JARGON_TERMS`): a hand-maintained set of
+  FreeBSD/OS-internals terms needing a gloss on first prose use. Curated
+  deliberately — a generic "hard word" heuristic drowns the writer.
+- **Unexpanded acronyms**: any `[A-Z]{2,}` used 2+ times that is never
+  expanded anywhere in the chapter. Safety net for terms missing from the
+  curated list, which will always lag the source tree.
+
+Both mask fenced code blocks: a term inside a struct definition or DTrace
+script is not prose use, and demanding a gloss there would be wrong.
+
+Findings go to `jargon_unglossed` / `acronyms_unexpanded` and are
+**deliberately excluded from `total_issues`**. That count gates the
+fact-fix loop, whose prompt is about deleting hallucinated symbols. An
+undefined term is not a false claim, and folding it in would (a) fire that
+loop on nearly every chapter and (b) blend "delete this lie" with "explain
+this term" in one instruction — the prompt-blending this document already
+records as backfiring. Readability goes to the reviewer, which owns
+accessibility (criterion 5) and rationale (criterion 8).
+
+**Two calibration lessons, both found by testing against real chapters
+rather than synthetic drafts:**
+
+*The gloss cue must be adjacent, not nearby.* The first version accepted a
+bare `(` or `:` anywhere within 400 characters. It passed every synthetic
+test and **missed ch12** — an unrelated parenthetical 90 characters after
+`KVM` counted as its definition. Cues are now two tiers: verbal cues
+("stands for", "is a") anywhere in the window; punctuation cues only
+immediately after the term, with a gloss body of 2+ words that is not a
+cross-reference ("see below").
+
+*False-positive rate is the whole ballgame.* Measured across all 31
+shipped chapters, then tightened twice:
+
+| | findings/chapter |
+|---|---|
+| first cut | 10.4 |
+| after dropping `sysctl`, `README`, TCP state names, TX/RX, chip models | 7.5 |
+| after dropping bare `vfs`/`zone`, SCSI command words, queue macros, arch names | **7.0** |
+
+Range is now 2-13. `vfs` and `zone` came out of the curated list as too
+generic ("the vfs layer" is ordinary prose; `zone` collides with UMA, jail
+and DNS zones). What survives reads as genuine: `VMCS`/`VMX`/`SVM`/`GPA`
+really are unexplained in the vmm chapter, `BBR`/`RACK`/`ECN` really are
+undefined TCP algorithm names, and `UMA`/`newbus`/`devclass`/`sysinit`/`kld`
+genuinely go undefined across many chapters.
+
+Tests: `tests/test_jargon_gloss.py` — 9 groups, including a regression
+test that asserts the real ch12 text still flags `KVM` (the case the loose
+cue regex missed) and one asserting readability findings stay out of
+`total_issues`.
+
+#### Step 2 — make Glossary a default section, and link terms to it [OPEN]
+
+Add `Glossary` to `_DEFAULT_SECTIONS`, positioned immediately after
+`Quick Summary`. The catalog comment already warns that defining terms
+*after* `Architecture` has used them defeats the point. Populate it from
+step 1's output so entries are grounded in terms the chapter actually
+uses rather than invented.
+
+Then — the piece the user asked about directly — **a deterministic
+first-use linker**, a fourth sibling to `_link_see_also_source_paths` and
+`_link_manpage_refs` in phase 4. Pure Python, no LLM:
+
+- in-chapter: wrap first prose use as `[KVM](#glossary)`;
+- cross-chapter: for terms defined in another chapter's glossary, link to
+  `../../<that-chapter>#kvm`, reusing the existing relative-depth logic
+  (note the ch17 depth bug: depth must be computed from the final
+  `output_file`, not assumed);
+- idempotent, and skipping any term already inside a link or backticks —
+  the same rules `_link_manpage_refs` already follows.
+
+Step 1 does not do this and cannot: linking to a glossary requires the
+glossary to exist, and today 1 of 40 chapters has one. Sequencing is
+therefore step 1 (define terms inline) → step 2 (glossary exists) →
+linker.
+
+Cost: one extra section per chapter, and the benefit only materialises on
+a full regeneration — so it lands with the next full run, not
+retroactively.
+
+#### Step 3 — broaden criterion 8 and split its verdict [OPEN]
+
+Two changes to the reviewer rubric:
+
+- **Add flags-and-modes to the trigger examples** — `BIO_UNMAPPED`,
+  `M_NOWAIT` vs `M_WAITOK`, `LK_EXCLUSIVE` vs `LK_SHARED`. Wherever the
+  kernel offers two ways to do something, the reader needs to know which
+  to pick and why. Today's examples are all data structures, so flags
+  never register as "non-obvious mechanisms".
+- **Replace the binary verdict with an enumeration**: require
+  `"rationale": {"missing": [...]}` listing each unexplained mechanism.
+  Enumeration resists the "found three, good enough" failure that one
+  PASS/FAIL invites.
+
+Deliberately last and unmeasured. This is a prompt edit, and this document
+is largely a record of prompt edits that broke something else — so it
+wants an A/B on a fixed chapter set, not a confident commit. Note step 1
+already adds a narrower version of the first half: the "Undefined Terms
+Detected" block tells the reviewer that where a term names a *choice*, the
+gloss must say why both options exist.
+
+#### Step 4 — rationale correctness is unverifiable [OPEN, no approach yet]
+
+Steps 1-3 raise the floor: the term gets defined, and the reviewer is
+forced to account for it. **None of them can tell a correct rationale
+from a plausible invented one.** The `BIO_UNMAPPED` pageout-daemon
+confabulation would still ship today.
+
+Every verifier in `generate-doc.py` is symbol-shaped: it asks whether a
+name exists, whether an arity matches, whether a field is real. A claim
+about *why* a design exists has no symbol to check. This is the same
+class as the unverifiable ordering claims noted elsewhere — prose that
+asserts causality or sequence, where grep has no purchase.
+
+Possible directions, none prototyped:
+
+- **Commit-message grounding.** Design rationale often lives in the
+  commit that introduced the mechanism. `git log -S BIO_UNMAPPED` finds
+  it; whether a writer can be made to cite it is untested.
+- **Man-page and comment grounding.** `buf(9)` and the block comments in
+  `vfs_bio.c` state the actual rationale. Retrieval over those, scoped to
+  the mechanism under discussion, is closer to how the writer already
+  uses `search_books`.
+- **Targeted contradiction check.** Rather than verify a rationale, look
+  for the specific shape that failed here: a causal clause ("because…",
+  "in order to…") attached to a mechanism, where the named cause is a
+  subsystem the mechanism has no dependency on. The pagedaemon has no
+  role in `BIO_UNMAPPED`, and the call graph would show that.
+
+Until one of these is real, treat rationale prose as the least-verified
+content in the corpus. It reads authoritative, and nothing checks it.
+
 ### [DONE — shipped 2026-08-22] Disabling the writer's reasoning channel made it stop converging
 
 Qwen3.8-27B is a reasoning model: it emits into `reasoning_content`, a
