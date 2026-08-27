@@ -4012,6 +4012,32 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
     print(f"  Reviewer thinking: {'on' if REVIEWER_THINKING else 'off'}")
     print(f"{'=' * 70}")
 
+    # Fail fast on an output_file whose parent directory does not exist in the
+    # source tree. `output_file` is relative to SRC_ROOT, so a missing top-level
+    # prefix still forms a valid-looking relative path and the atomic write
+    # happily creates the whole layout: ch17 shipped to a brand-new top-level
+    # `fs/nfs/` because its output_file read "fs/nfs/README.md" instead of
+    # "sys/fs/nfs/README.md" (2026-08-27). The chapter CONTENT was fine —
+    # source_dirs were correct — so nothing downstream had reason to complain,
+    # and the README simply never landed in the tree it documents.
+    #
+    # Only pre-existing directories are legitimate targets: every chapter
+    # documents code that is already there. Checked before the writer runs so a
+    # typo costs seconds instead of a multi-hour chapter.
+    if not dry_run:
+        parent = os.path.dirname(output_path)
+        if parent and not os.path.isdir(parent):
+            rel_parent = os.path.dirname(output_file)
+            print(f"  ✗ output_file '{output_file}' targets "
+                  f"'{rel_parent}/', which does not exist under {SRC_ROOT}.")
+            # A missing `sys/` prefix is by far the likeliest cause, so name it.
+            if os.path.isdir(os.path.join(SRC_ROOT, "sys", rel_parent)):
+                print(f"    Did you mean 'sys/{output_file}'? "
+                      f"('sys/{rel_parent}/' does exist.)")
+            print("    Refusing to create a new directory layout in the "
+                  "source tree. Fix output_file in chapters.yaml.")
+            return False
+
     if dry_run:
         print("  [dry-run] would generate README.md")
         return False

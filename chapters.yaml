@@ -707,7 +707,7 @@ chapters:
       - "VFS — Virtual File System Layer"
       - "UFS — FreeBSD's Native Filesystem"
       - "The Socket Layer — sockets, sockbuf, and UNIX-domain"
-    output_file: "fs/nfs/README.md"
+    output_file: "sys/fs/nfs/README.md"
     source_dirs:
       - "sys/fs/nfs"
       - "sys/fs/nfsclient"
