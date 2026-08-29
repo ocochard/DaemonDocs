@@ -196,7 +196,7 @@ second pass. That number is low only because 1 of 40 chapters has a
 Glossary today — the linker's yield scales with the next full
 regeneration, exactly as predicted above.
 
-#### Step 3 — broaden criterion 8 and split its verdict [OPEN]
+#### Step 3 — broaden criterion 8 and split its verdict [BUILT, UNMEASURED — default OFF]
 
 Two changes to the reviewer rubric:
 
@@ -216,6 +216,51 @@ wants an A/B on a fixed chapter set, not a confident commit. Note step 1
 already adds a narrower version of the first half: the "Undefined Terms
 Detected" block tells the reviewer that where a term names a *choice*, the
 gloss must say why both options exist.
+
+**Shipped 2026-08-29, inert.** Gated behind `DAEMONDOCS_RATIONALE_ENUM`,
+default OFF — the only flag in the codebase that defaults off, and the
+first to change prompt text at all. Nothing changes until it is set;
+`scripts/regen-runner.sh` takes it as positional arg 4 so one endpoint can
+run the treatment arm against a shared queue. Revert is unsetting the env
+var, not a code change. Three deviations from the spec above:
+
+1. **The spec's JSON shape is a bug and was not implemented as written.**
+   `"rationale": {"missing": [...]}` nests a list inside `criteria`, but
+   `_review_passes` returns False on any non-string criteria value (and
+   `_criteria_fail_count` counts it as a FAIL). That shape would fail the
+   gate for *every* chapter, exhaust `max_revisions`, and ship the corpus
+   UNVERIFIED. The enumeration is therefore a **top-level sibling**,
+   `rationale_missing`, and `criteria.rationale` stays a string verdict.
+   `tests/test_rationale_rubric.py` group 7 pins the broken shape as a
+   documented negative so nobody "fixes" it back.
+2. **Both halves are keyed off the one flag**, so an arm can never be
+   half-applied — widening the criterion with nowhere to record findings,
+   or the reverse, would each measure the wrong thing.
+3. **The list is deliberately not wired into any control flow.** Not the
+   approval gate (must stay criteria-driven), not `best_fails` (must stay
+   comparable across arms), not `total_issues`. Its only consumer is a log
+   suffix that is absent when the list is empty, so control-arm logs stay
+   byte-identical. Review JSON is never persisted, so without that line the
+   A/B would have nothing to measure.
+
+Separately and *not* behind the flag: `BIO_UNMAPPED`, `LK_EXCLUSIVE` and
+`LK_SHARED` were added to `_JARGON_TERMS`. That is deterministic and
+mechanically checked, so it needs no A/B — but it yields *glosses*, not
+rationale, so it complements step 3 rather than replacing it.
+
+**What the A/B must measure**, on a set including the bio/buf chapter, a
+locking chapter, an allocator chapter, and two architecture-prose chapters
+(the last as a check that the arm does not manufacture findings where there
+are no flags): rounds-to-approval and UNVERIFIED count (the main risk is
+revision-round inflation — "do not stop at three" removes the reviewer's
+stopping point and every entry becomes a writer instruction); criterion-8
+FAIL rate at round 1, which *should* rise; `rationale_missing` count from
+round 1 to last, which should trend toward 0; criterion-7 FAIL rate, since
+rationale prose invites the marketing words criterion 7 rejects; and the
+parse-failure rate, since a longer schema costs the single retry. None of
+those decide it on their own — the target defect has no mechanical
+detector, so one manual read of the bio chapter is what actually decides
+keep-vs-revert.
 
 #### Step 4 — rationale correctness is unverifiable [OPEN, no approach yet]
 

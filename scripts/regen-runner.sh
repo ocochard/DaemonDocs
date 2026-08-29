@@ -67,6 +67,10 @@ set -- $args
 LABEL="${1:?LABEL required}"
 URL="${2:?OPENAI_BASE_URL required}"
 RTHINK="${3:-1}"
+# Step 3 rationale rubric: OFF unless this arm explicitly opts in.
+# Default must stay 0 to match generate-doc.py, so an arm launched
+# without the 4th argument runs today's rubric unchanged.
+RATENUM="${4:-0}"
 
 QUEUE_DIR="/tmp/regen-queue"
 QUEUE="$QUEUE_DIR/queue.txt"
@@ -102,7 +106,7 @@ fetch_decode_total() {
     echo "$fetch_out" | awk '/^llamacpp:n_decode_total /{print $2; exit}'
 }
 
-echo "[$LABEL] starting at $(date -u +%FT%TZ) endpoint=$URL reviewer_thinking=$RTHINK watchdog=${WATCHDOG_SECS}s recover=$RECOVER" >> "$LOG"
+echo "[$LABEL] starting at $(date -u +%FT%TZ) endpoint=$URL reviewer_thinking=$RTHINK rationale_enum=$RATENUM watchdog=${WATCHDOG_SECS}s recover=$RECOVER" >> "$LOG"
 
 # Startup inflight handling. A leftover file means the previous run of this
 # label died between popping a chapter and finishing it.
@@ -187,6 +191,7 @@ while :; do
     OPENAI_MODEL="${MODEL_ALIAS:-Qwen3.8-27B-UD-Q8_K_XL}" \
     DAEMONDOCS_WRITER_THINKING=1 \
     DAEMONDOCS_REVIEWER_THINKING="$RTHINK" \
+    DAEMONDOCS_RATIONALE_ENUM="$RATENUM" \
         .venv/bin/python generate-doc.py --force --chapter "$N" \
             > "$CHLOG" 2>&1 &
     PYPID=$!
