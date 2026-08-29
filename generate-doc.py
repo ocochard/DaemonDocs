@@ -2359,9 +2359,18 @@ _SECTION_CATALOG = {
         "rubric_body": "3-4 paragraphs, no code (beginners)",
     },
     "Glossary": {
-        # Opt-in per chapter (not in _DEFAULT_SECTIONS). Best placed early
-        # in the section list — defining terms AFTER the Architecture
+        # In _DEFAULT_SECTIONS since 2026-08-29, positioned immediately
+        # after Quick Summary: defining terms AFTER the Architecture
         # section has already used them defeats the point.
+        #
+        # Promoted from opt-in because the mechanical scan found 5.2
+        # undefined terms per chapter across the chapters shipped that
+        # week, with 0 of 5 carrying a Glossary at all. The same handful
+        # recurred everywhere (newbus, devclass, kld, sysinit, UMA) — each
+        # chapter is written in isolation, so every one of them re-meets
+        # the same vocabulary cold. Telling the reviewer about undefined
+        # terms (step 1) did not fix it; giving the writer a section to
+        # put them in is the other half.
         "template_body": (
             "(3-8 single-line definitions of terms used in this chapter\n"
             "that a junior developer wouldn't already know — e.g. TLB\n"
@@ -2419,9 +2428,16 @@ _SECTION_CATALOG = {
 # has no way to verify them either. Chapters that legitimately benefit from
 # a small in-line analogy can include it within Architecture or Advanced
 # Notes; a separately-graded section produced more harm than good.
+#
+# `Glossary` joined the defaults on 2026-08-29 (see the catalog entry for
+# the measurement that motivated it). It sits second, right after Quick
+# Summary, so terms are defined before Architecture starts using them.
+# This takes the default chapter from 7 H2 sections to 8 — the reviewer's
+# structure criterion counts sections, so its rubric text is generated
+# from this list rather than hard-coded.
 _DEFAULT_SECTIONS = [
-    "Quick Summary", "Architecture", "Key Data Structures", "Deep Dive",
-    "Flow / Diagram", "Advanced Notes", "See Also",
+    "Quick Summary", "Glossary", "Architecture", "Key Data Structures",
+    "Deep Dive", "Flow / Diagram", "Advanced Notes", "See Also",
 ]
 
 
@@ -5221,6 +5237,267 @@ def _link_manpage_refs(
         return fences[int(m.group(1))]
     new_content = re.sub(r"\x00FENCE(\d+)\x00", _restore, new_masked)
 
+    return new_content, linked
+
+
+# Matches a glossary definition line. Two shapes are accepted because the
+# corpus contains both: the catalog template asks for `**term** — text`,
+# while the one chapter that shipped a Glossary before it became a default
+# (sys/vm/README.md) used a bullet, `- **term** — text`. Accepting only the
+# templated shape would silently skip the sole real-world example.
+#
+# The separator is an em/en dash or a colon. A plain hyphen is deliberately
+# NOT accepted: `- **Slab** - text` is indistinguishable from a bullet list
+# whose item happens to start bold, and matching it pulls in ordinary prose.
+_GLOSSARY_ENTRY_RE = re.compile(
+    r"^\s*(?:[-*]\s+)?\*\*(?P<term>[^*\n]{2,60}?)\*\*\s*(?:[—–:])",
+    re.MULTILINE,
+)
+
+# A term is linkable only if it looks like a term, not a sentence. Glossary
+# lines occasionally carry a parenthetical or a trailing qualifier; those
+# make bad link anchors and bad regex targets.
+_GLOSSARY_TERM_OK_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _/()+-]{1,40}$")
+
+# Own fence matcher, deliberately not shared. `_FENCED_BLOCK_RE` is defined
+# twice in this file (once near the man-page linker, once near the struct
+# verifier) and the later definition wins for every caller — the second one
+# requires a newline after the opening fence, so single-line ``` blocks are
+# not masked. That is a pre-existing bug in the man-ref linker, not one to
+# inherit here. This pattern masks both shapes.
+_GLOSS_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+
+
+def _parse_glossary_entries(content: str) -> Dict[str, str]:
+    """Return ``{term: anchor_slug}`` for each entry in a Glossary section.
+
+    Insertion-ordered (plain dict) so the caller links deterministically.
+    Returns an empty mapping when the chapter has no Glossary — which, on
+    the corpus as of 2026-08-29, is every chapter but one. That is the
+    reason step 2 pairs the linker with promoting Glossary to a default
+    section: a linker alone would have had almost nothing to point at.
+    """
+    section = _find_glossary_section(content)
+    if not section.strip():
+        return {}
+    out: Dict[str, str] = {}
+    for m in _GLOSSARY_ENTRY_RE.finditer(section):
+        term = m.group("term").strip()
+        # Strip inline code styling the writer may have added: `**`vnode`**`.
+        term = term.strip("`").strip()
+        if not _GLOSSARY_TERM_OK_RE.match(term):
+            continue
+        out.setdefault(term, _GLOSSARY_ANCHOR)
+    return out
+
+
+def _find_glossary_span(text: str) -> Optional[Tuple[int, int]]:
+    """Offsets of the whole Glossary section, heading included, or None.
+
+    `_find_glossary_section` returns the body text; the linker needs the
+    span so it can refuse to rewrite anything inside it. Same pattern, so
+    the two agree on what counts as a Glossary.
+    """
+    m = re.search(
+        r"^##+\s*Glossary\s*$(.*?)(?=^##\s|\Z)",
+        text, re.MULTILINE | re.DOTALL,
+    )
+    return (m.start(), m.end()) if m else None
+
+
+# Every glossary term links to the Glossary SECTION, not to a per-term
+# anchor. GitHub mints anchors for *headings* only — a term rendered as a
+# bolded list item (`- **Slab** — ...`) gets no anchor at all, so a
+# `#slab` target silently resolves to nothing and the reader lands at the
+# top of the file. Verified against the real sys/vm/README.md on
+# 2026-08-29: it has `## Glossary` and eight bolded terms beneath it, and
+# `#zone` / `#slab` match no heading in the document.
+#
+# The alternative — emitting `<a id="slab"></a>` into each definition —
+# would give exact targets, but it means the linker mutates the Glossary
+# body it is otherwise forbidden to touch, and raw HTML degrades in the
+# plain-text reading that these in-tree READMEs are also meant for. A
+# section link always resolves and puts the definition on screen.
+_GLOSSARY_ANCHOR = "glossary"
+
+
+def _github_anchor(text: str) -> str:
+    """Slugify text the way GitHub mints a heading anchor.
+
+    Lowercase, spaces to hyphens, drop everything that isn't
+    alphanumeric/hyphen/underscore. Retained for headings; glossary terms
+    use `_GLOSSARY_ANCHOR` because bolded list items get no anchor (see
+    the note above).
+    """
+    slug = text.strip().lower()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"\s+", "-", slug)
+    return slug.strip("-")
+
+
+def _link_glossary_first_use(
+    content: str, current_file: str,
+    external_terms: Optional[dict] = None,
+) -> Tuple[str, int]:
+    """Link the FIRST prose use of each glossary term to its definition.
+
+    Fourth sibling to `_link_see_also_source_paths` and
+    `_link_manpage_refs`, and it follows their rules exactly: mask fenced
+    blocks, never touch text already inside a markdown link, never touch
+    inline code, and be idempotent.
+
+    Two link targets:
+      * in-chapter — a term defined in this chapter's own Glossary links
+        to ``#anchor``;
+      * cross-chapter — a term defined in ANOTHER chapter's Glossary links
+        to ``<relpath>#anchor``, with the relative path computed from
+        `current_file`, never assumed. (The ch17 incident: a chapter whose
+        `output_file` gained a directory level shipped 15 links that were
+        all one ``../`` too shallow. Depth is derived, never hard-coded.)
+
+    `external_terms` maps ``term -> (output_file, anchor)``. When a term is
+    defined both here and elsewhere, the local definition wins: a reader
+    should not be sent to another file for something defined on the page.
+
+    Only the first prose occurrence is linked. Linking every mention turns
+    a chapter into a sea of blue and re-reads as noise; the first use is
+    where a reader actually needs the escape hatch.
+    """
+    entries = _parse_glossary_entries(content)
+    external_terms = external_terms or {}
+    if not entries and not external_terms:
+        return content, 0
+
+    # Local definitions shadow external ones.
+    targets: Dict[str, str] = {}
+    for term, anchor in entries.items():
+        targets[term] = f"#{anchor}"
+    current_dir = os.path.dirname(current_file)
+    for term, (other_file, anchor) in external_terms.items():
+        if term in targets or other_file == current_file:
+            continue
+        rel = os.path.relpath(
+            other_file, start=current_dir if current_dir else ".")
+        targets[term] = f"{rel}#{anchor}"
+    if not targets:
+        return content, 0
+
+    # Mask fenced blocks exactly as _link_manpage_refs does.
+    fences: List[str] = []
+
+    def _stash_fence(m: "re.Match") -> str:
+        fences.append(m.group(0))
+        return f"\x00FENCE{len(fences) - 1}\x00"
+
+    masked = _GLOSS_FENCE_RE.sub(_stash_fence, content)
+
+    # Never link inside the Glossary section itself — a definition that
+    # links to its own anchor is circular and looks broken.
+    gloss_span = _find_glossary_span(masked)
+
+    # Never link inside an existing markdown link, and never inside inline
+    # code. Inline-code spans matter more here than for man refs: kernel
+    # prose writes `vnode` in backticks constantly, and those are already
+    # styled as code — wrapping them would double up the markup.
+    skip_spans: List[Tuple[int, int]] = []
+    for m in re.finditer(r"\[[^\]]*\]\([^)]*\)", masked):
+        skip_spans.append((m.start(), m.end()))
+    for m in re.finditer(r"`[^`\n]+`", masked):
+        skip_spans.append((m.start(), m.end()))
+    if gloss_span:
+        skip_spans.append(gloss_span)
+    # Headings: linking a term inside an H2 breaks the heading's own anchor.
+    for m in re.finditer(r"^#{1,6} .*$", masked, re.MULTILINE):
+        skip_spans.append((m.start(), m.end()))
+
+    # See Also is a link list, owned by _add_see_also_links and the two
+    # path linkers. A fifth link threaded into a bullet that is already a
+    # link reads as noise. Observed on README_transport.md in the
+    # 2026-08-29 dry run.
+    for m in re.finditer(
+        r"^##+\s*See Also\s*$.*?(?=^##\s|\Z)", masked,
+        re.MULTILINE | re.DOTALL,
+    ):
+        skip_spans.append((m.start(), m.end()))
+
+    # Double-quoted spans. In this corpus a quoted phrase is either a
+    # verbatim quote from a source comment or a colloquialism, and
+    # neither should pick up a definition link. This is what caught
+    # `a "drop zone"` in README_internals.md, where "zone" is ordinary
+    # English and not the UMA term — the one homograph false positive
+    # in the whole corpus.
+    for m in re.finditer(r"\"[^\"\n]{1,200}\"", masked):
+        skip_spans.append((m.start(), m.end()))
+
+    def _skip(pos: int, end: int) -> bool:
+        for s, e in skip_spans:
+            if s <= pos < e or s < end <= e:
+                return True
+        return False
+
+    # Longest term first: linking "page fault" must win over "page" when
+    # both are defined, otherwise the shorter match eats the longer one.
+    ordered = sorted(targets, key=len, reverse=True)
+
+    linked = 0
+    # Track regions we have already rewritten so a shorter term cannot
+    # match inside a link we just inserted.
+    consumed: List[Tuple[int, int]] = []
+
+    def _consumed(pos: int, end: int) -> bool:
+        for s, e in consumed:
+            if s <= pos < e or s < end <= e:
+                return True
+        return False
+
+    for term in ordered:
+        # Case-insensitive for multi-word/lowercase terms, case-sensitive
+        # for short all-caps ones (KVM, UMA, DMA) so "uma" inside an
+        # identifier fragment does not match. Same rule as _term_pattern.
+        flags = 0 if (term.isupper() and len(term) <= 5) else re.IGNORECASE
+        pat = re.compile(rf"\b{re.escape(term)}\b", flags)
+
+        # Idempotency guard. "Link the first prose use" is not the same
+        # rule as "link the first UNLINKED use": on a second pass the
+        # already-linked first use is skipped as inside-a-link, and
+        # without this the loop would happily link the *next* mention,
+        # accumulating one more link per run.
+        #
+        # Keyed on the term text, not on the target: every term in a
+        # chapter now shares one target (`#glossary`), so a target-only
+        # check would see the first term's link and skip all the others.
+        if re.search(
+            rf"\[{pat.pattern}\]\({re.escape(targets[term])}\)",
+            masked, flags,
+        ):
+            continue
+
+        for m in pat.finditer(masked):
+            if _skip(m.start(), m.end()) or _consumed(m.start(), m.end()):
+                continue
+            # Rewrite this one occurrence and stop scanning this term.
+            replacement = f"[{m.group(0)}]({targets[term]})"
+            masked = masked[:m.start()] + replacement + masked[m.end():]
+            delta = len(replacement) - (m.end() - m.start())
+            # Shift previously recorded spans that sit after the edit.
+            skip_spans = [
+                (s + delta if s >= m.end() else s,
+                 e + delta if e >= m.end() else e)
+                for s, e in skip_spans
+            ]
+            consumed = [
+                (s + delta if s >= m.end() else s,
+                 e + delta if e >= m.end() else e)
+                for s, e in consumed
+            ]
+            consumed.append((m.start(), m.start() + len(replacement)))
+            skip_spans.append((m.start(), m.start() + len(replacement)))
+            linked += 1
+            break
+
+    def _restore(m: "re.Match") -> str:
+        return fences[int(m.group(1))]
+    new_content = re.sub(r"\x00FENCE(\d+)\x00", _restore, masked)
     return new_content, linked
 
 
@@ -8171,6 +8448,35 @@ def build_navigation(chapters: List[dict]) -> dict:
 
     updated = {}
 
+    # Pre-pass: collect every term defined in any chapter's Glossary, so
+    # the first-use linker can point a term at whichever chapter actually
+    # defines it. Must run before the rewrite loop — a chapter processed
+    # early otherwise cannot link to a definition in a chapter processed
+    # later.
+    #
+    # First definition wins on collision. Chapters are processed in
+    # chapters.yaml order, so the winner is stable across runs rather
+    # than depending on directory-walk order; two chapters defining the
+    # same term is itself a content smell worth seeing in the count.
+    glossary_index: Dict[str, Tuple[str, str]] = {}
+    for ch in chapters:
+        gf = ch.get("output_file", "README.md")
+        gp = os.path.join(SRC_ROOT, gf)
+        if not os.path.exists(gp):
+            continue
+        try:
+            with open(gp, errors="replace") as f:
+                gtext = f.read()
+        except OSError:
+            continue
+        for gterm, ganchor in _parse_glossary_entries(gtext).items():
+            glossary_index.setdefault(gterm, (gf, ganchor))
+    if glossary_index:
+        print(
+            f"  [links] glossary index: {len(glossary_index)} term(s) "
+            f"across all chapters"
+        )
+
     for ch in chapters:
         output_file = ch.get("output_file", "README.md")
         output_path = os.path.join(SRC_ROOT, output_file)
@@ -8314,6 +8620,19 @@ def build_navigation(chapters: List[dict]) -> dict:
             print(
                 f"  [links] {output_file}: linked {_man_linked} "
                 f"man-page reference(s)"
+            )
+
+        # Link the first prose use of each glossary term to its
+        # definition — in-chapter (`#anchor`) when this chapter defines
+        # it, cross-chapter otherwise. Runs last of the four linkers so
+        # it sees, and skips, every link the earlier three inserted.
+        content, _gloss_linked = _link_glossary_first_use(
+            content, output_file, glossary_index,
+        )
+        if _gloss_linked:
+            print(
+                f"  [links] {output_file}: linked {_gloss_linked} "
+                f"glossary first-use(s)"
             )
 
         updated[output_file] = content

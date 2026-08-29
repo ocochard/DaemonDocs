@@ -125,7 +125,7 @@ test that asserts the real ch12 text still flags `KVM` (the case the loose
 cue regex missed) and one asserting readability findings stay out of
 `total_issues`.
 
-#### Step 2 — make Glossary a default section, and link terms to it [OPEN]
+#### Step 2 — make Glossary a default section, and link terms to it [SHIPPED 2026-08-29]
 
 Add `Glossary` to `_DEFAULT_SECTIONS`, positioned immediately after
 `Quick Summary`. The catalog comment already warns that defining terms
@@ -153,6 +153,48 @@ linker.
 Cost: one extra section per chapter, and the benefit only materialises on
 a full regeneration — so it lands with the next full run, not
 retroactively.
+
+**What shipped**, and three ways it differs from the spec above:
+
+- `Glossary` is `_DEFAULT_SECTIONS[1]`, right after `Quick Summary`.
+  Default chapters go from 7 H2 sections to 8; the reviewer's Structure
+  criterion already interpolates `{section_count}` from the list, so no
+  rubric text was hard-coded and none needed changing.
+- `_link_glossary_first_use` is the fourth phase-4 linker, plus
+  `_parse_glossary_entries` / `_find_glossary_span` /
+  `_GLOSSARY_ANCHOR`. A pre-pass over all chapters builds the
+  cross-chapter term index before the rewrite loop, so a chapter
+  processed early can still link to a definition in one processed late.
+  Tests in `tests/test_glossary_linker.py`.
+
+1. **Per-term anchors do not exist.** The spec's two bullets contradicted
+   each other — `#glossary` for in-chapter, `#kvm` for cross-chapter —
+   and the `#kvm` form is the wrong one. GitHub mints anchors for
+   *headings* only; a glossary term is a bolded list item, so `#slab`
+   matches nothing and the reader lands at the top of the file with no
+   error anywhere. The first implementation emitted per-term anchors and
+   a corpus dry run showed all of them dead. Everything now targets the
+   Glossary section. Pinned by test 9, which asserts every emitted
+   anchor matches a real heading in the target file.
+2. **Two skips the spec did not list**, both found by dry-running phase 4
+   over the real corpus rather than by reasoning about inputs: `See Also`
+   (already a link list owned by three other linkers — an inline link
+   inside an existing bullet is noise) and double-quoted spans (`a "drop
+   zone"` in `README_internals.md` is ordinary English, not the UMA
+   term; it was the corpus's one homograph false positive). Together
+   these removed 4 of 15 links from the dry run.
+3. **Idempotency needs a term-keyed guard.** "Link the first prose use"
+   is not "link the first *unlinked* use": on a second pass the existing
+   link is skipped as inside-a-link and the loop links the next mention
+   instead, accumulating one link per run. The guard keys on the term,
+   not the target, because every term in a chapter now shares the single
+   `#glossary` target.
+
+Dry run over the 149-README corpus: 11 links across 7 chapters, every
+one resolving to a file that has a `## Glossary`, byte-identical on a
+second pass. That number is low only because 1 of 40 chapters has a
+Glossary today — the linker's yield scales with the next full
+regeneration, exactly as predicted above.
 
 #### Step 3 — broaden criterion 8 and split its verdict [OPEN]
 
