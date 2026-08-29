@@ -6717,11 +6717,18 @@ _JARGON_TERMS: Tuple[str, ...] = (
     # `zone` alone is dropped: it collides with UMA zones, jail zones and
     # DNS zones. `UMA zone` as a phrase is covered by `UMA` + `keg`.
     "UMA", "slab", "keg", "M_NOWAIT", "M_WAITOK", "malloc type",
-    # Synchronization
+    # Synchronization. The LK_* pair is here for the same reason as
+    # M_NOWAIT/M_WAITOK above: a reader meeting one of two mutually
+    # exclusive modes needs to know the other exists to understand why
+    # the choice is being made at all.
     "turnstile", "witness", "epoch", "read-mostly lock", "lock order",
     "priority propagation", "memory barrier", "atomic",
-    # I/O and storage
-    "bio", "DMA", "MAXPHYS", "unmapped I/O", "strategy routine",
+    "LK_EXCLUSIVE", "LK_SHARED",
+    # I/O and storage. `BIO_UNMAPPED` is the flag spelling of
+    # `unmapped I/O`; ch12 used it five times without ever glossing it,
+    # which is the defect that motivated adding it.
+    "bio", "DMA", "MAXPHYS", "unmapped I/O", "BIO_UNMAPPED",
+    "strategy routine",
     "scatter-gather", "bounce buffer", "write-back", "write-through",
     # VFS
     # `vfs` alone is dropped: it matches the subsystem name in ordinary
