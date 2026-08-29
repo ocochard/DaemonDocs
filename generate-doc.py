@@ -4281,10 +4281,28 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
             issues = review_json.get("issues", []) or []
             praise = review_json.get("praise", []) or []
             criteria = review_json.get("criteria", {}) or {}
+            # Only populated when DAEMONDOCS_RATIONALE_ENUM=1. Read with a
+            # tolerant .get so a control-arm review (no such key) and a
+            # treatment-arm review that returned a non-list both degrade to
+            # []. Deliberately NOT fed into the approval gate,
+            # `_criteria_fail_count`, or `total_issues`: the gate must stay
+            # criteria-driven, `best_fails` must stay comparable across arms,
+            # and the fact-fix loop excludes model-generated readability
+            # findings. This exists purely so the A/B has a per-round scalar
+            # in the runner logs — review JSON is never persisted, so without
+            # it there is nothing to measure afterwards.
+            rationale_missing = review_json.get("rationale_missing", []) or []
+            if not isinstance(rationale_missing, list):
+                rationale_missing = []
 
             fail_count = _criteria_fail_count(criteria)
+            # Suffix is absent when the list is empty, so control-arm logs
+            # stay byte-identical to what they were before step 3.
+            rat = (f"  rationale_missing={len(rationale_missing)}"
+                   if rationale_missing else "")
             print(f"         grade={grade}  "
-                  f"({_N_CRITERIA - fail_count}/{_N_CRITERIA} criteria pass)")
+                  f"({_N_CRITERIA - fail_count}/{_N_CRITERIA} criteria pass)"
+                  f"{rat}")
             # Print every issue and every praise — truncating these hides
             # the diagnostic information needed to figure out why the
             # reviewer didn't approve. The log is verbose by design.
