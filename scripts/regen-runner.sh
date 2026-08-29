@@ -3,7 +3,8 @@
 #
 # Usage: runner.sh LABEL OPENAI_BASE_URL [REVIEWER_THINKING]
 #   LABEL — short tag for the log files (e.g. fw, fw2)
-#   OPENAI_BASE_URL — http://192.168.100.7:8080/v1, http://192.168.100.8:8080/v1
+#   OPENAI_BASE_URL — full URL of a llama-server, e.g. http://HOST:8080/v1
+#     (public repo: the real LAN addresses are not recorded here)
 #   REVIEWER_THINKING — 1 (default) or 0, controls the REVIEWER only.
 #     Running the two endpoints with opposite values against the shared
 #     queue is a live A/B: chapters land in one arm or the other by

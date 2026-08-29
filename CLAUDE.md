@@ -16,8 +16,13 @@ tried and broke specific things; the post-mortems are there.
 are remote llama-servers — used purely as compute, no repo / source
 tree / script there:
 
-- `framework`  → `http://192.168.100.7:8080/v1`
-- `framework2` → `http://192.168.100.8:8080/v1`
+- `framework`  → `$FW_URL`
+- `framework2` → `$FW2_URL`
+
+This is a public repo, so the LAN addresses are not written down here.
+They are in the operator's global `~/.claude/CLAUDE.md` under "Host →
+LAN endpoints"; substitute from there, or read them off a running
+job with `pgrep -lf runner.sh`.
 
 Set `OPENAI_BASE_URL` to one of those and `OPENAI_MODEL=Qwen3.8-27B-UD-Q8_K_XL`
 (the current model served at both, as of 2026-08-22 — verify with

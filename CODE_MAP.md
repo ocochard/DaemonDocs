@@ -328,8 +328,11 @@ on the LAN, reached purely via `OPENAI_BASE_URL` — they do NOT have
 the repo, the source tree, or a copy of the script. Do not SSH into
 them to launch jobs. Current endpoints:
 
-- `framework`  → `http://192.168.100.7:8080/v1`
-- `framework2` → `http://192.168.100.8:8080/v1`
+- `framework`  → `$FW_URL`
+- `framework2` → `$FW2_URL`
+
+The actual LAN addresses are deliberately not in this public repo —
+see the note in `CLAUDE.md` for where they live.
 
 Parallelism is N `generate-doc.py` processes on `bigone`, each
 pointed at a different `OPENAI_BASE_URL`. The script itself only

@@ -251,8 +251,8 @@ that completed; treat the run as a snapshot, not a corpus.
 
 | Endpoint | Hardware | OS | Backend | Driver |
 |---|---|---|---|---|
-| **fw** (192.168.100.7:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 128 GB | FreeBSD 16.0-CURRENT | Vulkan (`--device Vulkan0`) | Mesa RADV 24.1.7 |
-| **fw2** (192.168.100.136:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 122 GB | Ubuntu 24.04 / Linux 6.17.0-22-generic | Vulkan (`--device Vulkan0`) | Mesa RADV 25.2.8 |
+| **fw** (FreeBSD host) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 128 GB | FreeBSD 16.0-CURRENT | Vulkan (`--device Vulkan0`) | Mesa RADV 24.1.7 |
+| **fw2** (Linux host) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 122 GB | Ubuntu 24.04 / Linux 6.17.0-22-generic | Vulkan (`--device Vulkan0`) | Mesa RADV 25.2.8 |
 
 Same physical hardware as run1's fw1/fw2 — relabeled `fw`/`fw2` to
 match the current endpoint names (`framework`, `framework2`).
@@ -417,8 +417,8 @@ the regex/strptime accordingly.
 
 | Endpoint | Hardware | OS | Backend | Driver |
 |---|---|---|---|---|
-| **fw** (192.168.100.7:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 128 GB | FreeBSD 16.0-CURRENT | Vulkan (`--device Vulkan0`) | Mesa RADV 24.1.7 |
-| **fw2** (192.168.100.136:8080) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 122 GB | Ubuntu 24.04 / Linux 6.17.0-22-generic | Vulkan (`--device Vulkan0`) | Mesa RADV 25.2.8 |
+| **fw** (FreeBSD host) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 128 GB | FreeBSD 16.0-CURRENT | Vulkan (`--device Vulkan0`) | Mesa RADV 24.1.7 |
+| **fw2** (Linux host) | AMD Ryzen AI Max+ 395 (32 cores) + Radeon 8060S iGPU, 122 GB | Ubuntu 24.04 / Linux 6.17.0-22-generic | Vulkan (`--device Vulkan0`) | Mesa RADV 25.2.8 |
 
 Same physical hardware as run1/run2 — no change.
 
