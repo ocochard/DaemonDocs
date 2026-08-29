@@ -412,6 +412,22 @@ WRITER_THINKING = os.environ.get("DAEMONDOCS_WRITER_THINKING", "1") != "0"
 # instead of an assumption. Set DAEMONDOCS_REVIEWER_THINKING=0 to disable.
 REVIEWER_THINKING = os.environ.get("DAEMONDOCS_REVIEWER_THINKING", "1") != "0"
 
+# Whether criterion 8 ("Rationale") also covers flags and modes, and whether
+# the reviewer must ENUMERATE every unexplained mechanism in a top-level
+# `rationale_missing` list instead of collapsing the finding into one verdict.
+#
+# Defaults OFF, inverting the convention of the two flags above. Those default
+# ON because their arms were measured; this one has not been. It is a prompt
+# edit, and FUTURE_IMPROVEMENTS.md is largely a record of prompt edits that
+# broke something else — the risk here is revision-round inflation, since
+# "do not stop at three" removes the reviewer's stopping point and every
+# entry becomes a writer instruction. So it ships inert and waits for an A/B
+# on a fixed chapter set. Set DAEMONDOCS_RATIONALE_ENUM=1 to enable.
+#
+# `== "1"` and not `!= "0"`: with a "0" default, an empty export
+# (DAEMONDOCS_RATIONALE_ENUM=) would read as ON under the other idiom.
+RATIONALE_ENUM = os.environ.get("DAEMONDOCS_RATIONALE_ENUM", "0") == "1"
+
 # Resolved at startup by resolve_model_provenance(); cached for the run.
 RESOLVED_PROVENANCE: Optional[Dict[str, str]] = None
 
@@ -3231,6 +3247,41 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
         )
         mermaid_json_line = '            "mermaid_diagram": "PASS: not required",\n'
 
+    # Step 3 of the glossary roadmap, gated behind DAEMONDOCS_RATIONALE_ENUM
+    # (default OFF — see the flag's comment for why). Both halves are keyed
+    # off the one flag so an arm can never be half-applied: asking for the
+    # enumeration without widening the criterion, or widening the criterion
+    # with nowhere to record the findings, would both measure the wrong
+    # thing. Same pre-built-string shape as the mermaid pair above, and for
+    # the same reason: `dedent` runs BEFORE interpolation, so these strings
+    # carry their own indentation and must not be re-indented here.
+    if RATIONALE_ENUM:
+        rationale_criterion = (
+            " This applies equally to FLAGS and MODES,\n"
+            "           not just data structures: when a draft names one of a pair of\n"
+            "           mutually exclusive choices (`BIO_UNMAPPED` vs mapped I/O,\n"
+            "           `M_NOWAIT` vs `M_WAITOK`, `LK_EXCLUSIVE` vs `LK_SHARED`), the\n"
+            "           reader needs to know why a caller would pick one over the\n"
+            "           other, not merely that the flag exists."
+        )
+        rationale_json_line = (
+            '          "rationale_missing": [\n'
+            '            "Mechanism or flag named in the draft with no rationale given"\n'
+            '          ],\n'
+        )
+        rationale_rule = (
+            "          - `rationale_missing` MUST list EVERY mechanism, flag or mode the\n"
+            "            draft names without explaining why it exists — one entry each,\n"
+            "            naming the mechanism. Enumerate the whole draft BEFORE grading\n"
+            "            criterion 8; do not stop at three. The list is empty if and only\n"
+            "            if `rationale` starts with \"PASS\". If the list is non-empty,\n"
+            "            `rationale` MUST start with \"FAIL\".\n"
+        )
+    else:
+        rationale_criterion = ""
+        rationale_json_line = ""
+        rationale_rule = ""
+
     return textwrap.dedent(f"""\
         You are reviewing a draft chapter for "FreeBSD Internals."
         Your job is to find problems — be strict but fair.
@@ -3325,7 +3376,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
            kegs vs zones, copy-on-write, slab caches, witness, turnstiles,
            NUMA domains, pagedaemon thresholds, etc.), does it explain
            WHY the design exists — what engineering problem it solves —
-           and not just what it looks like? PASS if every non-obvious
+           and not just what it looks like?{rationale_criterion} PASS if every non-obvious
            mechanism gets at least one sentence of rationale on its first
            introduction. FAIL if a major mechanism is described purely
            structurally ("X is a linked list of Y") with no reason for
@@ -3355,7 +3406,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
             "no_marketing": "PASS/FAIL: reason (quote any offending sentences)",
             "rationale": "PASS/FAIL: reason (quote the paragraph if FAIL)"
           }},
-          "issues": [
+{rationale_json_line}          "issues": [
             "Specific issue 1 with actionable fix",
             "Specific issue 2 with actionable fix"
           ],
@@ -3372,7 +3423,7 @@ def build_review_prompt(chapter: dict, draft: str) -> str:
             list nice-to-have refinements in `issues`, but they are
             informational only and will not trigger another revision —
             so reserve them for genuinely worthwhile polish, not nitpicks.
-          - Never mark a criterion PASS while describing a hallucination,
+{rationale_rule}          - Never mark a criterion PASS while describing a hallucination,
             wrong fact, or missing required content — that is what FAIL
             is for. Honest FAIL grades are far more useful than padded
             PASS grades.
