@@ -17,6 +17,81 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-08-30] Struct verifier recognised one of three definition spellings; real structs verified as "missing"
+
+Third instance of the same failure family as the ch34 grep cap and the
+ch40 extractors, found while ch37 was still running. ch37 (TCP) was
+graded **FAIL on Accuracy** for this:
+
+> The draft cites two structs that are on the MISSING list as if they
+> were real FreeBSD entities. (1) `struct in_endpoints` is presented in
+> the Key Data Structures code block as part of the real struct
+> in_conninfo in sys/netinet/in_pcb.h.
+
+`struct in_endpoints` **is** real, exactly where the draft said it was.
+Only the second name in that finding (`struct tcp_stat`, whose real
+spelling is `tcpstat`) was a genuine hallucination — so the reviewer
+was half right and the chapter burned revision rounds on the half that
+was not.
+
+Stage 2 of `_batched_grep_present` filters stage 1's fixed-string hits
+down to definition-shaped lines, so the 1 MB output cap holds
+definitions instead of the forest of pointer-typed uses. Whatever
+stage 2 drops, stage 3 never sees, and the symbol is reported missing.
+The filter was `^struct [A-Za-z_]\w* *\{`. FreeBSD writes struct
+definitions four ways, and that matched one:
+
+| spelling | distinct tags in `sys/` | examples |
+|---|---|---|
+| `struct foo {` | (matched) | most of the tree |
+| `struct<TAB>foo {` | 42 | `arphdr`, `icmpstat`, `ether_arp`, `direct`, `eui64`, `fork_req`, `tcpstat` |
+| indented (nested in a struct/union) | 442 | `in_endpoints` in `in_conninfo`; most `fw_*` / `mt7915_*` driver headers |
+| `typedef struct foo {` | 3735 | `ksiginfo`, `moduledata`, `elf_file`, `if_txrx`, `__sigset` |
+
+**The `\t` trap.** The obvious fix — write `[ \t]` — does not work and
+looks like it does. `shape_grep` is consumed by BSD `grep -E`, where a
+bracket expression does **not** interpret `\t`: `[ \t]` matches a
+space, a backslash, or the letter `t`, never a tab. The pattern must
+carry a literal tab byte. Worse, the failure is invisible to the
+obvious test, because Python's `re` *does* understand `\t` — so a unit
+test over `pattern_template` passes while the pipeline stays broken.
+`tests/test_struct_shape_grep.py` group 1 therefore captures the
+pattern `_verify_structs` actually hands to grep and asserts a real tab
+byte is in it. I hit this trap during the fix: the first patch used
+`[ \t]` inside a raw string, tested green by hand (I typed an actual
+tab at the shell), and left the verifier just as blind.
+
+**Why relaxing the anchor is safe.** Leading whitespace and the
+`typedef` prefix are permitted only on the alternative that ends in
+`{`. A pointer use or parameter declaration never ends in a brace —
+verified over the whole tree — and `typedef struct NAME;` forward
+declarations with a brace do not exist. The K&R alternative
+(`struct foo` at end of line, brace on the next) keeps its `^` anchor
+for precisely this reason: unanchored, an indented `struct thread *td`
+parameter would pass it and the verifier would start rubber-stamping.
+
+**Measured effect.** Across the 55 shipped chapters, 464 struct claims
+now yield 18 reported missing, and spot-checking those 18 found the
+remaining ones to be genuine (`buflists`, `pglist`, `ifnets`,
+`db_command_table`, `sysctl_ctx_list` have no `struct NAME {` anywhere
+— they are field names, list heads and macro artifacts the writer
+described as structs).
+
+**Note on the arithmetic:** the false-positive rate this removes is not
+"3735 + 442 + 42 structs were broken" — it is that *any chapter citing
+a struct in one of those spellings* got a fabricated Accuracy failure.
+ch37 is the observed instance; how many earlier chapters lost rounds to
+it was not measured and is not recoverable from the logs.
+
+**Not fixed:** ch37 itself. Its verdict cache is in-process, so the
+running job kept the poisoned verdicts; the chapter would need a re-run
+to be graded fairly. `_verify_functions` was checked for the same
+blindness and does **not** share it: its shape filter is not anchored
+the same way, and 12 real functions across the tree (`tcp_input`,
+`uma_zalloc`, `m_getm2`, `bus_alloc_resource`, `tcp_newtcpcb`, ...)
+verify while 3 fabricated near-misses are still flagged. Its
+leading-column handling is deliberate per the comment there.
+
 ### [DONE — shipped 2026-08-30] The extractors invented symbol claims, and the reviewer dutifully failed the chapter over them
 
 ch40 (USB/Thunderbolt) shipped UNVERIFIED, scoring 5/8 → 7/8 → 6/8 and

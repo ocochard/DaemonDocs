@@ -203,6 +203,26 @@ pattern.
   ("a `bi_module` structure"). Bare-prose "data structure" / "tree
   structure" is rejected because it lacks the backticks; the
   writer's backticks are the load-bearing signal.
+- **`_verify_structs`' shape filter must match all three definition
+  spellings, and it is a BSD `grep -E` pattern.** Stage 2 of
+  `_batched_grep_present` narrows stage 1's hits to definition-looking
+  lines; anything it drops is invisible to stage 3 and comes back
+  "missing". FreeBSD writes struct definitions three ways, and the
+  original `^struct ` pattern only matched the first: plain
+  (`struct foo {`), tab-separated (`struct\tfoo {`, 42 tags),
+  indented-because-nested (`\tstruct foo {`, 442 tags), and
+  `typedef struct foo {` (3735 tags -- the biggest gap). ch37
+  (2026-08-30) was failed on Accuracy for citing `struct in_endpoints`,
+  which is real. **The tab must be a literal tab character**, not
+  `\t`: a BSD `grep -E` bracket expression does not interpret the
+  escape, so `[ \t]` matches space, backslash or `t` and never a tab
+  -- and a test exercising the pattern through Python's `re` passes
+  while the pipeline stays broken. `tests/test_struct_shape_grep.py`
+  therefore asserts on the pattern the function actually passes to
+  grep. Leading whitespace and the `typedef` prefix are allowed **only
+  on the brace alternative**; the K&R alternative (`struct foo` at
+  end of line) keeps `^` because an indented `struct thread *td`
+  parameter would otherwise verify as a definition.
 - **`struct` is also an English noun, and `_ENGLISH_AFTER_STRUCT`
   is how the extractor tells the two apart.** "The struct above",
   "the on-the-wire struct defines", "a four-struct tree" are prose;

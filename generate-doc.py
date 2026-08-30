@@ -6531,8 +6531,42 @@ def _verify_structs(structs: List[str], src_root: str,
         "struct", structs, src_root,
         pattern_template=r"struct\s+({alt})(?:\s*\{{|\s*$)",
         shape_grep=(
-            r"^struct [A-Za-z_][A-Za-z0-9_]* *\{|"
-            r"^struct [A-Za-z_][A-Za-z0-9_]* *$"
+            # A tab counts as separator too: 42 structs in `sys/` are
+            # written with a tab after `struct` (`arphdr`, `icmpstat`,
+            # `ether_arp`, `direct`, `fork_req`, `in_endpoints`, ...).
+            # A literal space here discarded those definition lines in
+            # stage 2, so `pattern_template`'s tab-tolerant `\s+` never
+            # saw them and the symbol came back missing. ch37 (2026-08-30)
+            # was graded FAIL on Accuracy for citing `struct in_endpoints`
+            # -- which is real, in `sys/netinet/in_pcb.h`. Same failure
+            # family as the ch34 grep cap and the ch40 extractors: the
+            # verifier fabricates the missing-symbol list and the
+            # reviewer correctly fails the chapter over it.
+            #
+            # Leading whitespace is allowed only on the brace
+            # alternative: 442 structs in `sys/` are defined nested
+            # inside another struct or union (`in_endpoints` inside
+            # `in_conninfo`, and most of the `fw_*`/`mt7915_*` driver
+            # headers). The trailing `{` is what makes that safe --
+            # a pointer use or parameter (`\tstruct thread *td`) never
+            # ends in a brace, verified over the whole tree. The K&R
+            # alternative below keeps `^` for exactly that reason: an
+            # indented `struct foo *p` would otherwise pass it.
+            #
+            # `typedef struct NAME {` is the third shape, and the
+            # biggest gap of the three: 3735 distinct tags in `sys/`
+            # are declared that way (`ksiginfo`, `moduledata`,
+            # `elf_file`, `if_txrx`, `__sigset`). Requiring the brace
+            # keeps it safe -- `typedef struct NAME;` forward
+            # declarations do not occur with a brace, and none exist
+            # in the tree at all.
+            #
+            # The brackets hold a LITERAL tab, not `\t`: this is a BSD
+            # `grep -E` pattern (see `_batched_grep_present`), and a
+            # bracket expression there does not interpret `\t` -- it
+            # would match space, backslash or `t` and never a tab.
+            "^[ 	]*(typedef[ 	]+)?struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*\\{|"
+            "^struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*$"
         ),
         extra_search_dirs=extra_search_dirs,
     )
