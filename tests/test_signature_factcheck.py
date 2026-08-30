@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke test for the function-signature fact-check pass.
 
-Run on bigone: `python3 test_signature_factcheck.py`.
+Run: `python3 test_signature_factcheck.py`.
 Imports generate-doc.py via importlib (the hyphen in the filename
 prevents normal `import`). Exits non-zero on any test failure.
 

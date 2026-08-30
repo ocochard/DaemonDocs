@@ -349,7 +349,7 @@ if you add a third corpus writer, it needs the same guard.
 
 ## Execution topology — where the script runs
 
-`generate-doc.py` runs on `bigone` (this host). The repo,
+`generate-doc.py` runs on this host. The repo,
 `$FREEBSD_SRC` (`~/freebsd-src`), `$BOOKS_DIR` (`~/books`), and
 `~/freebsd-doc` all live here. The LLM endpoints are separate hosts
 on the LAN, reached purely via `OPENAI_BASE_URL` — they do NOT have
@@ -362,7 +362,7 @@ them to launch jobs. Current endpoints:
 The actual LAN addresses are deliberately not in this public repo —
 see the note in `CLAUDE.md` for where they live.
 
-Parallelism is N `generate-doc.py` processes on `bigone`, each
+Parallelism is N `generate-doc.py` processes on this host, each
 pointed at a different `OPENAI_BASE_URL`. The script itself only
 cares about the env var.
 

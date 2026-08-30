@@ -722,8 +722,8 @@ ready index once per process; when either is missing it prints a single
 warning and `_verify_sysctls_via_graph` returns `[]` (nothing flagged). A
 host without codebase-memory-mcp runs the full pipeline unchanged, minus
 sysctl checking. This was a hard requirement — the script's execution host
-(`bigone`) has the tree, but a contributor's checkout may not have the
-graph indexed.
+has the tree, but a contributor's checkout may not have the graph
+indexed.
 
 **The false-negative caveat (why "suspect", not "hallucinated"):** ~1/3 of
 `Sysctl` nodes are `resolved:false` — the indexer built the leaf but could

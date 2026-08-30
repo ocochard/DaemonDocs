@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke test for the docs.freebsd.org URL sanitizer.
 
-Run on bigone: `python3 test_doc_url_sanitizer.py`.
+Run: `python3 test_doc_url_sanitizer.py`.
 Exits non-zero on any test failure.
 """
 import importlib.util

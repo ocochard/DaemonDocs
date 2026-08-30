@@ -11,13 +11,18 @@ fewest errors possible.** Bias every change toward correctness over throughput.
 
 ## Execution layout
 
-- Repo lives at `/usr/home/olivier/DaemonDocs/` (development).
-- Heavy runs happen on host `framework` (`ssh framework`, `scp` for sync — no rsync).
-  This host has the FreeBSD source tree at `~/freebsd-src/`, books at `~/books/`,
-  the index at `~/DaemonDocs/.index/`, and the llama-server log at
-  `/tmp/llama-server.log`. Never name `framework` in any generated documentation.
-- Workflow when iterating: edit locally → `scp generate-doc.py framework:DaemonDocs/`
-  → `ssh framework "cd DaemonDocs && python3 generate-doc.py --chapter N [--force]"`.
+- Repo lives at `/usr/home/olivier/DaemonDocs/` (development), on the
+  same host the script runs from. That host also has the FreeBSD source
+  tree at `~/freebsd-src/`, books at `~/books/`, and the index at
+  `.index/`.
+- `framework` and `framework2` are **llama-server endpoints, not
+  execution hosts.** They have no repo, no source tree and no copy of
+  the script; they are reached only via `OPENAI_BASE_URL`. Do not SSH
+  into them to launch jobs. See CODE_MAP.md "Execution topology."
+- Workflow when iterating: edit locally, run locally with
+  `OPENAI_BASE_URL` pointed at an endpoint —
+  `OPENAI_BASE_URL=<endpoint> OPENAI_MODEL=<alias> python3 generate-doc.py --chapter N [--force]`.
+- Never name the endpoints in any generated documentation.
 
 ## Pipeline shape
 
@@ -235,12 +240,12 @@ truncated file that crashes the next run before it can self-repair.
 
 ## Checking changes end-to-end
 
-For non-trivial changes to `generate-doc.py`, run a single chapter on framework
-before declaring done:
+For non-trivial changes to `generate-doc.py`, run a single chapter
+end-to-end before declaring done:
 
 ```
-scp generate-doc.py framework:DaemonDocs/
-ssh framework "cd DaemonDocs && python3 generate-doc.py --chapter 1 --force"
+OPENAI_BASE_URL=<endpoint>/v1 OPENAI_MODEL=<alias> \
+    python3 generate-doc.py --chapter 1 --force
 ```
 
 Watch for: `hit max_steps` warnings, `UNVERIFIED DRAFT` annotations,

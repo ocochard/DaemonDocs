@@ -14,7 +14,7 @@ Two test tiers:
      index for FREEBSD_SRC. Auto-SKIPPED (not failed) when the graph is
      unavailable, mirroring the pipeline's graceful-degradation contract.
 
-Run on bigone (the host with ~/freebsd-src and the index):
+Run on the host with ~/freebsd-src and the index:
     python3 test_sysctl_factcheck.py
 
 Exits non-zero on any real test failure; skips are not failures.

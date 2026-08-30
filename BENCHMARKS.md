@@ -230,7 +230,7 @@ endpoint is 2× slower than the others.)
 - Same 25 chapters in `chapters.yaml` as run1.
 - Topology change: dropped the `mac` endpoint; both runners now
   drive the AMD Vulkan endpoints (fw, fw2). The script runs from
-  `bigone` and talks to remote llama-servers via OpenAI API —
+  the local host and talks to remote llama-servers via OpenAI API —
   see CLAUDE.md / CODE_MAP.md "Execution topology."
 
 **This run was interrupted at 13/22 attempted chapters** to apply
@@ -564,10 +564,10 @@ of `daemon_init()` shape.
 
 ### Reproduction
 
-Logs live on `bigone` at `/tmp/regen-queue/{fw,fw2}.log` (runner
-outer log) and `/tmp/regen-queue/{fw,fw2}-ch{N}.log` (per-chapter
-output capture). Parse with the run1 script, but note that the
-runner-log timestamp format is now ISO with a Z suffix:
+Logs live on the script host at `/tmp/regen-queue/{fw,fw2}.log`
+(runner outer log) and `/tmp/regen-queue/{fw,fw2}-ch{N}.log`
+(per-chapter output capture). Parse with the run1 script, but note
+that the runner-log timestamp format is now ISO with a Z suffix:
 
 ```
 [fw 2026-05-03T09:35:48Z] starting chapter 10

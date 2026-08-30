@@ -11,7 +11,7 @@ prompt, run_chapter ordering, fact-check), also read the
 `FUTURE_IMPROVEMENTS.md`. Several "obvious" changes have been
 tried and broke specific things; the post-mortems are there.
 
-**Execution:** the script runs from this host (`bigone`). The repo,
+**Execution:** the script runs from this host. The repo,
 `~/freebsd-src`, `~/freebsd-doc`, and `~/books` all live here. LLMs
 are remote llama-servers — used purely as compute, no repo / source
 tree / script there:
