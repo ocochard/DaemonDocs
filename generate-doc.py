@@ -5742,6 +5742,26 @@ _FACT_CHECK_IGNORE = frozenset({
     "TDP_NOFAULTING",
     # Generic kernel sysctls / runtime knobs commonly referenced
     "bootverbose", "kdb", "ddb",
+    # C keywords and builtin type names. The writer writes `int(...)`
+    # casts, `sizeof(x)`, `return (0)` and fenced snippets whose
+    # declarations the fenced-def extractor reads as definitions, so
+    # these arrive as "claimed functions". They are not merely noise:
+    # `int` matches ~4.2 MB of stage-2 grep output on `sys/` by itself
+    # (87% of a 20-symbol batch), which used to evict every real
+    # symbol's definition under the output cap in
+    # `_batched_grep_present` and get the whole batch reported as
+    # hallucinated. ch34 (KDB/DDB, 2026-08-29) shipped UNVERIFIED with
+    # 15 real `sys/ddb/` functions falsely listed as NOT FOUND for
+    # this reason.
+    "int", "char", "long", "short", "float", "double", "void",
+    "signed", "unsigned", "const", "volatile", "static", "extern",
+    "inline", "register", "auto", "typedef", "enum", "union",
+    "sizeof", "return", "if", "else", "for", "while", "do", "switch",
+    "case", "default", "break", "continue", "goto", "bool",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "int8_t", "int16_t", "int32_t", "int64_t", "size_t", "ssize_t",
+    "uintptr_t", "intptr_t", "off_t", "u_int", "u_long", "u_char",
+    "u_short",
     # Linux/macOS structs and funcs the writer occasionally mentions in
     # passing prose (e.g. a one-line analogy in Architecture or Advanced
     # Notes). They don't exist in the FreeBSD tree, but flagging them as
@@ -5812,6 +5832,19 @@ def _filter_known_noise(names: List[str]) -> List[str]:
             continue
         # Well-known C macro families (SI_SUB_*, SDT_PROBE_*, TAILQ_*, etc.)
         if _MACRO_PREFIX_RE.match(n):
+            continue
+        # Names too short to be a real kernel symbol. A 1-2 char
+        # candidate is always a loop variable, a cast, or a single
+        # letter the writer back-ticked (`O` from `-O2`, `x` from an
+        # example). Grepping them is worse than useless: short names
+        # match enormous numbers of lines and crowd out real symbols
+        # under the output cap in `_batched_grep_present`. Two real
+        # 2-char definitions do exist (`tv()` in contrib/libsodium
+        # tests, `up()` in contrib/vchiq) — both vendored, neither
+        # something a chapter would teach — so the cost of this cut is
+        # negligible against the benefit. Verified 2026-08-29 by
+        # grepping `^[a-z_]{1,2}\(` across `sys/`.
+        if len(n) <= 2:
             continue
         out.append(n)
     return out
@@ -6078,6 +6111,21 @@ _FACT_CHECK_CACHE: Dict[Tuple[str, str, str], bool] = {}
 # treated as unverified, which cascades into reviewer accuracy:FAIL.
 _GREP_TIMEOUT_SEC = 30
 
+# Stage-2 output caps, in bytes. They bound memory for a grep over the
+# whole tree. These are real ceilings, not safety margins: a 20-symbol
+# batch containing one high-frequency name (`int`) produces ~5 MB. So
+# hitting one is treated exactly like a timeout — the reader returns
+# None and the verdict is never cached. Raising them trades memory for
+# fewer verification chunks.
+_GREP_OUTPUT_CAP_BYTES = 1048576
+_GREP_OUTPUT_CAP_SMALL_BYTES = 524288
+
+# Symbols per grep in `_verify_with_cache`. Not a memory knob — the caps
+# above are. This bounds how many innocent symbols share a grep with a
+# pathological one, so a cap hit costs one chunk's retry instead of the
+# whole draft's verification.
+_VERIFY_CHUNK_SIZE = 30
+
 # Corpus-level grep-output cache for the small, near-static macro corpora
 # (kernel-config options, SDT probes). Unlike the per-symbol
 # `_FACT_CHECK_CACHE`, these checks match every candidate against the SAME
@@ -6088,14 +6136,20 @@ _GREP_TIMEOUT_SEC = 30
 _GREP_CORPUS_CACHE: Dict[str, str] = {}
 
 
-def _cached_grep_corpus(cache_key: str, cmd: str) -> Optional[str]:
+def _cached_grep_corpus(cache_key: str, cmd: str,
+                        output_cap: int = _GREP_OUTPUT_CAP_BYTES
+                        ) -> Optional[str]:
     """Run `cmd` once per `cache_key`, caching stdout for the run.
 
-    Returns the captured stdout, or `None` on timeout. `None` is NOT
-    cached: the timeout is transient, so the next round retries. This is
-    the fail-closed policy shared with `_batched_grep_present` — a caller
-    that gets `None` must flag every candidate as unverified rather than
-    silently approving it.
+    Returns the captured stdout, or `None` on timeout **or when the
+    output hit `output_cap`**. `None` is NOT cached: both conditions are
+    transient (a later round may batch differently), so the next round
+    retries. This is the fail-closed policy shared with
+    `_batched_grep_present` — a caller that gets `None` must flag every
+    candidate as unverified rather than silently approving it.
+
+    `output_cap` must match the `head -c` value in `cmd`; a mismatch
+    either never trips or trips on every call.
     """
     if cache_key in _GREP_CORPUS_CACHE:
         return _GREP_CORPUS_CACHE[cache_key]
@@ -6107,6 +6161,15 @@ def _cached_grep_corpus(cache_key: str, cmd: str) -> Optional[str]:
     except subprocess.TimeoutExpired:
         print(f"  ⚠ fact-check grep timed out after {_GREP_TIMEOUT_SEC}s "
               f"({cache_key}) — treating candidates as unverified")
+        return None
+    # Same fail-closed rule as the timeout above and as
+    # `_batched_grep_present`: a `head -c` cut is silent, so a truncated
+    # corpus would be cached and every symbol past the cut reported
+    # missing for the rest of the run. Callers already handle None.
+    if len(result.stdout) >= output_cap:
+        print(f"  ⚠ fact-check grep hit the output cap "
+              f"({len(result.stdout)} B, {cache_key}) — "
+              f"treating candidates as unverified")
         return None
     _GREP_CORPUS_CACHE[cache_key] = result.stdout
     return result.stdout
@@ -6164,7 +6227,7 @@ def _batched_grep_present(symbols: List[str], pattern_template: str,
         f"grep -rhwF --include='*.c' --include='*.h' {fixed_args} "
         f"{roots_arg} 2>/dev/null | "
         f"grep -E {shlex.quote(shape_grep)} | "
-        f"head -c 1048576"
+        f"head -c {_GREP_OUTPUT_CAP_BYTES}"
     )
     try:
         # `errors='replace'` is load-bearing: FreeBSD source contains a
@@ -6194,6 +6257,29 @@ def _batched_grep_present(symbols: List[str], pattern_template: str,
         return None
 
     output = result.stdout
+
+    # Truncation is fail-closed, exactly like a timeout. `head -c` cuts
+    # mid-stream with no error, so a truncated read looks like a normal
+    # short result: stage 3 finds no definition for the symbols whose
+    # matches fell past the cut, and the caller caches `False` for every
+    # one of them. That is strictly worse than the timeout it mirrors,
+    # because the wrong verdict then persists for the rest of the run.
+    # Returning None keeps it out of `_FACT_CHECK_CACHE` and out of the
+    # reviewer's "Missing functions" block.
+    #
+    # ch34 (KDB/DDB, 2026-08-29): a candidate list containing `int` blew
+    # the cap, 15 real `sys/ddb/` functions were reported NOT FOUND, the
+    # reviewer FAILed Accuracy on all three rounds, and the chapter
+    # shipped UNVERIFIED after ~7h. Silent truncation was the whole
+    # cause. Compare the writer-token cap, which has printed a warning
+    # on `finish_reason: length` since 2026-05 for the same reason:
+    # truncation is reported, not silent.
+    if len(output) >= _GREP_OUTPUT_CAP_BYTES:
+        print(f"  ⚠ fact-check grep hit the output cap "
+              f"({len(output)} B, {len(symbols)} symbol(s)) — "
+              f"treating as unverified")
+        return None
+
     if not output:
         return set()
 
@@ -6269,22 +6355,52 @@ def _verify_with_cache(kind: str, symbols: List[str], src_root: str,
             continue
         uncached.append(s)
 
-    if uncached:
+    # Verify in chunks rather than one grep for the whole draft. One
+    # high-frequency candidate is enough to blow the output cap, and
+    # before chunking that took the *whole* batch down with it: every
+    # symbol in it came back unverified and the reviewer was handed a
+    # fabricated "Missing functions" list (ch34, 2026-08-29). Chunking
+    # bounds the blast radius to one chunk, and a chunk that trips the
+    # cap is retried symbol-by-symbol so the innocent symbols still get
+    # a real verdict. Sized from measurement: a clean 30-symbol batch
+    # produces well under 1 MB, while batches containing a name like
+    # `int` produce ~5 MB regardless of size — so the retry, not the
+    # chunk size, is what actually saves those.
+    for i in range(0, len(uncached), _VERIFY_CHUNK_SIZE):
+        chunk = uncached[i:i + _VERIFY_CHUNK_SIZE]
         present = _batched_grep_present(
-            uncached, pattern_template, search_roots, shape_grep,
+            chunk, pattern_template, search_roots, shape_grep,
         )
-        if present is None:
-            # Grep timed out. Fail closed — flag every uncached symbol as
-            # not-found this round — but do NOT cache the verdict: the
-            # timeout is transient and caching `False` would keep these
-            # symbols flagged for every later round in the run.
-            not_found.extend(uncached)
-        else:
-            for s in uncached:
-                present_now = s in present
-                _FACT_CHECK_CACHE[(kind, cache_root, s)] = present_now
+        if present is None and len(chunk) > 1:
+            # Cap or timeout on a multi-symbol chunk. Re-run each symbol
+            # alone: whichever one is pathological trips only its own
+            # grep, and the rest get cached verdicts as usual.
+            for sym in chunk:
+                one = _batched_grep_present(
+                    [sym], pattern_template, search_roots, shape_grep,
+                )
+                if one is None:
+                    # Still unverifiable alone. Fail closed WITHOUT
+                    # caching, so a later round can retry.
+                    not_found.append(sym)
+                    continue
+                present_now = sym in one
+                _FACT_CHECK_CACHE[(kind, cache_root, sym)] = present_now
                 if not present_now:
-                    not_found.append(s)
+                    not_found.append(sym)
+            continue
+        if present is None:
+            # Single-symbol chunk that timed out or blew the cap. Fail
+            # closed — flag it this round — but do NOT cache the verdict:
+            # both conditions are transient and caching `False` would
+            # keep the symbol flagged for every later round in the run.
+            not_found.extend(chunk)
+            continue
+        for sym in chunk:
+            present_now = sym in present
+            _FACT_CHECK_CACHE[(kind, cache_root, sym)] = present_now
+            if not present_now:
+                not_found.append(sym)
 
     return not_found
 
@@ -6454,9 +6570,11 @@ def _verify_kernel_options(options: List[str], src_root: str) -> List[str]:
         f"grep -rh "
         f"--include='options' --include='options.*' --include='NOTES' "
         f"-E '[A-Z][A-Z0-9_]{{3,}}' {shlex.quote(sys_conf)}/ 2>/dev/null | "
-        f"head -c 524288"
+        f"head -c {_GREP_OUTPUT_CAP_SMALL_BYTES}"
     )
-    output = _cached_grep_corpus(f"kernopt::{sys_conf}", cmd)
+    output = _cached_grep_corpus(
+        f"kernopt::{sys_conf}", cmd,
+        output_cap=_GREP_OUTPUT_CAP_SMALL_BYTES)
     if output is None:
         # Fail closed: grep timed out, flag all candidates as unverified.
         return list(options)
@@ -6508,7 +6626,7 @@ def _verify_dtrace_probes(probes: List[Tuple[str, str]],
     cmd = (
         f"grep -rhE --include='*.c' --include='*.h' "
         f"'SDT_PROBE_DEFINE[0-9]?\\b' {shlex.quote(sys_root)}/ 2>/dev/null | "
-        f"head -c 1048576"
+        f"head -c {_GREP_OUTPUT_CAP_BYTES}"
     )
     output = _cached_grep_corpus(f"sdtprobe::{sys_root}", cmd)
     if output is None:
