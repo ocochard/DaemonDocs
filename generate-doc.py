@@ -5850,6 +5850,64 @@ def _filter_known_noise(names: List[str]) -> List[str]:
     return out
 
 
+# Words that follow the *English* noun "struct" rather than naming a C
+# type. `struct` is used as a bare noun in ordinary prose ("the struct
+# above", "the struct defines these fields", "a four-struct tree"), and
+# `struct\s+(\w+)` cannot tell that from the C keyword.
+#
+# Deliberately small and closed: every entry is a word observed in a
+# shipped chapter, not a guess at English. A general part-of-speech
+# filter would be the wrong tool — it would also reject real FreeBSD
+# type names, several of which are ordinary words (`struct buf`,
+# `struct file`, `struct proc`, `struct thread`, `struct mount`,
+# `struct link`, `struct name`...). Those must keep verifying, so this
+# list may only contain words that are never FreeBSD struct tags.
+# Check `grep -rw "struct <word> {" ~/freebsd-src/sys` before adding.
+_ENGLISH_AFTER_STRUCT = frozenset({
+    # Positional / referential
+    "above", "below", "here", "there", "this", "that", "these",
+    "those", "it", "its", "itself", "same", "other", "another",
+    # Verbs / participles the noun can govern. `avoids`, `allocated`
+    # and `rather` are not guesses: they are the three residual words
+    # a sweep of all 56 shipped chapters turned up after the first
+    # pass of this list ("one struct avoids repeated mbuf walking",
+    # "a distinct struct allocated by its own t4_sge_alloc_* f...",
+    # "the generated argument struct rather than typed by hand").
+    "defines", "define", "contains", "contain", "holds", "hold",
+    "has", "have", "is", "are", "was", "were", "describes",
+    "describe", "represents", "represent", "stores", "store",
+    "tracks", "track", "carries", "carry", "points", "point",
+    "provides", "provide", "uses", "use", "lives", "live",
+    "avoids", "avoid", "allocated", "allocates", "returns",
+    "returned", "requires", "require", "needs", "need", "makes",
+    "make", "keeps", "keep", "adds", "add", "sets", "set",
+    "gets", "wraps", "wrap", "embeds", "embed", "shares", "share",
+    # Generic nouns in "<N>-struct <noun>" / "struct <noun>" prose
+    "tree", "trees", "layout", "layouts", "member", "members",
+    "field", "fields", "definition", "definitions", "hierarchy",
+    "chain", "chains", "array", "arrays", "table", "tables",
+    "instance", "instances", "pointer", "pointers", "copy",
+    "copies", "size", "sizes", "type", "types", "version",
+    "versions", "family", "families", "pair", "pairs",
+    # Determiners / conjunctions / adverbs
+    "rather", "instead", "also", "only", "just", "still", "always",
+    "never", "often", "simply", "directly", "actually",
+    "and", "or", "but", "with", "without", "for", "from", "into",
+    "per", "via", "plus", "then", "than", "when", "while", "which",
+    "whose", "where", "because", "so", "if", "as", "at", "by", "in",
+    "of", "on", "to",
+})
+
+
+# A man-page section in a `name(N)` citation. Sections are 1-9 with an
+# optional architecture/locale suffix (`ipf(5)`, `pci(4)`, `intro(9)`,
+# and forms like `sysctl(3lua)` / `atomic(9)`), never an expression.
+# Matched against the *inside* of the parens, so a real one-argument
+# call like `free(9)`-vs-`free(mem)` stays distinguishable: only the
+# bare-section form is dropped.
+_MANPAGE_CITATION_RE = re.compile(r'^[1-9][a-z]{0,4}$')
+
+
 def _extract_struct_names(text: str) -> List[str]:
     """Extract claimed struct names from markdown text.
 
@@ -5868,11 +5926,31 @@ def _extract_struct_names(text: str) -> List[str]:
     extractor missed both.
     """
     structs = []
-    # Form 1: `struct NAME`
-    for m in re.finditer(r'\bstruct\s+([a-zA-Z_]\w*)\b', text):
+    # Form 1: `struct NAME`.
+    #
+    # The leading `(?<![\w-])` is load-bearing twice over. A plain `\b`
+    # matches inside a hyphenated English compound, so "a four-struct
+    # tree" yielded the struct name `tree`; and `\b` after a word char
+    # would also match the tail of `sub_struct`. Requiring a non-word,
+    # non-hyphen character before `struct` kills both.
+    #
+    # `_ENGLISH_AFTER_STRUCT` then rejects the case where "struct" is an
+    # English *noun* rather than the C keyword — "the struct above",
+    # "the on-the-wire struct defines". Those are ordinary prose, and
+    # the words following them are not type names.
+    #
+    # ch40 (USB/Thunderbolt, 2026-08-30) shipped UNVERIFIED with
+    # `struct above`, `struct defines` and `struct tree` in the
+    # reviewer's "Missing structs" list, so the reviewer was told to
+    # FAIL the Accuracy criterion over three English words the draft
+    # never claimed were types.
+    for m in re.finditer(r'(?<![\w-])struct\s+([a-zA-Z_]\w*)\b', text):
         name = m.group(1)
-        if name not in ('struct', 'structs', 'structname'):
-            structs.append(name)
+        if name in ('struct', 'structs', 'structname'):
+            continue
+        if name.lower() in _ENGLISH_AFTER_STRUCT:
+            continue
+        structs.append(name)
     # Form 2: `` `IDENT` structure`` (with the backticks). Identifier
     # must be backticked — bare-word "data structure" / "tree
     # structure" prose would otherwise dominate. Allow "structure",
@@ -5905,7 +5983,21 @@ def _extract_function_names(text: str) -> List[str]:
     """
     funcs = set()
     # Backtick-quoted function calls: `vm_page_insert()`
-    for m in re.finditer(r'`([a-zA-Z_]\w*)\s*\(\s*[^`]*\)`', text):
+    #
+    # `_MANPAGE_CITATION_RE` filters man-page citations, which share the
+    # `name(N)` shape exactly: `usbdi(9)`, `usb(4)`, `newbus(4)` all
+    # parse as zero-or-one-arg calls. They are section references, not
+    # functions, and the section digit is the whole tell — a real call
+    # written in prose does not carry a bare integer as its only
+    # argument. `_link_manpage_refs` already treats this notation as a
+    # first-class citizen elsewhere in the pipeline.
+    #
+    # ch40 (USB/Thunderbolt, 2026-08-30) shipped UNVERIFIED with
+    # `newbus()`, `usb()` and `usbdi()` in the reviewer's "Missing
+    # functions" list, all three from a See Also man-page list.
+    for m in re.finditer(r'`([a-zA-Z_]\w*)\s*\(\s*([^`]*)\)`', text):
+        if _MANPAGE_CITATION_RE.match(m.group(2).strip()):
+            continue
         funcs.add(m.group(1))
     # "the foo() function" prose pattern
     for m in re.finditer(r'\b(?:the|a|an)\s+([a-zA-Z_]\w*)\s*\(\s*\)\s+function', text):

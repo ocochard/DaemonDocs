@@ -175,6 +175,15 @@ pattern.
   `_extract_fenced_function_defs` results so a fabricated function
   *body* in a ` ```c ` block (`static int bi_construct(void) { ... }`)
   is flagged the same way as a backticked call.
+- **`name(N)` in backticks is a man-page citation, not a call** —
+  `_MANPAGE_CITATION_RE` drops it. A citation is shape-identical to a
+  zero- or one-argument call, so ch40 (2026-08-30) sent the reviewer
+  `newbus()`, `usb()` and `usbdi()` harvested from its own See Also
+  list. The test is run against the *paren contents*, not the whole
+  match, and requires a bare section (`1`-`9` plus optional suffix,
+  `sysctl(3lua)`): that keeps `free(9)` and `free(ptr)` on opposite
+  sides of the line. `_link_manpage_refs` already treats the same
+  notation as first-class, so the two agree on what it means.
 - **Three layers of struct-field verification, distinct shapes:**
   (1) `_extract_struct_bodies` + `_verify_struct_bodies` — claims
   inside a literal `struct NAME { ... }` block; (2) `_extract_struct_field_claims`
@@ -194,6 +203,24 @@ pattern.
   ("a `bi_module` structure"). Bare-prose "data structure" / "tree
   structure" is rejected because it lacks the backticks; the
   writer's backticks are the load-bearing signal.
+- **`struct` is also an English noun, and `_ENGLISH_AFTER_STRUCT`
+  is how the extractor tells the two apart.** "The struct above",
+  "the on-the-wire struct defines", "a four-struct tree" are prose;
+  the word after `struct` is not a type name. ch40 (2026-08-30)
+  shipped UNVERIFIED partly because all three reached the reviewer's
+  "Missing structs" list, and the Accuracy criterion is told to FAIL
+  on that — the reviewer graded correctly against fabricated input.
+  Two details are load-bearing. The guard is `(?<![\w-])`, not `\b`:
+  `\b` matches inside a hyphenated compound (`four-struct` → boundary
+  before `struct`) and after a word char (`sub_struct`), and the
+  hyphen case is the one that actually shipped. And **every word on
+  the list must be verified never to be a real tag** before it is
+  added — FreeBSD names core types with plain words (`buf`, `file`,
+  `proc`, `thread`, `mount`, `link`, `name`), so a careless entry
+  blinds the checker to a real type rather than to prose. Run
+  `grep -rwE 'struct (word1|word2) \{' ~/freebsd-src/sys`; group 4
+  of `tests/test_extractor_english.py` re-runs that over the whole
+  list on every test run.
 - **The hang detector asks the LLM endpoint before crying wolf, and it
   reads `n_decode_total` — not `tokens_predicted_total`.** A wall-clock
   threshold cannot separate "model thinking hard" from "process wedged":

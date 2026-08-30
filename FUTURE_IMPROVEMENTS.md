@@ -17,6 +17,88 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-08-30] The extractors invented symbol claims, and the reviewer dutifully failed the chapter over them
+
+ch40 (USB/Thunderbolt) shipped UNVERIFIED, scoring 5/8 → 7/8 → 6/8 and
+regressing on the final round. Its Accuracy failure listed these as
+symbols the draft claimed but source did not define:
+
+```
+Missing structs:   above, defines, tree
+Missing functions: newbus, usb, usbdi
+```
+
+The draft never claimed any of the six. They came out of the
+extractors, from two distinct shapes.
+
+**`struct` used as an English noun.** The prose was "building a
+`tb_cfg_read` frame (the struct above)", "packs the same fields the
+on-the-wire struct defines", and "a four-struct tree". The pattern was
+`\bstruct\s+([a-zA-Z_]\w*)\b`, which cannot tell the C keyword from
+the ordinary noun. The third case is worse than the other two: `\b`
+matches *inside* `four-struct`, so a hyphenated English compound
+produced the struct name `tree`. A sweep of all 56 shipped chapters
+found three more live instances — `avoids`, `allocated`, `rather`.
+
+**Man-page citations read as function calls.** `usbdi(9)`, `usb(4)`
+and `newbus(4)` came from the chapter's own See Also list. `name(N)`
+is shape-identical to a zero- or one-argument call, so the function
+extractor had no way to reject them.
+
+The mechanism is the same one as ch34's grep-cap defect, one layer
+upstream: **the reviewer was not wrong.** Its rubric says to FAIL
+Accuracy when claimed symbols do not exist, and it was handed six
+symbols that do not exist. Every layer downstream behaved correctly on
+poisoned input. That is why the fix belongs in the extractor and not
+in the rubric, and why "make the reviewer more forgiving" would have
+been exactly the wrong response — it would have taught the reviewer to
+ignore real hallucinations too.
+
+**Fix.** `_ENGLISH_AFTER_STRUCT`, a verified denylist of words that
+follow `struct` in prose, plus a `(?<![\w-])` guard replacing `\b` so
+neither `four-struct` nor `sub_struct` matches. `_MANPAGE_CITATION_RE`
+tests the *paren contents* for a bare man-page section, which keeps
+`free(9)` (citation) and `free(ptr)` (call) on opposite sides.
+
+**The denylist is the dangerous part of this fix.** FreeBSD names many
+real types with ordinary English words — `struct buf`, `struct file`,
+`struct proc`, `struct thread`, `struct mount`, `struct link`,
+`struct name`. Adding any of those to the list would blind the
+fact-checker to a real type, which is a strictly worse failure than
+the one being fixed: a false positive costs a review round, a false
+*negative* ships a hallucination as verified. So no word goes on the
+list without `grep -rw "struct <word> {" ~/freebsd-src/sys` returning
+nothing first, and group 4 of `tests/test_extractor_english.py`
+re-verifies the entire list against `sys/` on every run rather than
+trusting the comment.
+
+Two things were deliberately *not* done:
+
+- **`acked()`, `idle()`, `destroy()`, `recovery()` were left alone.**
+  These showed up as pseudo-calls in README_transport prose and were
+  tempting denylist entries. But `idle` and `loss` have real
+  definition-shaped hits in `sys/`, and more importantly the writer
+  writing `` `acked()` `` for a thing that is not a function *is* a
+  drafting defect the fact-checker should report. Group 6 of the test
+  suite pins that decision so nobody tidies them into the ignore list.
+- **The reviewer's `max_steps=5` truncation was not touched.** ch40's
+  round 2 hit the cap, which is a plausible second cause of the 7/8 →
+  6/8 regression and is independent of this defect. The cap was
+  lowered from 15 to 5 on 2026-08-23 to stop runaway reviewers; moving
+  it back without measurement would trade one failure mode for the
+  other.
+
+Verified against real data, not just synthetic cases: on the actual
+ch40 draft all six false positives are gone and 23 genuine structs
+still extract; across all 56 shipped chapters the struct count fell
+607 → 604 (exactly the three residual words), and every one of the 27
+remaining inflection-looking names is a real FreeBSD tag (`ucred`,
+`termios`, `sigacts`, `vfsops`, `witness`, `timehands`, …).
+
+**Not fixed by this:** ch40's UNVERIFIED status. The extractor no
+longer manufactures the claims, but the chapter was graded under the
+old behavior and would need a re-run to clear.
+
 ### [PARTIALLY DONE — step 1 shipped 2026-08-27] Jargon goes undefined: every verifier asks "is this symbol real?", none asks "will the reader understand it?"
 
 Reported by the user against `sys/vm/README_bcache.md` (ch12):
