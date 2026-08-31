@@ -33,6 +33,29 @@ three defects; chapters with zero genuine symbol findings went 7 -> 10.
      functions, `nm_acregmin/max` two fields, `nbuf/8` arithmetic.
      4 occurrences.
 
+Three more classes, fixed after the same sweep (2026-08-31):
+
+  4. Function-pointer struct members reported as missing functions
+     (`_verify_functions`). `pgo_getpages()` and
+     `sv_fetch_syscall_args()` are real kernel entry points with no
+     `name(` definition line -- only a member declaration plus
+     indirect call sites. Two spellings, both real:
+     `int (*sv_fetch_syscall_args)(struct thread *);` and the
+     typedef'd `pgo_getpages_t\t*pgo_getpages;`. 6 findings.
+
+  5. Driver-local option aliases reported as missing kernel options
+     (`_verify_kernel_options`). `#define KTR_CXGBE KTR_SPARE3`
+     makes the name real and usable, but only `KTR_SPARE3` reaches
+     sys/conf/options. Fixed by asking whether sys/ #defines the
+     name before reporting it missing -- which also reclassified
+     `KTR_PROC` and `KTR_RUNQ`, two real KTR classes the sweep had
+     recorded as genuine defects.
+
+  6. Dotted makefile names read as sysctl OIDs
+     (`_extract_sysctls`). `kern` is a real sysctl root and
+     `.pre.mk` is two valid segments, so `sys/conf/kern.pre.mk`
+     parsed as an OID. 2 findings, both against correct ch4 prose.
+
 Each group also pins the opposite direction. A verifier that stops
 reporting false positives by going blind is strictly worse than the
 bug: a false negative ships a hallucination stamped as verified.
@@ -275,6 +298,147 @@ else:
           f"found {offenders} -- the underscore rule in "
           "_extract_file_paths would now suppress real path claims"
           if offenders else f"checked {len(tops)} top-level dirs")
+
+# ---------------------------------------------------------------- 6
+print("\n6) function-pointer struct members are real functions")
+# Each is a kmethod a chapter is right to name as `foo()`. None has a
+# `foo(` definition line, so the two-alternative shape grep never saw
+# them. The comment records which of the two declaration spellings each
+# uses, because they are matched by different alternatives.
+FNPTR_MEMBERS = [
+    "pgo_getpages",           # typedef'd:  pgo_getpages_t <TAB>*pgo_getpages;
+    "pgo_putpages",           # typedef'd
+    "sv_fetch_syscall_args",  # inline:     int (*sv_fetch_syscall_args)(...)
+    "ift_txd_encap",          # inline
+    "ift_rxd_pkt_get",        # inline
+    "ift_rxd_refill",         # inline
+]
+if not HAVE_SRC:
+    print("     SKIP (no ~/freebsd-src)")
+else:
+    mod._FACT_CHECK_CACHE.clear()
+    missing = mod._verify_functions(list(FNPTR_MEMBERS), SRC)
+    check("all function-pointer members verify",
+          missing == [],
+          f"reported missing: {missing}" if missing
+          else f"all {len(FNPTR_MEMBERS)} verified")
+
+    # The typedef alternative needs a LITERAL TAB: the real line is
+    # `pgo_getpages_t\t\t*pgo_getpages;` and BSD `grep -E` does not read
+    # `\t` in a bracket expression. Written with only spaces, the two
+    # pgo_* symbols silently stay missing while the four inline ones
+    # pass -- which is exactly how this first shipped.
+    captured = {}
+    _real_f = mod._verify_with_cache
+
+    def _spy_f(kind, symbols, src_root, pattern_template, shape_grep, **kw):
+        captured["shape_grep"] = shape_grep
+        return _real_f(kind, symbols, src_root, pattern_template,
+                       shape_grep, **kw)
+
+    mod._verify_with_cache = _spy_f
+    try:
+        mod._FACT_CHECK_CACHE.clear()
+        mod._verify_functions(["pgo_getpages"], SRC)
+    finally:
+        mod._verify_with_cache = _real_f
+    sg = captured.get("shape_grep", "")
+    check("func shape grep has both fnptr alternatives",
+          "(\\*" in sg and "_t[" in sg,
+          f"got {sg!r}")
+    check("the typedef alternative carries a literal tab",
+          "_t[ \t]" in sg,
+          "written with spaces only, the typedef'd pgo_* members stay "
+          f"missing; got {sg!r}")
+
+    print("\n6b) fabricated near-misses are still reported missing")
+    FN_FAKES = ["pgo_getpagez", "sv_fetch_bogus_args", "ift_txd_nope",
+                "zzz_not_real"]
+    mod._FACT_CHECK_CACHE.clear()
+    missing = mod._verify_functions(list(FN_FAKES), SRC)
+    check("every fabricated function still flagged",
+          sorted(missing) == sorted(FN_FAKES),
+          f"flagged {sorted(missing)}")
+
+    REAL_FUNCS = ["tcp_input", "uma_zalloc", "m_getm2",
+                  "bus_alloc_resource", "tcp_newtcpcb"]
+    mod._FACT_CHECK_CACHE.clear()
+    missing = mod._verify_functions(list(REAL_FUNCS), SRC)
+    check("ordinary function definitions still verify",
+          missing == [], f"reported missing: {missing}")
+
+# ---------------------------------------------------------------- 7
+print("\n7) a #defined option name is not a missing option")
+if not HAVE_SRC:
+    print("     SKIP (no ~/freebsd-src)")
+else:
+    # KTR_CXGBE: driver-local alias, absent from sys/conf/options.
+    # KTR_PROC / KTR_RUNQ: real classes in sys/sys/ktr_class.h that the
+    # sweep's classifier misfiled as genuine defects.
+    # KTR_START4: a macro FUNCTION in sys/sys/ktr.h -- excused here
+    # because the name is real, though the deeper defect is that
+    # _KERNEL_OPTION_RE claims every KTR* token as an option.
+    mod._FACT_CHECK_CACHE.clear()
+    missing = mod._verify_kernel_options(
+        ["KTR_CXGBE", "KTR_PROC", "KTR_RUNQ", "KTR_START4"], SRC)
+    check("#defined KTR names are not reported missing",
+          missing == [], f"reported missing: {missing}")
+
+    mod._FACT_CHECK_CACHE.clear()
+    missing = mod._verify_kernel_options(["INVARIANTS", "WITNESS", "KTR"], SRC)
+    check("real config options still verify",
+          missing == [], f"reported missing: {missing}")
+
+    print("\n7b) invented options are still reported missing")
+    OPT_FAKES = ["VERBOSE_NOPE_XYZ", "DEBUG_FICTIONAL_Q",
+                 "INVARIANT_BOGUS_Z"]
+    mod._FACT_CHECK_CACHE.clear()
+    missing = mod._verify_kernel_options(list(OPT_FAKES), SRC)
+    check("every invented option still flagged",
+          sorted(missing) == sorted(OPT_FAKES),
+          f"flagged {sorted(missing)} -- the #define escape hatch must "
+          "not excuse names the tree never defines")
+
+    # The helper must fail CLOSED: a bad root means "not defined", so the
+    # option falls through to the corpus check instead of being excused.
+    # `getattr` rather than a direct call so a missing helper is one
+    # named failure instead of an AttributeError that kills the groups
+    # below it -- which is how the pre-fix arm of this file behaved.
+    _defined = getattr(mod, "_option_is_defined_in_tree", None)
+    check("_option_is_defined_in_tree fails closed on a bad root",
+          _defined is not None and _defined("KTR_PROC", "/nonexistent") is False,
+          "must exist and return False so the option is still "
+          "corpus-checked")
+
+# ---------------------------------------------------------------- 8
+print("\n8) a dotted makefile name is not a sysctl OID")
+NOT_OIDS = [
+    "`kern.pre.mk`",   # sys/conf/kern.pre.mk
+    "`kern.post.mk`",  # sys/conf/kern.post.mk
+]
+for text in NOT_OIDS:
+    got = mod._extract_sysctls(text)
+    check(f"{text} is not extracted as an OID", got == [], f"got {got}")
+
+print("\n8b) real OIDs are still extracted")
+# Includes the three ch40 sysctls that are genuine findings: the fix must
+# not stop them reaching the verifier, or a real hallucination ships.
+OID_TEXT = ("`kern.ipc.maxsockbuf` `vm.pmap.pg_ps_enabled` "
+            "`net.inet.ip.forwarding` `debug.witness.skipspin` "
+            "`hw.usb.xhci.route` `hw.usb.xhci.polling`")
+got = mod._extract_sysctls(OID_TEXT)
+want = sorted(["kern.ipc.maxsockbuf", "vm.pmap.pg_ps_enabled",
+               "net.inet.ip.forwarding", "debug.witness.skipspin",
+               "hw.usb.xhci.route", "hw.usb.xhci.polling"])
+check("all six real OIDs still extracted", got == want,
+      f"got {got}")
+
+# A leaf that merely LOOKS like a short word must survive -- the suffix
+# list is closed on purpose, and this pins that it stays small.
+got = mod._extract_sysctls("`kern.sched.quantum` `vm.stats.vm.v_free_count`")
+check("short real leaves are not mistaken for extensions",
+      got == ["kern.sched.quantum", "vm.stats.vm.v_free_count"],
+      f"got {got}")
 
 # ---------------------------------------------------------------- exit
 print()

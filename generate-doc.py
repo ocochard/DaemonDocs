@@ -6675,6 +6675,12 @@ def _verify_functions(funcs: List[str], src_root: str,
         # shape grep accepts these via the `^NAME\s*\(` alternative,
         # and we accept them here too.
         r"^({alt})\s*\("
+        r"|"
+        # Function-pointer struct member -- see shape_grep note 3.
+        r"\(\s*\*\s*({alt})\s*\)\s*\("
+        r"|"
+        # Same, declared through a typedef: `pgo_getpages_t *pgo_getpages;`
+        r"[A-Za-z_]\w*_t\s+\*\s*({alt})\s*;"
         r")"
     )
     # `shape_grep` keeps lines that look like a function signature.
@@ -6692,6 +6698,18 @@ def _verify_functions(funcs: List[str], src_root: str,
         shape_grep=(
             r"[A-Za-z_][A-Za-z0-9_]* *\*? *[A-Za-z_][A-Za-z0-9_]*\("
             r"|^[A-Za-z_][A-Za-z0-9_]*\("
+            # 3. Function-pointer struct members. A kmethod like
+            #    `pgo_getpages()` or `sv_fetch_syscall_args()` is a real
+            #    kernel entry point a chapter is right to name, but it has
+            #    no `name(` definition line anywhere -- only a member
+            #    declaration and indirect call sites. Reported missing on
+            #    ch5/ch7/ch25 (6 findings). Two spellings, both real:
+            #      int  (*sv_fetch_syscall_args)(struct thread *);
+            #      pgo_getpages_t  *pgo_getpages;      /* typedef'd */
+            #    The typedef form has no parenthesis at all, which is why
+            #    the two alternatives below are separate.
+            r"|\(\*[A-Za-z_][A-Za-z0-9_]*\) *\("
+            r"|[A-Za-z_][A-Za-z0-9_]*_t[ 	]+\*[A-Za-z_][A-Za-z0-9_]*;"
         ),
         extra_search_dirs=extra_search_dirs,
     )
@@ -6732,6 +6750,27 @@ def _extract_kernel_options(text: str) -> List[str]:
     return sorted(found)
 
 
+def _option_is_defined_in_tree(option: str, src_root: str) -> bool:
+    """True if `sys/` contains a `#define <option>` for this name.
+
+    A driver-local alias (`#define KTR_CXGBE KTR_SPARE3`) makes the name
+    real and usable even though it never reaches `sys/conf/options`.
+    Fails CLOSED the other way from `_verify_kernel_options`: on any grep
+    error this returns False, so the option falls through to the normal
+    corpus check rather than being silently excused.
+    """
+    sys_dir = os.path.join(src_root, "sys")
+    if not os.path.isdir(sys_dir):
+        return False
+    cmd = (
+        f"grep -rhE '^[ \t]*#[ \t]*define[ \t]+{re.escape(option)}\\b' "
+        f"{shlex.quote(sys_dir)}/ 2>/dev/null | head -c 4096"
+    )
+    output = _cached_grep_corpus(
+        f"optdefine::{sys_dir}::{option}", cmd, output_cap=4096)
+    return bool(output and output.strip())
+
+
 def _verify_kernel_options(options: List[str], src_root: str) -> List[str]:
     """Grep `sys/conf/options*` and `sys/conf/NOTES` for each option name.
 
@@ -6742,6 +6781,25 @@ def _verify_kernel_options(options: List[str], src_root: str) -> List[str]:
     sys_conf = os.path.join(src_root, "sys", "conf")
     if not os.path.isdir(sys_conf):
         return []  # can't verify — don't flag
+    # A name can be a real, usable KTR class without appearing in the
+    # option corpus, because a driver defines its own alias:
+    #     sys/dev/cxgbe/adapter.h:65:#define KTR_CXGBE  KTR_SPARE3
+    # `KTR_CXGBE` is the name a cxgbe chapter should use, and it is not
+    # in sys/conf/options or NOTES -- only `KTR_SPARE3` is. Flagging it
+    # sent ch25 a fact-fix instruction against correct prose. So before
+    # reporting anything missing, ask whether the tree #defines it.
+    #
+    # This reclassifies three findings the 2026-08-31 sweep had recorded
+    # as GENUINE. `KTR_PROC` and `KTR_RUNQ` are real KTR classes in
+    # sys/sys/ktr_class.h; the sweep's classifier only tested for the
+    # driver-alias shape and so missed them. `KTR_START4` is a macro
+    # FUNCTION (sys/sys/ktr.h), not an option at all -- the #define test
+    # excuses it for the right reason (the name is real) even though the
+    # deeper defect is that `_KERNEL_OPTION_RE` claims any `KTR*` token.
+    options = [o for o in options
+               if not _option_is_defined_in_tree(o, src_root)]
+    if not options:
+        return []
     # The option corpus (sys/conf/options*, NOTES) is the same regardless
     # of which options we're checking, so grep it once per run and match
     # every candidate against the cached output. `-w` on any option name
@@ -6928,6 +6986,14 @@ _SYSCTL_OID_RE = re.compile(
     r'`(' + r'|'.join(_SYSCTL_ROOTS) + r')((?:\.[a-z0-9_]+)+)`'
 )
 
+# Trailing segments that make a dotted token a filename rather than an OID.
+# Deliberately a small closed list of suffixes that actually collide with a
+# sysctl root in this corpus (`sys/conf/kern.pre.mk`), not a general
+# extension list: a wide list would start swallowing real OID leaves.
+_NOT_SYSCTL_LEAF_SUFFIXES = frozenset({
+    "mk", "c", "h", "s", "o", "md", "conf", "sh", "py",
+})
+
 # Per-OID availability cache (True=real, False=not found). Separate from the
 # grep `_FACT_CHECK_CACHE` because the backend and key space are different.
 _SYSCTL_GRAPH_CACHE: Dict[str, bool] = {}
@@ -6943,7 +7009,16 @@ def _extract_sysctls(text: str) -> List[str]:
     """
     found = set()
     for m in _SYSCTL_OID_RE.finditer(text):
-        found.add(m.group(1) + m.group(2))
+        oid = m.group(1) + m.group(2)
+        # `kern.pre.mk` / `kern.post.mk` are makefiles in sys/conf, not
+        # OIDs -- but `kern` is a real sysctl root and `.pre.mk` is two
+        # syntactically valid segments, so the regex takes them. ch4 was
+        # told twice that correct filenames were hallucinated sysctls.
+        # Keyed on the trailing segment: no sysctl leaf is a file
+        # extension, and treating one as an OID is always the error.
+        if oid.rsplit(".", 1)[-1] in _NOT_SYSCTL_LEAF_SUFFIXES:
+            continue
+        found.add(oid)
     return sorted(found)
 
 
