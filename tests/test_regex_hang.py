@@ -201,6 +201,54 @@ src = inspect.getsource(mod._endpoint_decode_count)
 check("probe reads n_decode_total, not tokens_predicted_total",
       "n_decode_total" in src and "tokens_predicted_total" not in src)
 
+# A TRICKLE IS NOT LIVENESS. ch7 (2026-08-31) advanced n_decode_total by 2
+# in 20s — 0.1/s, ~70x below healthy — and the old `second > first` test
+# read that as a busy model, suppressing the dump for the entire 2481s of
+# client silence. The probe must require a RATE, not bare movement.
+_counts = []
+_saved_count = mod._endpoint_decode_count
+_saved_gap = mod._DECODE_PROBE_GAP_SEC
+try:
+    # Keep the real gap semantics — the rate is (delta / gap), so shrinking
+    # the gap inflates the rate and would defeat the trickle case entirely.
+    # Patch time.sleep instead so the suite stays fast at a realistic gap.
+    mod._DECODE_PROBE_GAP_SEC = 20.0
+    _real_sleep = mod.time.sleep
+    mod.time.sleep = lambda _s: None
+    mod._endpoint_decode_count = lambda: _counts.pop(0)
+
+    # Healthy: ~5/s, comfortably above the floor.
+    _counts[:] = [1000, 1000 + int(5 * mod._DECODE_PROBE_GAP_SEC)]
+    check("fast decode -> decoding (no dump)", mod._endpoint_is_decoding() is True)
+
+    # Trickle: ch7's exact numbers — 2 decodes in 20s = 0.1/s.
+    _counts[:] = [1000, 1002]
+    check("trickle (moved but below floor) -> NOT decoding (detector fires)",
+          mod._endpoint_is_decoding() is False)
+
+    # Flat: the original 6.8-hour regex-hang signature, still caught.
+    _counts[:] = [1000, 1000]
+    check("flat counter -> NOT decoding", mod._endpoint_is_decoding() is False)
+
+    # Counter reset (server restart) must not read as huge negative progress
+    # and must not read as liveness.
+    _counts[:] = [1000, 5]
+    check("counter reset -> NOT decoding", mod._endpoint_is_decoding() is False)
+finally:
+    mod._endpoint_decode_count = _saved_count
+    mod._DECODE_PROBE_GAP_SEC = _saved_gap
+    mod.time.sleep = _real_sleep
+
+# getattr, not a direct reference: on the pre-fix module this attribute does
+# not exist, and a bare `mod._DECODE_MIN_RATE` raises AttributeError that
+# ends the whole run — silently skipping every group below with exit 0.
+_floor = getattr(mod, "_DECODE_MIN_RATE", None)
+check("rate floor constant exists", _floor is not None)
+check("rate floor is env-tunable via DAEMONDOCS_DECODE_MIN_RATE",
+      "DAEMONDOCS_DECODE_MIN_RATE" in inspect.getsource(mod))
+check("rate floor sits below observed healthy throughput (~5-7/s)",
+      _floor is not None and 0 < _floor <= 3.0, f"floor={_floor}")
+
 print()
 
 # --- 5) writer generation cap --------------------------------------------

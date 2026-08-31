@@ -180,6 +180,20 @@ class heartbeat:
 
 _DECODE_PROBE_GAP_SEC = 8.0
 
+# Minimum decode rate that counts as "the model is working". Bare movement
+# is not enough: on ch7 (2026-08-31) the endpoint advanced n_decode_total by
+# 2 in 20s — 0.1/s against the ~5-7/s a healthy run sustains here — and
+# because the old probe only asked `second > first`, the hang detector
+# suppressed its dump for the full 2481s of client silence. The runner's
+# wall-clock watchdog was the only guard that fired, so the chapter died
+# with no stack trace and no diagnosis. A trickle also defeats the httpx
+# read timeout, which resets on every byte received.
+#
+# 1.0/s sits ~5x below observed healthy throughput and 10x above the
+# trickle, so it separates the two without re-introducing the 2026-08-23
+# false positive. Env-tunable because the floor is hardware-dependent.
+_DECODE_MIN_RATE = float(os.environ.get("DAEMONDOCS_DECODE_MIN_RATE", "1.0"))
+
 
 def _endpoint_decode_count() -> Optional[int]:
     """Read llama-server's cumulative decode counter, or None.
@@ -209,10 +223,12 @@ def _endpoint_decode_count() -> Optional[int]:
 def _endpoint_is_decoding() -> bool:
     """True only if the model demonstrably produced tokens just now.
 
-    Samples `n_decode_total` twice. Conservative by construction: any
-    uncertainty (metrics unavailable, counter flat) returns False so the
-    hang detector still dumps. A local CPU spin with an idle endpoint —
-    the 6.8-hour regex hang — reads as flat and is correctly reported.
+    Samples `n_decode_total` twice and requires the implied rate to clear
+    `_DECODE_MIN_RATE`. Conservative by construction: any uncertainty
+    (metrics unavailable, counter flat, or merely trickling) returns False
+    so the hang detector still dumps. A local CPU spin with an idle
+    endpoint — the 6.8-hour regex hang — reads as flat and is correctly
+    reported; a 0.1/s trickle — ch7 — now reads as stuck rather than busy.
     """
     first = _endpoint_decode_count()
     if first is None:
@@ -221,7 +237,11 @@ def _endpoint_is_decoding() -> bool:
     second = _endpoint_decode_count()
     if second is None:
         return False
-    return second > first
+    # Rate, not bare movement — see _DECODE_MIN_RATE. Guard the divisor so a
+    # clock anomaly cannot make this claim liveness it did not measure.
+    if _DECODE_PROBE_GAP_SEC <= 0:
+        return second > first
+    return (second - first) / _DECODE_PROBE_GAP_SEC >= _DECODE_MIN_RATE
 
 
 def _hang_watchdog() -> None:
@@ -252,7 +272,10 @@ def _hang_watchdog() -> None:
         # the entire generation you are trying to observe.)
         #
         # This only suppresses the dump when the endpoint is provably
-        # working. Unreachable metrics, no --metrics flag, or a stalled
+        # working — and "working" is a RATE, not bare movement
+        # (_DECODE_MIN_RATE): ch7 trickled at 0.1 decode/s for 2481s and the
+        # old `second > first` test suppressed every dump.
+        # Unreachable metrics, no --metrics flag, or a stalled
         # counter all fall through to the dump: the detector must fail
         # loud, since the bug it exists for (a local CPU spin with the
         # endpoint idle) shows up as exactly "no decode progress".
@@ -320,6 +343,7 @@ def install_hang_detector() -> None:
               f"real hang (expect occasional false dumps until then).")
     else:
         print(f"  [hang-detector] on, {_HANG_DUMP_AFTER_SEC:.0f}s threshold, "
+              f"min decode rate {_DECODE_MIN_RATE:.2f}/s, "
               f"endpoint liveness via /metrics (n_decode_total={count})")
 
     t = threading.Thread(target=_hang_watchdog, name="hang-watchdog",

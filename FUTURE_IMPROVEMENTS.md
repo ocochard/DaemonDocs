@@ -17,6 +17,62 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-09-01] A decode trickle read as liveness, so every hang guard suppressed itself and ch7 died undiagnosed
+
+ch7 (VM) was killed by the runner's wall-clock watchdog after 3861s. The
+useful part is what did *not* happen: no stack dump, no `APITimeoutError`,
+no UNVERIFIED write. Three independent guards were armed and all three
+stayed quiet through 2481s of total client silence.
+
+Measured on the live endpoint while the chapter was wedged:
+
+| signal | value | healthy |
+|---|---|---|
+| `n_decode_total` | +2 per 20s (0.1/s) | ~5-7/s |
+| `tokens_predicted_total` | frozen at 18929 | advancing |
+| server decode time / wall-clock | 1216s / 3861s (36%) | most of it |
+| prefill cache hit | 92% | — |
+| client log growth | none for 41 min | steady |
+
+**Root cause: `_endpoint_is_decoding()` returned `second > first`.** Bare
+movement counted as a working model. At 0.1 decode/s the endpoint is dead
+for practical purposes but technically advancing, so:
+
+- the **hang detector** (1800s) suppressed its dump — it asks the endpoint
+  first, by design, to avoid the 2026-08-23 false positive;
+- the **runner watchdog** logged "endpoint still decoding; NOT killing" on
+  earlier chapters for the same reason, and on ch7 only fired because its
+  wall-clock rule is unconditional;
+- the **httpx read timeout** (600s) never tripped, because a single-float
+  timeout resets on every byte received and a trickle keeps resetting it.
+
+**The fix** is a rate floor, not a new timeout: `_DECODE_MIN_RATE`
+(env `DAEMONDOCS_DECODE_MIN_RATE`, default 1.0/s) — ~5x below observed
+healthy throughput and 10x above the trickle, so it separates the two
+without re-introducing the false positive. The probe keeps its fail-safe
+direction: metrics unavailable, flat counter, counter reset, or trickle
+all read as "not decoding" so the detector still dumps.
+
+**Two fixes considered and rejected.** An explicit
+`httpx.Timeout(connect=, read=, write=, pool=)` would not have caught
+ch7 either — bytes *were* arriving, just barely, so no read gap ever
+opened. And lowering the runner watchdog would trade this failure for the
+2026-08-23 false-dump problem. The defect was never the threshold; it was
+treating a boolean as a rate.
+
+**What this does not fix.** ch7's writer was at 332k input tokens by step
+17, growing ~20-28k per step with output flat. The rate floor makes the
+next occurrence *legible* (a stack dump naming the phase) rather than
+silent; it does not curb the writer's context appetite, which is a
+separate open item.
+
+Regression tests in `tests/test_regex_hang.py` group 4: ch7's exact
+numbers (2 decodes in 20s) must read as NOT decoding, healthy ~5/s must
+read as decoding, and flat / counter-reset must stay caught. The gap is
+patched via `time.sleep`, not by shrinking `_DECODE_PROBE_GAP_SEC` —
+the rate is `delta / gap`, so a tiny gap inflates the rate and silently
+defeats the trickle case (that mistake cost a test-authoring round).
+
 ### [DONE — shipped 2026-08-31] The writer's symbol tool matched definitions only, so header-only KPIs were unconfirmable and the reviewer flagged correct prose as hallucinated
 
 **Symptom.** During the 2026-08-31 regen, both endpoints stalled on the
