@@ -17,6 +17,63 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-08-31] The writer's symbol tool matched definitions only, so header-only KPIs were unconfirmable and the reviewer flagged correct prose as hallucinated
+
+**Symptom.** During the 2026-08-31 regen, both endpoints stalled on the
+same class of problem. ch37 (transport) logged four consecutive failed
+lookups — `cc_conn_init`, `cc_post_recovery`, `cc_after_idle`,
+`cc_ecnpkt_handler` — each answered "No exact definition found for X,
+but it appears in these files". ch39 (sound) cited `getptr()` and the
+reviewer FAILed criterion 1 (Accuracy) on it across two consecutive
+review rounds; the revision did not remove it, because the symbol is
+real and the writer had no way to prove it.
+
+**Cause.** `_extract_func_sigs` had a single regex, `func_def_re`,
+requiring a trailing `{`. That matches function *definitions* only.
+Three real, citable symbol classes have no body anywhere in the tree:
+
+1. **Prototypes** — `void\tcc_conn_init(struct tcpcb *tp);` in
+   `sys/netinet/tcp_var.h`. Every KPI exposed only through a header.
+2. **Function-pointer struct members** — both the inline spelling
+   `int (*sv_fetch_syscall_args)(struct thread *);` and the typedef'd
+   `pgo_getpages_t\t\t*pgo_getpages;` (literal tabs, no parenthesis).
+3. **kobj interface methods** — declared in `.m` interface files, not
+   C: `METHOD uint32_t getptr { ... } DEFAULT channel_nogetptr;`.
+   Drivers realize them as `KOBJMETHOD(channel_getptr, foo_getptr)`
+   table entries, so the bare interface name has no C definition at
+   all. `ResolveCDefinition`'s file walks filtered to `.c`/`.h`, so the
+   147 `.m` files in the tree were invisible to it outright.
+
+**Fix.** Added `_FUNC_DECL_RE` (three alternatives, one per bodyless
+shape, ending in `;`) alongside the existing definition regex, and
+`_extract_kobj_methods` for `.m` files, with `.m` added to both file
+walks and a dispatch branch in the extraction loop. Shared the keyword
+stoplist as `_C_KEYWORD_STOPWORDS`.
+
+**Two false-positive traps hit while building it** — both are pinned by
+tests, do not reintroduce them:
+
+- `re.DOTALL` on the declaration regex let `[^{;]*?` cross statement
+  boundaries, so `else if (sbt != 0)\n\trval = sleepq_timedwait(...)`
+  parsed as a declaration of `rval`. Dropped DOTALL; excluded `=`.
+- `return chn_resizebuf(c, latency, -1, 0);` parsed as return-type
+  `return` declaring `chn_resizebuf`. Fixed with a negative lookahead
+  on statement keywords. A five-file sweep went 5 suspicious matches
+  to 0.
+
+**What was NOT changed, deliberately.** `cc_record_rtt`, `cc_rttsample`
+and `cc_newround` — three of the seven ch37 lookups — do not exist
+anywhere in `sys/`. The tool's "Could not find definition" was correct
+for those; they are writer hallucinations and the reviewer was right to
+flag them. A looser matcher that resolved them would be a regression,
+not a fix. `tests/test_resolve_declarations.py` group 4 pins this.
+
+**Scope note.** This is the writer-side tool. The *verifier*-side
+equivalent for function-pointer members shipped separately in
+`2bbed64`; the two code paths are independent and both were needed.
+
+Tests: `tests/test_resolve_declarations.py` (28 checks, 18 fail pre-fix).
+
 ### [DONE — shipped 2026-08-30] Struct verifier recognised one of three definition spellings; real structs verified as "missing"
 
 Third instance of the same failure family as the ch34 grep cap and the

@@ -2068,6 +2068,54 @@ def _extract_struct_defs(content: str, file_path: str) -> List[str]:
     return defs
 
 
+_C_KEYWORD_STOPWORDS = frozenset({
+    'if', 'else', 'while', 'for', 'switch', 'return',
+    'struct', 'union', 'enum', 'typedef', 'define',
+    'sizeof', 'case', 'goto', 'do', 'static', 'extern',
+})
+
+# Three declaration shapes, all ending in `;` with no body.
+# Alternative 1: plain prototype           -- `void cc_conn_init(struct tcpcb *);`
+# Alternative 2: inline fnptr member       -- `int (*sv_fetch_syscall_args)(...);`
+# Alternative 3: typedef'd fnptr member    -- `pgo_getpages_t\t*pgo_getpages;`
+_FUNC_DECL_RE = re.compile(
+    r"^[ \t]*"
+    r"(?!(?:return|goto|break|continue|case|else|if|while|for|switch|do)\b)"
+    r"(?:(?:static|extern|inline|const|volatile|unsigned|signed)[ \t]+)*"
+    r"(?:"
+    r"(?:[A-Za-z_]\w*[ \t]+)+\**[ \t]*([A-Za-z_]\w*)[ \t]*\((?:[^{;=()]|\n)*?\)[ \t]*;"
+    r"|"
+    r"(?:[A-Za-z_]\w*[ \t]+)+\([ \t]*\*[ \t]*([A-Za-z_]\w*)[ \t]*\)[ \t]*\((?:[^{;=()]|\n)*?\)[ \t]*;"
+    r"|"
+    r"[A-Za-z_]\w*_t[ \t]+\*[ \t]*([A-Za-z_]\w*)[ \t]*;"
+    r")",
+    re.MULTILINE,
+)
+
+
+# kobj interface methods, declared in .m files (not C):
+#     METHOD uint32_t getptr {
+#             kobj_t obj;
+#     } DEFAULT channel_nogetptr;
+# Drivers realize them as KOBJMETHOD(channel_getptr, foo_getptr) table
+# entries, so the bare interface name has no C definition anywhere and
+# resolve_c_definition could not find it -- ch39 cited `getptr()` and the
+# reviewer FAILed Accuracy on it across two rounds (2026-08-31 regen).
+_KOBJ_METHOD_RE = re.compile(
+    r"^[ \t]*(?:STATIC)?METHOD[ \t]+[A-Za-z_][\w \t*]*?"
+    r"([A-Za-z_]\w*)[ \t]*\{",
+    re.MULTILINE,
+)
+
+
+def _extract_kobj_methods(content: str, file_path: str) -> List[str]:
+    """Extract kobj interface method names from a .m interface file."""
+    return [
+        f"{m.group(1)} (from {file_path}, kobj interface method)"
+        for m in _KOBJ_METHOD_RE.finditer(content)
+    ]
+
+
 def _extract_func_sigs(content: str, file_path: str) -> List[str]:
     """Extract function signatures from C source code.
 
@@ -2087,10 +2135,33 @@ def _extract_func_sigs(content: str, file_path: str) -> List[str]:
     )
     for m in func_def_re.finditer(content):
         name = m.group(1)
-        if name in ('if', 'else', 'while', 'for', 'switch', 'return',
-                    'struct', 'union', 'enum', 'typedef', 'define'):
+        if name in _C_KEYWORD_STOPWORDS:
             continue
         sigs.append(f"{name} (from {file_path})")
+
+    # Prototypes and function-pointer members -- declarations that end in
+    # `;` and have no body, so the definition regex above can never match
+    # them. Both are real, citable kernel entry points:
+    #
+    #   void	cc_conn_init(struct tcpcb *tp);           <- prototype
+    #   int (*sv_fetch_syscall_args)(struct thread *);  <- fnptr member
+    #   pgo_getpages_t	*pgo_getpages;                  <- typedef'd fnptr
+    #
+    # Without this, resolve_c_definition answered "No exact definition
+    # found" for symbols declared only in a header (every KPI exposed
+    # through tcp_var.h, for one), the writer could not confirm them, and
+    # the reviewer flagged correct prose as hallucinated. Observed on
+    # ch37 (cc_conn_init, cc_post_recovery, cc_after_idle,
+    # cc_ecnpkt_handler) during the 2026-08-31 regen.
+    #
+    # Anchored at column 0 for the same reason as func_def_re: an
+    # unanchored match picks up call statements inside other bodies.
+    for m in _FUNC_DECL_RE.finditer(content):
+        name = m.group(1) or m.group(2) or m.group(3)
+        if not name or name in _C_KEYWORD_STOPWORDS:
+            continue
+        sigs.append(f"{name} (from {file_path}, declaration)")
+
     return sigs
 
 
@@ -2177,7 +2248,7 @@ class ResolveCDefinition(Tool):
             # Search for struct definitions
             for root, dirs, files in os.walk(os.path.join(SRC_ROOT, "sys")):
                 for fname in files:
-                    if not (fname.endswith('.c') or fname.endswith('.h')):
+                    if not fname.endswith(('.c', '.h', '.m')):
                         continue
                     fpath = os.path.relpath(os.path.join(root, fname), SRC_ROOT)
                     if fpath in files_to_search:
@@ -2215,6 +2286,11 @@ class ResolveCDefinition(Tool):
                             found_defs.append(sd)
                 elif search_type == "general":
                     # Search for the symbol in various forms
+                    if fpath.endswith('.m'):
+                        for km in _extract_kobj_methods(content, fpath):
+                            if km.split(' ', 1)[0] == symbol:
+                                found_defs.append(km)
+                        continue
                     func_sigs = _extract_func_sigs(content, fpath)
                     for fs in func_sigs:
                         if symbol in fs:
@@ -2247,7 +2323,7 @@ class ResolveCDefinition(Tool):
             broader_results = []
             for root, dirs, files in os.walk(os.path.join(SRC_ROOT, "sys")):
                 for fname in files[:50]:  # Limit to avoid slow walks
-                    if not (fname.endswith('.c') or fname.endswith('.h')):
+                    if not fname.endswith(('.c', '.h', '.m')):
                         continue
                     fpath = os.path.relpath(os.path.join(root, fname), SRC_ROOT)
                     try:

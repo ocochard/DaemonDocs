@@ -43,6 +43,9 @@ The file is divided by `# ---` banner comments. In source order:
    a structured one-level summary (subdirs + Makefile SRCS + per-
    file struct/function names + top-of-file comments) so the
    writer can orient before reading individual files.
+   `ResolveCDefinition` resolves **declarations as well as
+   definitions** — see the gotcha below before touching its
+   extractors.
 5. **Prompt builders** — `build_chapter_prompt` (writer),
    `build_review_prompt` (reviewer), `build_revision_prompt`
    (writer revising). Plus `_SECTION_CATALOG`, `_chapter_sections`,
@@ -152,6 +155,26 @@ pattern.
 - **`output_file: README_internals.md` for chapter 1** — upstream
   FreeBSD ships `README.md` at the tree root. Writing there would
   clobber it and cause a read-vs-write collision in `run_chapter`.
+- **`resolve_c_definition` must match bodyless declarations** —
+  `_extract_func_sigs` looks for two things: definitions (via
+  `func_def_re`, which requires a trailing `{`) and declarations
+  (via `_FUNC_DECL_RE`, which requires a trailing `;`). Three real
+  symbol classes have no body anywhere in the tree — prototypes
+  (`void cc_conn_init(struct tcpcb *);`), function-pointer struct
+  members (`int (*sv_fetch_syscall_args)(...);`, and the typedef'd
+  `pgo_getpages_t\t*pgo_getpages;` spelling with **literal tabs**),
+  and kobj interface methods declared in `.m` files
+  (`METHOD uint32_t getptr {`, extracted by `_extract_kobj_methods`;
+  the file walks must keep `.m` in their extension filter). Before
+  this, the tool answered "No exact definition found" for every
+  header-only KPI, the writer could not confirm them, and the
+  reviewer flagged correct prose as hallucinated. When loosening
+  `_FUNC_DECL_RE`, re-run `tests/test_resolve_declarations.py`: its
+  group 4 pins that genuinely absent symbols (`cc_record_rtt`,
+  `cc_rttsample`, `cc_newround`) stay **unresolved**, and group 5
+  pins that `return f(a);` / `x = f(a);` are not read as
+  declarations — both were real bugs during development.
+
 - **`additional_authorized_imports=["re", "json"]`** in
   `create_writer_agent` — keeps the sandbox honest. Authorizing
   `os`/`pathlib` lets the model bypass the "no file I/O" prompt
