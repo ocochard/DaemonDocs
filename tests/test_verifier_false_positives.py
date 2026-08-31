@@ -56,6 +56,16 @@ Three more classes, fixed after the same sweep (2026-08-31):
      `.pre.mk` is two valid segments, so `sys/conf/kern.pre.mk`
      parsed as an OID. 2 findings, both against correct ch4 prose.
 
+  7. `_KERNEL_OPTION_RE` claimed every KTR token as a kernel-config
+     option. In the shipped corpus only 4 of 13 were options; the
+     rest were trace-class #defines, a driver alias, and a macro
+     function. Fixed by dropping the blanket `KTR[A-Z0-9_]*` rule
+     from the context-free branch, which required lowering the
+     contextual branch's length floor from 5 to 2 -- otherwise
+     `options KTR` (3 chars) would have lost its only claimant.
+     Corpus candidates 20 -> 8, and the only two now reported are
+     the two real hallucinations.
+
 Each group also pins the opposite direction. A verifier that stops
 reporting false positives by going blind is strictly worse than the
 bug: a false negative ships a hallucination stamped as verified.
@@ -439,6 +449,75 @@ got = mod._extract_sysctls("`kern.sched.quantum` `vm.stats.vm.v_free_count`")
 check("short real leaves are not mistaken for extensions",
       got == ["kern.sched.quantum", "vm.stats.vm.v_free_count"],
       f"got {got}")
+
+# ---------------------------------------------------------------- 9
+print("\n9) the option extractor does not over-claim KTR tokens")
+# A KTR trace class is not a kernel-config option, and asking the option
+# verifier about one is a category error. `_option_is_defined_in_tree`
+# suppresses the resulting report, but these must not be CLAIMED at all.
+NOT_OPTIONS = [
+    "`KTR_PROC`",     # trace class, sys/sys/ktr_class.h
+    "`KTR_RUNQ`",     # trace class
+    "`KTR_GEOM`",     # trace class
+    "`KTR_GEN`",      # trace class
+    "`KTR_SPARE3`",   # trace class
+    "`KTR_VMM`",      # alias of KTR_GEN
+    "`KTR_CXGBE`",    # driver-local alias
+    "`KTR_START4`",   # macro FUNCTION, sys/sys/ktr.h
+    "`KTR_COMPILE`",  # a real option, but not claimed without context
+    "`KTR_ENTRIES`",  # ditto
+]
+for text in NOT_OPTIONS:
+    got = mod._extract_kernel_options(text)
+    check(f"bare {text} is not claimed as an option",
+          got == [], f"got {got}")
+
+print("\n9b) contextual option claims are still extracted")
+# Branch 1 keys on the `option`/`options` keyword, so the draft itself
+# has asserted the claim. `KTR` and `DDB` are the regression cases: both
+# are real options in sys/conf/options and both are shorter than the old
+# 5-char floor, so before the floor was lowered branch 1 could never
+# verify them and only branch 2's blanket rule reached `KTR`.
+CONTEXTUAL = [
+    ("Build with `options VERBOSE_SYSINIT` to trace.", ["VERBOSE_SYSINIT"]),
+    ("compile with `options KTR` enabled", ["KTR"]),
+    ("`options DDB`", ["DDB"]),
+    ("options WITNESS", ["WITNESS"]),
+    ("options P1003_1B_MQUEUE", ["P1003_1B_MQUEUE"]),
+]
+for text, want in CONTEXTUAL:
+    got = mod._extract_kernel_options(text)
+    check(f"{text[:38]!r} -> {want}", got == want, f"got {got}")
+
+print("\n9c) invented-option shapes are still claimed without context")
+# These four prefixes stay in the context-free branch because they have
+# no other meaning in kernel prose. VERBOSE_FAILURE and
+# VERBOSE_FAILURE_PROGRESS are in the shipped corpus, are neither
+# options nor #defines anywhere in sys/, and are the whole reason the
+# context-free branch exists.
+INVENTED = [
+    ("`VERBOSE_FAILURE`", ["VERBOSE_FAILURE"]),
+    ("`VERBOSE_FAILURE_PROGRESS`", ["VERBOSE_FAILURE_PROGRESS"]),
+    ("`DEBUG_VFS_LOCKS`", ["DEBUG_VFS_LOCKS"]),
+    ("`INVARIANTS`", ["INVARIANTS"]),
+    ("`WITNESS_SKIPSPIN`", ["WITNESS_SKIPSPIN"]),
+]
+for text, want in INVENTED:
+    got = mod._extract_kernel_options(text)
+    check(f"{text} still claimed", got == want, f"got {got}")
+
+if HAVE_SRC:
+    print("\n9d) end to end: only the real hallucinations are reported")
+    text = ("Enable `options KTR` and set the `KTR_GEOM` trace-class bit. "
+            "For cxgbe the `KTR_CXGBE` class is `KTR_SPARE3`. "
+            "Build with `options VERBOSE_SYSINIT`, and `VERBOSE_FAILURE` "
+            "reports the rest.")
+    claimed = mod._extract_kernel_options(text)
+    mod._FACT_CHECK_CACHE.clear()
+    reported = mod._verify_kernel_options(claimed, SRC)
+    check("only VERBOSE_FAILURE is reported missing",
+          reported == ["VERBOSE_FAILURE"],
+          f"claimed {claimed}, reported {reported}")
 
 # ---------------------------------------------------------------- exit
 print()

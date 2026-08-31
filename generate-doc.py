@@ -6723,13 +6723,55 @@ def _verify_functions(funcs: List[str], src_root: str,
 # documents `option FOO`). We extract candidate names from the draft and
 # grep those files; anything not found is reported back to the writer.
 
-# Match `option FOO` mentions (with optional backticks) and bare ALL_CAPS
-# tokens introduced as kernel options. Restricted to identifiers of length
-# ≥ 5 to avoid matching incidental ALL-CAPS words like `BSD` or `API`.
+# Two branches, and the difference between them is the whole design.
+#
+# Branch 1 -- `option FOO` / `options FOO` -- is CONTEXTUAL: the prose
+# itself asserts "this is a kernel-config option", so verifying it against
+# sys/conf/options is testing the claim the draft actually made.
+#
+# Its length floor was >= 5 chars, which silently excluded real options:
+# sys/conf/options has ALQ, DDB, GDB, XDR, and KTR. Because branch 1
+# already requires the `option`/`options` keyword, the floor was doing
+# almost no filtering -- lowering it to >= 2 admits exactly one further
+# token across the whole shipped corpus (`KTR`, from `options KTR`), and
+# that one is a real option. The floor only ever mattered for branch 2,
+# which has no keyword to lean on.
+#
+# Branch 2 is a bare backticked token with NO surrounding context, so it
+# only names shapes that are option-like by construction. `KTR[A-Z0-9_]*`
+# used to be in this list and was removed 2026-08-31: it claimed every
+# KTR token in a draft, and in the shipped corpus only 4 of 13 were
+# options. The rest were three different kinds of thing --
+#
+#   KTR_GEOM, KTR_GEN, KTR_PROC, KTR_RUNQ, KTR_SPARE3, KTR_VMM
+#       trace-class bitmask #defines in sys/sys/ktr_class.h
+#   KTR_CXGBE
+#       a driver-local alias (#define KTR_CXGBE KTR_SPARE3)
+#   KTR_START4
+#       a macro FUNCTION in sys/sys/ktr.h
+#
+# -- none of which belong in sys/conf/options, so every one produced a
+# fact-fix instruction against correct prose (5 findings, ch5/8/25).
+# `_option_is_defined_in_tree` now suppresses the report, but the honest
+# fix is to not claim them: a KTR class is not an option, and asking the
+# option verifier about it is a category error.
+#
+# Genuine KTR option claims still reach the verifier through branch 1 --
+# the corpus writes `options KTR`, which is the form that asserts the
+# claim -- but ONLY because the floor was lowered above. With the old
+# >= 5 floor, dropping the blanket rule would have lost `KTR` entirely:
+# branch 2 was the only thing claiming it. The motivating hallucination
+# is unaffected either way: `VERBOSE_SYSINIT` appears in the corpus as
+# `options VERBOSE_SYSINIT`, i.e. via branch 1.
+#
+# The VERBOSE_/DEBUG_/INVARIANT/WITNESS shapes stay in branch 2 because
+# they have no other meaning in kernel prose -- `VERBOSE_FAILURE` and
+# `VERBOSE_FAILURE_PROGRESS` are in the corpus, are neither options nor
+# #defines anywhere in sys/, and must keep being caught.
 _KERNEL_OPTION_RE = re.compile(
-    r'\b(?:option|options)\s+`?([A-Z][A-Z0-9_]{4,})`?\b'
+    r'\b(?:option|options)\s+`?([A-Z][A-Z0-9_]{1,})`?\b'
     r'|`(VERBOSE_[A-Z0-9_]+|DEBUG_[A-Z0-9_]+|INVARIANT[A-Z0-9_]*|'
-    r'WITNESS[A-Z0-9_]*|KTR[A-Z0-9_]*|BOOTVERBOSE)`'
+    r'WITNESS[A-Z0-9_]*|BOOTVERBOSE)`'
 )
 
 # Tokens that look like kernel-config options but are universally known
