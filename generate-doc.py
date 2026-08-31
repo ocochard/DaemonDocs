@@ -5705,6 +5705,41 @@ def _extract_file_paths(text: str) -> List[str]:
         # Skip things already covered by the extension-based branches.
         if os.path.splitext(p)[1] and p in paths:
             continue
+        # Slash-separated IDENTIFIER shorthand is not a path. Writers
+        # collapse related symbols with a slash:
+        #   `bus_space_read_1/2/4/8`  -> four functions
+        #   `nm_acregmin/max`        -> two struct fields
+        #   `nbuf/8`                 -> arithmetic, not a directory
+        # All three were extracted as paths and reported not-found over
+        # the 21 UNVERIFIED chapters (2026-08-31): 4 findings across
+        # ch11/ch17/ch23, all false. A real relative path's first
+        # segment is a real directory (`sys`, `share`, `stand`), so
+        # require that; a bare numeric segment (`/8`, `/2`) never names
+        # a FreeBSD source directory and is rejected outright.
+        #
+        # `marked_dir` bypasses this test: an explicit trailing slash
+        # is the writer naming a directory, and that claim must stay
+        # verifiable -- it is the ch1 `gnu/` catch, where the whole
+        # point is that `gnu` is NOT a real directory anymore.
+        #
+        # Purely lexical, no filesystem probe: extraction has no
+        # src_root (verification owns that), and a path claim must stay
+        # extractable-then-refutable rather than silently dropped
+        # because the tree happens to lack it.
+        if not marked_dir and '/' in p:
+            segs = p.split('/')
+            # `nbuf/8`, `foo/2/4` -- a numeric segment after the first
+            # is arithmetic or a variant list, never a directory name.
+            if any(seg.isdigit() for seg in segs[1:]):
+                continue
+            # `nm_acregmin/max`, `bus_space_read_1/2/4/8` -- the first
+            # segment is a C identifier (underscore, no dot) and no
+            # segment carries a file extension. Real source paths have
+            # either a dotted leaf (`sys/vm/vm_page.c`) or plainly
+            # directory-shaped segments (`sys/fs/nfsclient`); FreeBSD
+            # has no top-level directory with an underscore in it.
+            if '_' in segs[0] and not any('.' in seg for seg in segs):
+                continue
         paths.append(p)
 
     return list(set(paths))
@@ -6529,7 +6564,11 @@ def _verify_structs(structs: List[str], src_root: str,
     # are intentionally NOT matched by either alternative.
     return _verify_with_cache(
         "struct", structs, src_root,
-        pattern_template=r"struct\s+({alt})(?:\s*\{{|\s*$)",
+        pattern_template=(
+            r"struct\s+({alt})(?:\s*\{{|\s*$)"
+            # queue(3) macro declaration -- see shape_grep below.
+            r"|(?:TAILQ|LIST|STAILQ|SLIST)_(?:HEAD|ENTRY)\(\s*({alt})\s*,"
+        ),
         shape_grep=(
             # A tab counts as separator too: 42 structs in `sys/` are
             # written with a tab after `struct` (`arphdr`, `icmpstat`,
@@ -6566,7 +6605,24 @@ def _verify_structs(structs: List[str], src_root: str,
             # bracket expression there does not interpret `\t` -- it
             # would match space, backslash or `t` and never a tab.
             "^[ 	]*(typedef[ 	]+)?struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*\\{|"
-            "^struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*$"
+            "^struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*$|"
+            #
+            # Fourth spelling: the queue(3) macros DECLARE a struct.
+            # `TAILQ_HEAD(pglist, vm_page);` defines `struct pglist` and
+            # there is no `struct pglist {` line anywhere in the tree, so
+            # all three alternatives above miss it and a correctly-cited
+            # struct is reported missing. Measured over the 21 UNVERIFIED
+            # chapters (2026-08-31): 8 such structs across ch7/8/11/23/34
+            # /38 -- pglist, rq_queue, buflists, sysctl_ctx_list,
+            # db_command_table, ip6fraghead, ip6qhead, note_info_list.
+            # ch34 and ch38 had NO other symbol finding, so this alone
+            # cost them their Accuracy pass.
+            #
+            # The declared type name is the FIRST macro argument. Only
+            # the _HEAD and _ENTRY families create a type; CIRCLEQ was
+            # retired from FreeBSD. Deliberately NOT `^`-anchored --
+            # these occur indented inside enclosing struct bodies.
+            "(TAILQ|LIST|STAILQ|SLIST)_(HEAD|ENTRY)\\([ 	]*[A-Za-z_][A-Za-z0-9_]*[ 	]*,"
         ),
         extra_search_dirs=extra_search_dirs,
     )
@@ -8054,6 +8110,14 @@ _MEMBER_ACCESS_RE = re.compile(
     r"\b([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*)\b"
 )
 
+# Same, but with NO whitespace permitted around the operator. Used for
+# the prose stage of `_extract_struct_field_claims`, where `foo. Bar` is
+# an English sentence boundary, not a member access. Fenced C blocks
+# keep the loose form above -- real code may wrap a long `->` chain.
+_MEMBER_ACCESS_TIGHT_RE = re.compile(
+    r"\b([A-Za-z_]\w*)(?:->|\.)([A-Za-z_]\w*)\b"
+)
+
 
 def _extract_struct_field_claims(
     text: str,
@@ -8121,7 +8185,19 @@ def _extract_struct_field_claims(
         # Strip fenced blocks so member-access in code (handled by
         # Stage 1) doesn't double-trigger.
         prose = _FENCED_BLOCK_RE.sub("", text)
-        for m in _MEMBER_ACCESS_RE.finditer(prose):
+        # TIGHT regex here: in real C there is never whitespace around
+        # `.` or `->`, but in English there is always whitespace after a
+        # sentence-ending period. The loose regex allows `\s*` on both
+        # sides and `re`'s `\s` matches newlines, so "invoked with the
+        # bio. GEOM is responsible" parsed as `bio` . `GEOM` and was
+        # reported as a bogus field of struct bio. Measured over the 21
+        # UNVERIFIED chapters (2026-08-31): 8 such findings across
+        # ch11/13/16/23/31/37 -- every one a sentence boundary and not
+        # one real member access (`bio->It`, `disk->The`, `inpcb->This`,
+        # `label->Because`, `objset->The`). The capitalized second word
+        # is the tell, but rejecting on case would drop real SHOUTY
+        # field names, so key on the whitespace instead.
+        for m in _MEMBER_ACCESS_TIGHT_RE.finditer(prose):
             var, field = m.group(1), m.group(2)
             if var not in known:
                 continue
