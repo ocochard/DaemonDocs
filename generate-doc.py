@@ -2102,14 +2102,36 @@ _C_KEYWORD_STOPWORDS = frozenset({
 # Alternative 1: plain prototype           -- `void cc_conn_init(struct tcpcb *);`
 # Alternative 2: inline fnptr member       -- `int (*sv_fetch_syscall_args)(...);`
 # Alternative 3: typedef'd fnptr member    -- `pgo_getpages_t\t*pgo_getpages;`
+# NOTE the arg-list groups are `[^{;=()]*?`, NOT `(?:[^{;=()]|\n)*?`.
+# The `|\n` alternative was redundant and catastrophic: a negated character
+# class already matches newline (it is not DOTALL-dependent), so every
+# newline in the arg list had two ways to match and the engine explored
+# 2^n paths across n lines. On sys/arm64/arm64/vfp.c -- an ordinary 32 KB
+# file -- `_extract_func_sigs` did not terminate: >25s, unbounded.
+#
+# That is what wedged ch38 (2026-09-01). The hang detector's dump pointed
+# at the resolve_c_definition walk, and the walk is genuinely slow (16.2s
+# for a full tree scan), but the walk was a red herring: the draft step
+# stalled inside this one regex on this one file. Removing `|\n` takes the
+# file from >25s to 0.000s.
+#
+# Verified equivalent, not just faster: `[^{;=()]` matches `\n` (checked
+# directly, plus 200k random strings over `a;=(){}\n\t *,\\` with zero
+# language difference), and across a 2500-file sample of sys/ the extracted
+# name sets are identical. Do NOT "clarify" this by reintroducing an
+# explicit newline branch, and do not try to fix it with a length bound:
+# `{0,400}` terminates but silently drops real declarations with long
+# argument lists (four in sys/dev/pms/.../saproto.h), and `{0,800}` brings
+# the hang straight back. There is no cap that both terminates and keeps
+# every real match -- the alternation itself is the defect.
 _FUNC_DECL_RE = re.compile(
     r"^[ \t]*"
     r"(?!(?:return|goto|break|continue|case|else|if|while|for|switch|do)\b)"
     r"(?:(?:static|extern|inline|const|volatile|unsigned|signed)[ \t]+)*"
     r"(?:"
-    r"(?:[A-Za-z_]\w*[ \t]+)+\**[ \t]*([A-Za-z_]\w*)[ \t]*\((?:[^{;=()]|\n)*?\)[ \t]*;"
+    r"(?:[A-Za-z_]\w*[ \t]+)+\**[ \t]*([A-Za-z_]\w*)[ \t]*\([^{;=()]*?\)[ \t]*;"
     r"|"
-    r"(?:[A-Za-z_]\w*[ \t]+)+\([ \t]*\*[ \t]*([A-Za-z_]\w*)[ \t]*\)[ \t]*\((?:[^{;=()]|\n)*?\)[ \t]*;"
+    r"(?:[A-Za-z_]\w*[ \t]+)+\([ \t]*\*[ \t]*([A-Za-z_]\w*)[ \t]*\)[ \t]*\([^{;=()]*?\)[ \t]*;"
     r"|"
     r"[A-Za-z_]\w*_t[ \t]+\*[ \t]*([A-Za-z_]\w*)[ \t]*;"
     r")",
@@ -2189,6 +2211,38 @@ def _extract_func_sigs(content: str, file_path: str) -> List[str]:
     return sigs
 
 
+# Wall-clock ceiling for one resolve_c_definition call. The tool makes up to
+# three unbounded passes over sys/ (~15200 files, ~357 MB): the symbol scan,
+# the definition extraction, and the "appears in these files" fallback. None
+# was bounded, so a symbol that matches nothing pays the full tree walk with
+# no early exit — measured at 16.2s for `prx`, a three-character local
+# variable the ch38 writer asked about by mistake (2026-09-01). That call
+# cannot succeed: `prx` is not a kernel symbol, so every file is read and
+# every pattern misses.
+#
+# 16.2s per call is survivable alone; 40 calls in one draft step is not, and
+# the writer batches them. This is a SEATBELT, not a fix -- same relationship
+# as the scan budget in _extract_fenced_function_defs to its atomic group.
+# It cannot interrupt a single pathological match (re has no timeout), only
+# stop the next file from being opened. The real fix for the ch38 class is
+# curbing what the writer asks for.
+#
+# 45s, chosen against measurement rather than taste. A COMPLETE search that
+# legitimately finds nothing costs 23.0s here (walk 1 over the whole tree,
+# then the fallback walk): `cc_record_rtt`, `cc_newround` and `prx` all
+# return the correct "Could not find definition" in 22.8-23.0s with the
+# budget disabled. A 20s ceiling therefore converted every genuine negative
+# into "budget exceeded" -- turning a correct answer into an unresolved one,
+# which is the same silent-degradation trap as a verifier that skips a claim
+# class. 45s leaves ~2x headroom over the measured worst legitimate case.
+#
+# Raise it if the tree grows or the host slows; the failure mode of too-low
+# is false "unresolved", and of too-high is a slow step. Set to 0 to disable
+# the ceiling entirely (that is how the 23.0s figures above were measured).
+_RESOLVE_WALK_BUDGET_SEC = float(
+    os.environ.get("DAEMONDOCS_RESOLVE_BUDGET_SEC", "45"))
+
+
 class ResolveCDefinition(Tool):
     """Trace #include chains to find C struct/function/macro definitions.
 
@@ -2218,7 +2272,37 @@ class ResolveCDefinition(Tool):
     output_type = "string"
 
     def forward(self, symbol: str, start_file: str = "") -> str:
-        """Search for and return the C definition of a symbol."""
+        """Search for and return the C definition of a symbol.
+
+        Thin wrapper: _resolve does the work and reports whether it ran out
+        of budget, so the log warning fires exactly once per truncated call
+        regardless of which of the three walks ran out first. An earlier
+        version printed inline between walks 2 and 3 and silently missed
+        every truncation that began in the fallback walk.
+        """
+        text, truncated = self._resolve(symbol, start_file)
+        if truncated:
+            # Log as well as return: the string goes to the writer, this goes
+            # to the chapter log where a human tuning the budget will look.
+            # Same style as the fact-check grep timeout.
+            print(f"  ⚠ resolve_c_definition('{symbol}') hit the "
+                  f"{_RESOLVE_WALK_BUDGET_SEC:.0f}s search budget — "
+                  f"tree not fully scanned, result is partial", flush=True)
+        return text
+
+    def _resolve(self, symbol: str, start_file: str = "") -> tuple:
+        """Resolve `symbol`; returns (output_text, hit_budget)."""
+        # One deadline shared by all three tree walks below, so a call cannot
+        # spend the budget three times over. Checked between files, never
+        # mid-match. `truncated` is what keeps a cut-short scan from being
+        # reported as a clean "not found" -- see the return paths.
+        _deadline = (time.monotonic() + _RESOLVE_WALK_BUDGET_SEC
+                     if _RESOLVE_WALK_BUDGET_SEC > 0 else None)
+        truncated = False
+
+        def _out_of_time() -> bool:
+            return _deadline is not None and time.monotonic() > _deadline
+
         # Clean up symbol name
         symbol = symbol.strip()
         if symbol.startswith("struct "):
@@ -2271,9 +2355,15 @@ class ResolveCDefinition(Tool):
         if not files_to_search or search_type == "struct":
             # Search for struct definitions
             for root, dirs, files in os.walk(os.path.join(SRC_ROOT, "sys")):
+                if _out_of_time():
+                    truncated = True
+                    break
                 for fname in files:
                     if not fname.endswith(('.c', '.h', '.m')):
                         continue
+                    if _out_of_time():
+                        truncated = True
+                        break
                     fpath = os.path.relpath(os.path.join(root, fname), SRC_ROOT)
                     if fpath in files_to_search:
                         continue
@@ -2299,6 +2389,9 @@ class ResolveCDefinition(Tool):
         # 3. Extract definitions from found files
         found_defs = []
         for fpath in sorted(files_to_search):
+            if _out_of_time():
+                truncated = True
+                break
             try:
                 full_path = os.path.join(SRC_ROOT, fpath)
                 content = Path(full_path).read_text(errors="ignore")
@@ -2346,9 +2439,23 @@ class ResolveCDefinition(Tool):
             # Try a broader search - just grep for the symbol
             broader_results = []
             for root, dirs, files in os.walk(os.path.join(SRC_ROOT, "sys")):
-                for fname in files[:50]:  # Limit to avoid slow walks
+                if _out_of_time():
+                    truncated = True
+                    break
+                # This loop used to read `files[:50]` "to avoid slow walks".
+                # That bounded nothing -- all 3315 directories were still
+                # visited -- while making 2872 of 15221 source files (19%,
+                # in the 133 directories holding more than 50 entries)
+                # permanently invisible to the fallback. A symbol defined
+                # only in sys/dev/ath or sys/contrib could therefore report
+                # "not found" when it was present. The shared deadline is a
+                # real bound; the truncation is now reported, not silent.
+                for fname in files:
                     if not fname.endswith(('.c', '.h', '.m')):
                         continue
+                    if _out_of_time():
+                        truncated = True
+                        break
                     fpath = os.path.relpath(os.path.join(root, fname), SRC_ROOT)
                     try:
                         content = Path(os.path.join(root, fname)).read_text(errors="ignore")
@@ -2366,14 +2473,44 @@ class ResolveCDefinition(Tool):
             if broader_results:
                 return (
                     f"No exact definition found for '{symbol}', "
-                    f"but it appears in these files:\n" +
+                    f"but it appears in these files"
+                    + (" (list incomplete: search budget reached)"
+                       if truncated else "") + ":\n" +
                     "\n".join(f"  - {f}" for f in broader_results[:10]) +
-                    "\n\nTry reading one of these files with read_freebsd_source."
+                    "\n\nTry reading one of these files with read_freebsd_source.",
+                    truncated,
                 )
 
-            return f"Could not find definition for '{symbol}' in {SRC_ROOT}"
+            if truncated:
+                # NOT the same claim as "could not find definition". The scan
+                # was cut off, so absence here is unproven -- saying otherwise
+                # would hand the writer a false negative it would then write
+                # prose against, and the fact-checker grades prose, not the
+                # provenance of this string. Name the budget so the reader can
+                # raise it rather than concluding the symbol does not exist.
+                return (
+                    f"Search for '{symbol}' exceeded the "
+                    f"{_RESOLVE_WALK_BUDGET_SEC:.0f}s budget and was stopped "
+                    f"before the whole tree was scanned. This is NOT evidence "
+                    f"the symbol is absent -- it is unresolved. Narrow the "
+                    f"search with start_file, or raise "
+                    f"DAEMONDOCS_RESOLVE_BUDGET_SEC.",
+                    True,
+                )
 
-        return f"=== Definition for '{symbol}' ===\n" + "\n".join(found_defs[:15])
+            return (f"Could not find definition for '{symbol}' in {SRC_ROOT}",
+                    False)
+
+        if truncated:
+            return (
+                f"=== Definition for '{symbol}' (PARTIAL: {_RESOLVE_WALK_BUDGET_SEC:.0f}s "
+                f"budget reached, tree not fully scanned) ===\n"
+                + "\n".join(found_defs[:15]),
+                True,
+            )
+
+        return (f"=== Definition for '{symbol}' ===\n"
+                + "\n".join(found_defs[:15]), False)
 
 
 def gather_source_context(chapter: dict) -> str:

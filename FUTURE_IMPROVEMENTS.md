@@ -17,6 +17,101 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-09-01] A redundant `|\n` in the declaration regex was exponential, and the hang detector's dump blamed the wrong code
+
+The rate floor from the entry below paid for itself the day it shipped:
+ch38 and ch34 both produced stack dumps that the old `second > first`
+probe would have suppressed. ch34's was a genuine stalled `recv`. ch38's
+pointed here, and the first reading was wrong.
+
+**The dump's deepest worker frame** was `re/__init__.py:177 in search`,
+called from `ResolveCDefinition.forward`, so the obvious suspect was the
+tool's unbounded `os.walk` over `sys/` — ~15200 files, ~357 MB, up to
+three `re.search` passes each, no timeout, while the fact-check greps
+next door have had `_GREP_TIMEOUT_SEC` since ch13. Measured: **16.2s**
+for a full tree scan. Real, but not a 1808s wedge. The walk was a red
+herring; a single instantaneous sample lands inside `re.search` most of
+the time precisely *because* that is where the loop spends itself.
+
+**The actual defect** was in `_FUNC_DECL_RE`, whose argument-list groups
+were `(?:[^{;=()]|\n)*?`. A negated character class already matches
+newline — it is not DOTALL-dependent — so the `|\n` branch was pure
+redundancy, and every newline in the argument list had two ways to
+match: 2^n paths across n lines. On `sys/arm64/arm64/vfp.c`, an
+unremarkable 32 KB file, `_extract_func_sigs` did not terminate.
+
+| | before | after |
+|---|---|---|
+| `_extract_func_sigs(vfp.c)` | >25s, unbounded | **0.002s**, 47 sigs |
+| identical output, 2500-file sample of `sys/` | — | **2500/2500** |
+| declaration classes still resolved | — | all (groups 4) |
+
+The trigger is ordinary code: an `if (` a few lines above a function
+definition. The `(?!return|goto|...|if|...)` guard excludes `if` only at
+the *start* of a line, and the match begins earlier.
+
+**Two rejected alternatives, both measured.**
+
+1. **A length bound on the arg list.** `{0,400}` terminates but
+   silently drops real declarations with long argument lists — four in
+   `sys/dev/pms/RefTisa/sallsdk/spc/saproto.h`, whose parameter lists
+   run ~470 chars. `{0,800}` reintroduces the hang. There is no cap that
+   both terminates and keeps every real match, so the cap would have
+   been load-bearing *and* lossy. The alternation itself is the defect.
+2. **An atomic group on the identifier run**
+   (`(?=(?P<a>...))(?P=a)`), by analogy with the
+   `_extract_fenced_function_defs` fix. Did not help: stripping the
+   pattern down showed the run was innocent — a single-iteration variant
+   still took 4.9s, while replacing the newline alternation alone took
+   it to 0.000s.
+
+**Also fixed, and independent of the hang:** the three walks now share
+one deadline (`_RESOLVE_WALK_BUDGET_SEC`, env
+`DAEMONDOCS_RESOLVE_BUDGET_SEC`, default 45s, `0` disables). This is a
+**seatbelt, not the fix** — the same relation the scan budget in
+`_extract_fenced_function_defs` has to its atomic group. It checks
+between files and cannot interrupt one pathological match; `re` has no
+timeout.
+
+Two things about it are easy to get wrong, and I got the first one wrong
+before measuring:
+
+- **The default must exceed a complete negative search.** A search that
+  legitimately finds nothing costs **23.0s** (`cc_record_rtt`,
+  `cc_newround`, `prx` all 22.8-23.0s uncapped). My first default was
+  20s, which converted every genuine "Could not find definition" into
+  "budget exceeded" — a correct answer degraded into an unresolved one.
+  45s leaves ~2x headroom.
+- **A truncated search must not claim absence.** "Could not find
+  definition" is a positive claim the writer turns into prose, and the
+  fact-checker grades the prose, not the provenance of the string. On
+  truncation the tool now says it was cut short and is explicitly *not*
+  evidence of absence. Same failure class as a verifier that silently
+  skips a claim class: a false clean is worse than no check.
+
+The old "limit" in the fallback walk deserves naming: `for fname in
+files[:50]  # Limit to avoid slow walks`. It bounded nothing — all 3315
+directories were still visited — while making **2872 of 15221 source
+files (19%)**, in the 133 directories holding more than 50 entries,
+permanently invisible. A symbol defined only in `sys/dev/ath` or
+`sys/contrib` could report "not found" while present.
+
+Regression tests in `tests/test_resolve_budget.py` (22 checks). Group 2
+uses `SIGALRM`, because a regression test for a hang must **fail** rather
+than hang — the first draft wedged the suite when the fix was reverted,
+which is a test that cannot report the bug it exists for. The revert arm
+produces 6 named FAILs and exits 1. Group 3 pins the redundancy claim
+itself (20k random strings over `a;=(){}\n\t *,\\` with zero language
+difference) so nobody reintroduces the newline branch for readability.
+
+**What this does not fix.** ch38's step durations still climbed
+15s → 881s as its input grew 12k → 934k tokens over 31 steps, ~40k per
+step. Both this regex and the walk budget make a wedge legible and
+bounded; neither curbs what the writer asks for. The writer called
+`resolve_c_definition(symbol='prx')` — a three-character local variable
+that cannot be a kernel symbol and costs a full 23s tree scan to
+disprove. Curbing that is still open.
+
 ### [DONE — shipped 2026-09-01] A decode trickle read as liveness, so every hang guard suppressed itself and ch7 died undiagnosed
 
 ch7 (VM) was killed by the runner's wall-clock watchdog after 3861s. The

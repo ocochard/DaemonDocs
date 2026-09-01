@@ -175,6 +175,39 @@ pattern.
   pins that `return f(a);` / `x = f(a);` are not read as
   declarations — both were real bugs during development.
 
+- **`_FUNC_DECL_RE`'s arg lists must stay `[^{;=()]*?`, never
+  `(?:[^{;=()]|\n)*?`** — a negated character class already matches
+  newline, so the `|\n` branch was pure redundancy that gave every
+  newline two ways to match: 2^n paths across n lines. On
+  `sys/arm64/arm64/vfp.c`, an ordinary 32 KB file,
+  `_extract_func_sigs` never returned (>25s, unbounded). This is what
+  wedged ch38 on 2026-09-01; the hang detector's dump pointed at the
+  `resolve_c_definition` tree walk, which is genuinely slow (16.2s for
+  a full scan) but finishes — the walk was a red herring. Removing
+  `|\n` takes the file to 0.002s with identical output across a
+  2500-file sample of `sys/`. **Do not "fix" this with a length
+  bound**: `{0,400}` terminates but silently drops real declarations
+  with long argument lists (four in `sys/dev/pms/.../saproto.h`), and
+  `{0,800}` reintroduces the hang — no cap both terminates and keeps
+  every real match. Re-run `tests/test_resolve_budget.py`.
+- **A truncated search must not report absence** —
+  `resolve_c_definition` walks `sys/` up to three times (~15200 files,
+  ~357 MB) and now shares one deadline across all three
+  (`_RESOLVE_WALK_BUDGET_SEC`, env `DAEMONDOCS_RESOLVE_BUDGET_SEC`,
+  default 45s, `0` disables). The default is measured, not chosen: a
+  **complete** search that legitimately finds nothing costs 23.0s, so
+  a 20s ceiling turned every genuine "Could not find definition" into
+  a false "unresolved". When the budget does fire, the tool says it was
+  truncated and explicitly not evidence of absence — that string
+  becomes writer prose, so claiming absence on a cut-short scan is the
+  same silent-degradation trap as a verifier that skips a claim class.
+  The budget is a **seatbelt, not the fix** (same relation as the scan
+  budget in `_extract_fenced_function_defs` to its atomic group): it
+  checks between files and cannot interrupt one pathological match.
+  The fallback walk's old `files[:50]` per-directory cap bounded
+  nothing — all 3315 directories were still visited — while hiding
+  2872 of 15221 source files (19%); it is gone.
+
 - **`additional_authorized_imports=["re", "json"]`** in
   `create_writer_agent` — keeps the sandbox honest. Authorizing
   `os`/`pathlib` lets the model bypass the "no file I/O" prompt
