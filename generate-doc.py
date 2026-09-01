@@ -7550,8 +7550,24 @@ _GLOSS_CUE_RE = re.compile(
 # space", "KVM: the kernel's address space". Anchored at position 0 of the
 # post-term text, and the gloss body must contain at least two words so a
 # bare cross-reference like "KVM (see below)" does not count.
+# NOTE the leading skip group: a term can be followed by a CLOSING delimiter
+# before its gloss begins, and the tier-2 cues are checked at offset 0 only.
+# Two forms occur in shipped chapters, both of which were being missed:
+#   `vm_object` (definition)                  -- closing backtick of a code span
+#   [mbuf](../README.md#glossary) (definition) -- tail of a markdown link
+# A term written as a code span (`vm_object`) leaves
+# its CLOSING backtick as the first character of the gloss window, because
+# _term_pattern matches the bare word INSIDE the span. Without this, the very
+# common "`term` (definition)" form failed the offset-0 tier-2 check and the
+# term was reported unglossed -- ch5 shipped a correct gloss for `vm_object`
+# and the scanner flagged it anyway (2026-09-01).
+#
+# This cannot admit a gloss from inside a code span: the match starts at the
+# bare word, so any backtick here is necessarily the span's closer, never an
+# opener. Backticks are consumed, not required -- plain-prose terms are
+# unaffected.
 _GLOSS_ADJACENT_RE = re.compile(
-    r"^\s*(?:"
+    r"^(?:`|\]\([^)\s]*\))*\s*(?:"
     r"\(\s*(?P<paren>[^)]{6,120})\)|"
     r"[—–]\s*(?P<dash>[^.;\n]{6,120})|"
     r":\s+(?P<colon>[^.;\n]{6,120})"
@@ -7653,7 +7669,20 @@ def _extract_unglossed_jargon(text: str) -> List[str]:
     definitional cue within `_GLOSS_WINDOW_CHARS` and which are not
     defined in an explicit `## Glossary` section.
     """
-    prose = _mask_fenced_blocks(text)
+    # Strip the auto-generated nav sidebar BEFORE scanning. Its link text
+    # ("Kernel Modules and the Linker -- KLD, SYSINIT, and linker sets") is
+    # built by _build_nav_sidebar from other chapters' TITLES, so the terms
+    # in it were never written by the writer and cannot be glossed there --
+    # the sidebar is regenerated on every nav rebuild and any gloss added to
+    # it would be overwritten. Worse, it sits at the TOP of the file, so it
+    # captures `first prose use` for every term it mentions and hides a real
+    # gloss further down: that is exactly how ch5 was flagged for UMA, KLD
+    # and SYSINIT while carrying correct glosses at lines 399-400.
+    #
+    # Measured across the 100 shipped chapters: 99 of 159 findings (62%)
+    # were nav-line artifacts. Reuses the same stripper the nav rebuild
+    # uses, so the two cannot disagree about what a nav block is.
+    prose = _mask_fenced_blocks(_strip_existing_nav_block(text))
     glossary = _find_glossary_section(text)
 
     unglossed = []
@@ -7689,7 +7718,10 @@ def _extract_unexpanded_acronyms(text: str) -> List[str]:
     set is applied, and anything appearing fewer than twice is ignored
     (a one-off mention is rarely load-bearing).
     """
-    prose = _strip_inline_code(_mask_fenced_blocks(text))
+    # Nav sidebar stripped first -- same reason as _extract_unglossed_jargon:
+    # generated link text, not authored prose, and it front-runs first use.
+    prose = _strip_inline_code(_mask_fenced_blocks(
+        _strip_existing_nav_block(text)))
 
     counts: Dict[str, int] = {}
     for m in _ACRONYM_RE.finditer(prose):
