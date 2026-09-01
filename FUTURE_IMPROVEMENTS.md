@@ -17,6 +17,110 @@ pipeline is the way it is, and several have load-bearing comments in
 
 ## Pipeline quality issues observed in real runs
 
+### [DONE — shipped 2026-09-02] The struct verifier picked the biggest homonym and called it authoritative, so ch4 was told its correct fields were hallucinated
+
+**Symptom.** ch4 (build system) finished `rc=0` in 12781s but shipped
+UNVERIFIED. Its fact-check raised five issues; on inspection **all of
+them were false positives**, and the writer said so:
+
+> Conclusion: All four flagged issues are false positives from a
+> fact-checking [pass] ... introduce hallucinations into a correct
+> FreeBSD chapter.
+
+The writer was right. It refused the fact-fix and shipped correct prose.
+
+**What the fact-check claimed, and the truth.**
+
+| Claim | Reality |
+|---|---|
+| `struct cfgfile`, `struct file_list` not in tree | Both at `usr.sbin/config/config.h:97,103` |
+| `struct device` fields `d_done, d_name, yyfile, d_next` don't exist | All four verbatim from `usr.sbin/config/config.h:139` |
+| `struct device` body has 0 overlap with real definition | Same cause |
+| Kernel option `FOO` not in `options*`/`NOTES` | Metasyntactic placeholder quoted from the chapter's own subject file, `share/mk/src.opts.mk` (`WITH_FOO`, `MK_FOO`) |
+
+**Two independent root causes.**
+
+1. **Coverage gap.** ch4 documents `config(8)` but `usr.sbin/config`
+   was not in its `source_dirs` (only `share/mk`, `tools/build`). The
+   real definitions were outside the search roots entirely.
+
+2. **Silent wrong-winner (the dangerous one).** The tree holds **six**
+   `struct device` definitions. `_real_struct_fields` selected by
+   **max field count**, so linuxkpi's 22-field struct
+   (`sys/compat/linuxkpi/common/include/linux/device.h`) beat
+   config(8)'s 4-field one. Selecting by size is exactly backwards for
+   the case that matters: a small canonical struct against a large
+   unrelated homonym.
+
+**Why this was worse than ch21.** ch21 failed *open* — fact-fix
+stubbed, the banner went up, the damage was visible. This fails
+*closed*. The "carry the ANSWER" design (see CODE_MAP) handed the
+writer the wrong field list as ground truth and told it
+`Do NOT re-derive them by reading the header`. Had the writer
+complied, correct prose would have been rewritten into wrong prose
+that every downstream stage would then certify as clean — a
+hallucination *manufactured by the hallucination detector*. Only the
+writer's refusal prevented it, and refusal is not a mechanism we can
+rely on.
+
+**Fix.** `_real_struct_fields` now collects every *distinct* parsed
+definition instead of the largest. When candidates disagree it logs
+the competing paths and returns empty — "verification unavailable",
+which callers already treat as don't-flag. Unambiguous structs are
+unaffected: `vm_page` still resolves to its 16 fields. Also added
+`usr.sbin/config` to ch4's `source_dirs`, which fixes claim 1
+independently.
+
+Ambiguity is not a rare edge: `device`, `buf`, `file`, `node` and
+friends recur across `sys/`, `usr.sbin/`, and the compat shims. This
+was mis-verifying silently for every chapter that touched one.
+
+**Not fixed: the `FOO` class.** The kernel-option verifier cannot tell
+an option name from a metasyntactic placeholder in quoted
+documentation. Narrow and low-harm (the writer dismissed it), but it
+means option findings inside quoted `share/mk` prose are unreliable.
+The general shape — *verifiers cannot see quoting context* — is the
+same gap that makes prose-level claims unverifiable (roadmap step 4).
+
+**A third defect, found while fixing the second: burial.** The
+candidate loop only opens `candidates[:32]`. `struct thread` matches
+**1012 files** under `sys/` (nearly every kernel source takes a
+`struct thread *td` parameter), and the real `sys/sys/proc.h` sorted
+to **rank 39** — losing on alphabetical order within the canonical-
+header tier to `_rmlock.h`, `acct.h`, `alq.h`. It was never opened, so
+`struct thread` silently returned "verification unavailable" for every
+thread/process chapter. `struct proc` was buried the same way.
+
+Fixed with a second grep for the *definition shape*
+(`struct NAME {`, or `struct NAME` at end-of-line for K&R) whose hits
+sort ahead of mere mentions, so real definitions enter the slice
+regardless of filename. Falls back to the original ordering on
+grep failure or timeout. `thread` now resolves to 127 fields, `proc`
+to 100.
+
+**That prefilter caused a regression, repaired in the same change.**
+Promoting definition sites pulled `sys/netpfil/ipfw/test/dn_test.h` —
+dummynet's two-field *fake mbuf* — into the slice, which made the real
+`sys/sys/mbuf.h` look ambiguous and turned off verification for ch36's
+core struct. Test-path definitions (`/test/`, `/tests/`, `/testsuite/`,
+`/regress/`) are now excluded from the ambiguity determination: a stub
+is not a competing authority. `mbuf` resolves to 28 fields again.
+
+Worth noting the interaction — the ambiguity check and the burial fix
+pull against each other. Surfacing more true definitions also surfaces
+more false rivals, so widening candidate discovery *requires* the stub
+exclusion or it converts silent-wrong-answers into silent-no-answers.
+
+**Accepted coverage loss.** `struct resource` now skips verification:
+`sys/compat/linuxkpi/common/include/linux/ioport.h` (4 fields) and
+`sys/sys/rman.h` genuinely disagree. Max-field-count previously picked
+rman.h correctly *by luck*. Skipping is the right trade — the ch4
+failure mode is worse than no check — but it is a real loss for ch23.
+
+**Guard.** `tests/test_struct_ambiguity.py` (14 checks), verified
+against pre-change code: the ambiguity checks fail with the exact
+bogus message ch4 received, and the burial checks fail on `thread`.
+
 ### [DONE — shipped 2026-09-01] A redundant `|\n` in the declaration regex was exponential, and the hang detector's dump blamed the wrong code
 
 The rate floor from the entry below paid for itself the day it shipped:

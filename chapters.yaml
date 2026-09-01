@@ -167,6 +167,11 @@ chapters:
     source_dirs:
       - "share/mk"
       - "tools/build"
+      # config(8) parses kernel config files and owns `struct device`,
+      # `struct cfgfile`, `struct file_list`. Without it in the search
+      # roots the fact-checker cannot see those definitions and (ch4,
+      # 2026-09-01) flagged all three as hallucinated.
+      - "usr.sbin/config"
     source_files:
       - "Makefile.inc1"
       - "share/mk/bsd.sys.mk"

@@ -8243,6 +8243,41 @@ def _real_struct_fields(struct_name: str, src_root: str,
         line for line in result.stdout.splitlines() if line.strip()
     ]
 
+    # Prefer files containing the DEFINITION shape, not just a mention.
+    # The grep above is deliberately loose (`struct NAME` with no brace,
+    # so K&R `struct foo` + newline + `{` still matches), which for a
+    # ubiquitous type is overwhelmingly forward declarations and
+    # `struct thread *td` parameters.
+    #
+    # ch8, 2026-09-02: `struct thread` matched 1012 files under sys/.
+    # The real definition (sys/sys/proc.h) sorted to rank 39 — purely
+    # alphabetical within the canonical-header tier, losing to
+    # _rmlock.h / acct.h / alq.h — so the candidates[:32] slice never
+    # opened it, and the struct silently returned "verification
+    # unavailable" for every thread/process chapter.
+    #
+    # A second grep for the definition shape promotes real definition
+    # sites ahead of mentions so the slice sees them regardless of
+    # filename. On failure/timeout we keep the original ordering rather
+    # than lose the candidate list.
+    def_pattern = (
+        "struct[[:space:]]+" + re.escape(struct_name)
+        + "[[:space:]]*([{]|$)"
+    )
+    def_files = set()
+    try:
+        def_result = subprocess.run(
+            f"grep -rlE --include='*.c' --include='*.h' "
+            f"{shlex.quote(def_pattern)} {roots_arg} 2>/dev/null",
+            shell=True, capture_output=True, text=True,
+            errors="replace", timeout=_GREP_TIMEOUT_SEC,
+        )
+        def_files = {
+            ln for ln in def_result.stdout.splitlines() if ln.strip()
+        }
+    except subprocess.TimeoutExpired:
+        pass
+
     # Sort candidates by likelihood of being the canonical definition.
     # The `sys/sys/` and `sys/<arch>/include/` directories hold the
     # primary kernel headers; deeper paths (e.g. `sys/netpfil/ipfw/test/`)
@@ -8263,6 +8298,7 @@ def _real_struct_fields(struct_name: str, src_root: str,
         is_h = path.endswith(".h")
         depth = rel.count(os.sep)
         return (
+            0 if path in def_files else 1,
             0 if canonical and is_h else (1 if is_h else 2),
             depth,
             path,
@@ -8303,9 +8339,45 @@ def _real_struct_fields(struct_name: str, src_root: str,
     # read. The first definition we find under the canonical sort is
     # almost always right; we still pick max-fields across the slice to
     # tolerate test-stub headers in the noise.
-    best_fields: List[str] = []
-    best_path: Optional[str] = None
+    # Collect EVERY distinct definition, not just the biggest one.
+    #
+    # ch4 (build system), 2026-09-01: the tree holds six different
+    # `struct device` definitions. This loop picked the 22-field
+    # linuxkpi one (`sys/compat/linuxkpi/.../device.h`) purely because
+    # max-field-count wins, and the fact-check then told the writer
+    # that config(8)'s real fields (`d_done`, `d_name`, `yyfile`,
+    # `d_next` — verbatim from `usr.sbin/config/config.h`) "do not
+    # exist", handing over the linuxkpi list as authoritative with
+    # "Do NOT re-derive them by reading the header."
+    #
+    # Selecting by size is actively backwards for exactly the case
+    # that matters: a small canonical struct competing with a large
+    # unrelated homonym. And when a name is genuinely ambiguous there
+    # IS no single authoritative field list, so asserting one is a
+    # fabrication generator. The writer rejected it and was right; had
+    # it complied, correct prose would have been rewritten into wrong
+    # prose that every later stage would then "verify" as clean.
+    #
+    # So: when candidates disagree, return empty = "verification
+    # unavailable". Callers already treat empty as don't-flag, which
+    # is the fail-open behavior this case needs.
+    # Test stubs are not competing authorities. `sys/netpfil/ipfw/test/
+    # dn_test.h` defines a two-field "fake mbuf" for the dummynet test
+    # harness; counting it as a rival definition would make the real
+    # `sys/sys/mbuf.h` unverifiable. The pre-existing candidate sort
+    # already de-prioritised these by path depth, but the ambiguity
+    # check needs them gone entirely, not merely ranked lower.
+    def _is_test_stub(path: str) -> bool:
+        low = path.replace(os.sep, "/").lower()
+        return (
+            "/test/" in low or "/tests/" in low
+            or "/testsuite/" in low or "/regress/" in low
+        )
+
+    distinct: Dict[frozenset, str] = {}
     for candidate in candidates[:32]:
+        if _is_test_stub(candidate):
+            continue
         try:
             with open(candidate, "r", encoding="utf-8",
                       errors="replace") as f:
@@ -8316,12 +8388,26 @@ def _real_struct_fields(struct_name: str, src_root: str,
         if body is None:
             continue
         fields = _parse_struct_fields(body)
-        if len(fields) > len(best_fields):
-            best_fields = fields
-            best_path = candidate
+        if not fields:
+            continue
+        distinct.setdefault(frozenset(fields), candidate)
 
-    if best_fields:
-        real = frozenset(best_fields)
+    if len(distinct) > 1:
+        # Ambiguous: same struct name, materially different bodies.
+        # Do not guess. Cache the empty result so the whole run stays
+        # consistent rather than flip-flopping per revision round.
+        paths = ", ".join(
+            sorted(os.path.relpath(v, src_root) if v.startswith(src_root)
+                   else v for v in distinct.values())[:4]
+        )
+        print(f"  [fact-check] struct {struct_name}: {len(distinct)} "
+              f"differing definitions ({paths}) — skipping field "
+              f"verification (ambiguous)")
+        _STRUCT_FIELDS_CACHE[cache_key] = frozenset()
+        return frozenset()
+
+    if distinct:
+        real = next(iter(distinct))
         _STRUCT_FIELDS_CACHE[cache_key] = real
         return real
 

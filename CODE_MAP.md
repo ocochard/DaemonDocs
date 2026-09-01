@@ -347,6 +347,25 @@ pattern.
   sends the writer to rewrite prose into an unrelated file. A
   wrong correction is worse than no correction: the writer trusts
   it.
+- **Ambiguous struct names are not verified at all.**
+  `_real_struct_fields` collects every *distinct* parsed definition
+  and returns empty when they disagree, logging the competing paths.
+  It used to pick max-field-count, which is backwards: on 2026-09-01
+  ch4 the 22-field linuxkpi `struct device` beat config(8)'s 4-field
+  one and the writer was told its verbatim-correct fields were
+  hallucinated. Because the message below carries the real field list
+  as authoritative, a wrong winner *manufactures* hallucinations
+  rather than catching them — so ambiguity must fail open, never
+  guess. Guard: `tests/test_struct_ambiguity.py`.
+- **Candidate discovery is definition-shape-first, and test paths are
+  excluded.** A loose `struct NAME` grep returns mostly forward decls
+  and parameters — `struct thread` matched 1012 files, burying
+  `sys/sys/proc.h` at rank 39 past the `[:32]` slice, so it silently
+  went unverified. A second `grep -E` for `struct NAME {` (or EOL, for
+  K&R) sorts real definitions first. Because that also surfaces test
+  stubs, definitions under `/test/`, `/tests/`, `/testsuite/`, or
+  `/regress/` are dropped before the ambiguity count — otherwise
+  dummynet's two-field fake `mbuf` makes the real one unverifiable.
 - **Fact-check messages carry the ANSWER, not just the verdict.**
   `_verify_struct_bodies` already parses the real field list in
   order to detect a mismatch, so the flag string includes it:
