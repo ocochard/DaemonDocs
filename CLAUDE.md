@@ -25,10 +25,22 @@ LAN endpoints"; substitute from there, or read them off a running
 job with `pgrep -lf runner.sh`.
 
 Set `OPENAI_BASE_URL` to one of those and `OPENAI_MODEL=Qwen3.8-27B-UD-Q8_K_XL`
-(the current model served at both, as of 2026-08-22 — verify with
-`curl -s <endpoint>/models` rather than trusting this line). Do not
-SSH into the endpoints to launch jobs. See `CODE_MAP.md` "Execution
-topology."
+(the alias served at both, as of 2026-09-01). Do not SSH into the
+endpoints to launch jobs. See `CODE_MAP.md` "Execution topology."
+
+**`curl -s <endpoint>/models` cannot tell you which model is loaded** —
+it returns only llama-server's `--alias`, and the launcher script
+deliberately gives two different recipes the *same* alias so that
+swapping one for the other needs no change to `OPENAI_MODEL`. As of
+2026-09-01 both `qwen38-mtp` (Q8_0 dense + matched-precision MTP draft
+head, the production recipe) and `qwen38-q8` (plain Q8_K_XL, no draft
+head) answer `Qwen3.8-27B-UD-Q8_K_XL`. A matching alias therefore proves
+only that the endpoint is up.
+
+To identify the actual recipe, read the server's argv on the endpoint
+host and look at `--model` and `--spec-draft-model`; `--spec-type
+draft-mtp` plus a draft model means MTP, its absence means plain Q8.
+Read-only inspection like this is not "launching a job" and is fine.
 
 **The model is a reasoning model** and both agents keep reasoning
 enabled. Do not "optimize" it away: it is ~3x faster per call and far
