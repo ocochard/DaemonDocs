@@ -4659,12 +4659,64 @@ def run_chapter(chapter: dict, writer, reviewer, max_revisions: int,
                 new_draft = _run_agent(writer, "fact-fix", fact_prompt,
                                        stats=stats)
                 if _looks_like_stub(new_draft):
-                    # Hit max_steps before producing prose. Keep the
-                    # pre-fact-fix draft (still contains hallucinations
-                    # but is at least readable) and mark fact-fix failed.
+                    # Hit max_steps before producing prose, or drifted into
+                    # returning a status string. ONE retry with an explicit
+                    # final_answer reminder, mirroring the initial-draft
+                    # stub-retry above — same drift, same recovery.
+                    #
+                    # Why retry here at all, when this stage deliberately
+                    # did not: the fallback is not "slightly worse prose",
+                    # it is SHIPPING KNOWN HALLUCINATIONS. fact-check has
+                    # already named specific fabricated symbols; keeping the
+                    # pre-fact-fix draft keeps every one of them and only
+                    # flags the file. ch21 (pf) shipped that way on
+                    # 2026-08-27 -- reviewer PASS 8/8, then fact-check found
+                    # hallucinated DTrace probes and a bogus pf_state_cmp
+                    # sub-struct, fact-fix stubbed, and the fabrications
+                    # went out under an UNVERIFIED banner.
+                    #
+                    # Still bounded and still fails safe: exactly one extra
+                    # call, and if the retry also stubs we keep the
+                    # pre-fact-fix draft and mark fact_fix_failed exactly as
+                    # before. The banner behaviour is unchanged.
                     print("  ⚠ fact-fix: output looks truncated/stub — "
-                          "keeping pre-fact-fix draft")
-                    fact_fix_failed = True
+                          "retrying once with explicit final_answer "
+                          "instructions ...")
+                    fact_retry_prompt = (
+                        fact_prompt
+                        + "\n\n---\n\n"
+                        + "**RETRY — your previous attempt was rejected as "
+                          "a stub.**\n\n"
+                        + "You likely returned a short status string, a\n"
+                        + "summary of your edits, or ran out of steps before\n"
+                        + "returning prose. Neither works.\n\n"
+                        + "Do this instead, exactly:\n"
+                        + "1. Build the COMPLETE corrected chapter as a\n"
+                        + "   Python string variable (call it `content`) —\n"
+                        + "   the whole document, not just the fixed parts\n"
+                        + "   and not a description of what you changed.\n"
+                        + "2. Call `final_answer(content)`. Its return value\n"
+                        + "   IS the chapter; it must be the full Markdown\n"
+                        + "   body starting with `# " + chapter['title'] + "`.\n"
+                        + "3. Do NOT call open(), Path.write_text, or any\n"
+                        + "   file I/O. They raise InterpreterError.\n"
+                        + "4. Keep every section that was already correct\n"
+                        + "   verbatim. Only the flagged claims change.\n"
+                    )
+                    try:
+                        retry_draft = _run_agent(writer, "fact-fix-retry",
+                                                 fact_retry_prompt,
+                                                 stats=stats)
+                    except Exception as e:
+                        print(f"  ✗ fact-fix retry failed: {e}")
+                        retry_draft = ""
+                    if retry_draft and not _looks_like_stub(retry_draft):
+                        print("  ✓ fact-fix retry produced a real draft")
+                        draft = retry_draft
+                    else:
+                        print("  ⚠ fact-fix retry still stubbed — "
+                              "keeping pre-fact-fix draft")
+                        fact_fix_failed = True
                 else:
                     draft = new_draft
             except Exception as e:

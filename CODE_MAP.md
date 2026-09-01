@@ -109,8 +109,20 @@ revision regressed. Don't undo this — see FUTURE_IMPROVEMENTS.md
 
 **Stub detection:** `_looks_like_stub` flags drafts that look like
 status strings (`"README.md successfully written"`) instead of
-chapter content. Initial-draft stubs get one retry; revision /
-fact-fix stubs abort that step and roll back to the best draft.
+chapter content. Initial-draft **and fact-fix** stubs get one retry
+with an explicit `final_answer()` reminder; **revision** stubs abort
+that step and roll back to the best draft.
+
+The asymmetry is deliberate and turns on what the fallback costs. A
+rolled-back *revision* loses polish -- the best-draft is still
+reviewer-graded prose. A rolled-back *fact-fix* ships content
+fact-check has already proven false: ch21 (pf) went out on 2026-08-27
+with hallucinated DTrace probes and a bogus `pf_state_cmp` sub-struct
+after its fact-fix stubbed, flagged only by the UNVERIFIED banner. So
+fact-fix retries once (2026-09-01); if the retry also stubs, the
+pre-fact-fix draft is kept and `fact_fix_failed` is set exactly as
+before, so the banner behaviour is unchanged. Test:
+`tests/test_factfix_stub_retry.py`.
 
 **The reviewer is a `CodeAgent` with only `search_books`** — no
 source-tree access. It cannot grep, cannot read files. Anything

@@ -1856,6 +1856,23 @@ exhibit this — it returns the chapter via `final_answer()` correctly.
    instead of chapter content. Initial-draft stubs get one retry;
    revision / fact-fix stubs abort that step and roll back to the best
    draft. Documented in `CODE_MAP.md` ("Stub detection").
+
+   **Amended 2026-09-01: fact-fix now retries once too.** Rolling back a
+   fact-fix is not the same trade as rolling back a revision. A
+   rolled-back revision costs polish; a rolled-back fact-fix ships
+   claims the fact-checker has already proven false. ch21 (pf, run
+   finished 2026-08-27T14:58Z) is the case: reviewer PASS 8/8, then
+   fact-check found DTrace probes in no `SDT_PROBE_DEFINE*` macro, a
+   hallucinated `pf_state_cmp` sub-struct, and a suspect `net.pfil`
+   sysctl; fact-fix stubbed, `keeping pre-fact-fix draft` fired, and all
+   of it shipped under the UNVERIFIED banner. The retry reuses the
+   fact-check prompt (so the flagged symbols stay in front of the
+   writer) plus the same explicit `final_answer()` reminder the
+   initial-draft retry uses. Bounded at exactly one extra call, and if
+   the retry also stubs the old path runs unchanged — pre-fact-fix draft
+   kept, `fact_fix_failed` set, banner emitted. Revision stubs are
+   deliberately left alone. Test: `tests/test_factfix_stub_retry.py`
+   (verified to fail on the pre-change code, 8 named failures).
 3. **Sampler params pinned** — `create_writer_agent` and
    `create_reviewer_agent` pass `temperature=0.6, top_p=0.95` to
    `OpenAIServerModel` so all llama-server endpoints behave identically
