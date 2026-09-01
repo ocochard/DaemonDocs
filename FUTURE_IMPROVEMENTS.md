@@ -104,13 +104,39 @@ produces 6 named FAILs and exits 1. Group 3 pins the redundancy claim
 itself (20k random strings over `a;=(){}\n\t *,\\` with zero language
 difference) so nobody reintroduces the newline branch for readability.
 
-**What this does not fix.** ch38's step durations still climbed
-15s → 881s as its input grew 12k → 934k tokens over 31 steps, ~40k per
-step. Both this regex and the walk budget make a wedge legible and
-bounded; neither curbs what the writer asks for. The writer called
+**What this does not fix.** The writer called
 `resolve_c_definition(symbol='prx')` — a three-character local variable
 that cannot be a kernel symbol and costs a full 23s tree scan to
-disprove. Curbing that is still open.
+disprove. Both this regex and the walk budget make a wedge legible and
+bounded; neither curbs what the writer asks for. Curbing that is still
+open.
+
+**Correction (2026-09-01), and a trap worth naming.** An earlier version
+of this paragraph said ch38's "input grew 12k → 934k tokens over 31
+steps, ~40k per step" and treated that as unbounded context growth. That
+reading is wrong. **The `Input tokens:` field in a smolagents step line is
+a RUNNING TOTAL across the run, not the size of that call's prompt.** The
+per-call prompt is the step-to-step *delta*: on ch38 it went 11.9k →
+44.4k over 31 steps, and on ch5's draft retry 12.7k → 42.0k over 52 —
+ordinary ReAct history accumulation, nowhere near the 131072-token
+context. Nothing was growing pathologically.
+
+Two further claims died with it. Tool observations are not the driver:
+across ch5's 52 draft steps every `Out:` block totals 4,518 chars
+(~1.1k tokens), about 1% of the transcript. And the slow steps are not
+slow from prefill — decode holds a flat ~15 tok/s throughout.
+
+What actually costs the wall clock is **per-step output volume**, the
+same distribution the 2026-08-23 `WRITER_MAX_TOKENS` entry documented on
+ch3. ch5's draft retry: step 52 generated 14,377 tokens in 955s (24% of
+a 3,910s draft), step 51 another 7,783 in 478s; the top 8 of 52 steps are
+64% of the draft. ch38's step 31 is the same shape — 881s for 13,196
+tokens. Step 52's 14,377 sits within 2k of the 16384 default cap and
+never truncated, so the cap is working as designed rather than failing.
+
+Before quoting a token figure from a step line, difference it. The
+cumulative number is ~20x the real prompt by the end of a long draft and
+makes healthy runs look like runaways.
 
 ### [DONE — shipped 2026-09-01] A decode trickle read as liveness, so every hang guard suppressed itself and ch7 died undiagnosed
 
