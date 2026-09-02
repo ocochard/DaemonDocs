@@ -201,27 +201,59 @@ check("second pass adds nothing", n2 == 0, f"n2={n2}")
 check("content unchanged by second pass", once == twice)
 
 print()
-print("8) the real sys/vm/README.md glossary")
+print("8) the real sys/vm/README.md glossary (frozen fixture)")
 # Pinned against real shipped text, not a synthetic sample: this is the
 # only chapter in the corpus that carried a Glossary before step 2, and
 # it is the reason the parser accepts the bullet shape at all.
-real = "/home/olivier/freebsd-src/sys/vm/README.md"
+#
+# The text is a FROZEN COPY, not the live artifact. Reading
+# ~/freebsd-src/sys/vm/README.md directly made this suite fail whenever
+# ch7 regenerated that chapter, for two reasons that are both properties
+# of the pipeline working correctly, not bugs:
+#
+#   1. The glossary's contents are model-authored, so which eight terms
+#      it defines drifts between runs. A 2026-09-02 regen swapped `PML4`
+#      for `PV list` and this block started failing on a chapter that was
+#      perfectly fine.
+#   2. Phase 4 links the file on its way out, so the shipped artifact
+#      already carries its glossary links. Asserting `n > 0` on it
+#      asserts that re-linking an already-linked file does more work --
+#      the exact opposite of the idempotence invariant group 7 pins.
+#
+# Freezing keeps the "real shipped text" property that motivated the
+# block while removing the dependency on a file another chapter owns.
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                    "fixtures", "vm_README.snapshot.md")
 if os.path.exists(real):
     with open(real, errors="replace") as f:
         rtext = f.read()
     got = mod._parse_glossary_entries(rtext)
     for term in ("Buddy allocator", "Slab", "Keg", "Zone",
-                 "Shadow chain", "TLB shootdown", "PML4", "NUMA domain"):
+                 "Shadow chain", "TLB shootdown", "PV list", "NUMA domain"):
         check(f"parsed: {term}", term in got, f"got {sorted(got)}")
     check("no spurious terms beyond the 8 defined",
           len(got) == 8, f"got {len(got)}: {sorted(got)}")
-    out, n = mod._link_glossary_first_use(rtext, "sys/vm/README.md", {})
+
+    # The fixture ships already-linked (phase 4 ran before it was
+    # frozen), so linking it again must be a no-op. Strip the links
+    # first to exercise the produces-links path on real prose.
+    unlinked = re.sub(r"\[([^\]]+)\]\(#glossary\)", r"\1", rtext)
+    check("fixture really was already linked",
+          unlinked != rtext, "no (#glossary) links found to strip")
+    out, n = mod._link_glossary_first_use(unlinked, "sys/vm/README.md", {})
     check("linking the real chapter produces links", n > 0, f"n={n}")
     out2, n2 = mod._link_glossary_first_use(out, "sys/vm/README.md", {})
     check("real chapter is idempotent too", n2 == 0 and out == out2,
           f"n2={n2}")
+    # And the shipped form is a fixed point, which is what phase 4
+    # actually guarantees about its own output.
+    _, n3 = mod._link_glossary_first_use(rtext, "sys/vm/README.md", {})
+    check("shipped (already-linked) form is a fixed point", n3 == 0,
+          f"n3={n3}")
 else:
-    print(f"  [SKIP] {real} not present")
+    # A committed fixture is missing -- that is a repo defect, not an
+    # environment difference, so fail instead of skipping quietly.
+    check("fixture vm_README.snapshot.md present", False, f"missing: {real}")
 
 print()
 print("9) every emitted anchor corresponds to a real heading")
@@ -250,7 +282,9 @@ if os.path.exists(real):
           f"dead anchors: {bad}" if bad else f"all of {sorted(anchors)} "
           f"match a heading")
 else:
-    print(f"  [SKIP] {real} not present")
+    # A committed fixture is missing -- that is a repo defect, not an
+    # environment difference, so fail instead of skipping quietly.
+    check("fixture vm_README.snapshot.md present", False, f"missing: {real}")
 
 print()
 if failures:

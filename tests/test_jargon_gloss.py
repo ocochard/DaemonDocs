@@ -127,9 +127,18 @@ check("inline-code identifiers are not acronyms",
 
 print()
 print("7) the real ch12 sentence reproduces the original miss")
-real = os.path.join("/home/olivier/freebsd-src", "sys/vm/README_bcache.md")
+# Frozen copy, not the live artifact. This block pins a DEFECT that was
+# present in the shipped chapter (KVM used in prose, no Glossary to
+# define it) -- which means the moment ch11 regenerates and the pipeline
+# fixes that defect, the test fails and reads like a code regression.
+# The snapshot was taken 2026-09-02, immediately before the step-3 A/B
+# regenerated this chapter on both arms.
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                    "fixtures", "vm_README_bcache.snapshot.md")
 if not os.path.exists(real):
-    print(f"  [SKIP] {real} not present")
+    # A committed fixture is missing -- that is a repo defect, not an
+    # environment difference, so fail instead of skipping quietly.
+    check("fixture vm_README_bcache.snapshot.md present", False, f"missing: {real}")
 else:
     text = open(real, encoding="utf-8").read()
     got = mod._extract_unglossed_jargon(text)
