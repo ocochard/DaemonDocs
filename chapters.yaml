@@ -906,6 +906,7 @@ chapters:
     source_dirs:
       - "sys/netpfil/pf"
     source_files:
+      - "sys/net/pfvar.h"
       - "sys/netpfil/pf/pf.c"
       - "sys/netpfil/pf/pf_ioctl.c"
       - "sys/netpfil/pf/pf_lb.c"
