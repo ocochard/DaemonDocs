@@ -8184,6 +8184,61 @@ def _struct_body_is_abridged(body: str) -> bool:
 _STRUCT_FIELDS_CACHE: Dict[Tuple[str, str], frozenset] = {}
 
 
+def _struct_field_aliases(content: str, real_fields: set) -> List[str]:
+    """Harvest `#define` field aliases from a struct's defining file.
+
+    FreeBSD routinely exposes a nested union member under a flat name:
+
+        sys/sys/proc.h:365
+        #define td_retval    td_uretoff.tdu_retval
+
+    `td_retval` is how ~95 files under `sys/` spell that field, but it
+    is not a `;`-terminated declarator, so `_parse_struct_fields` never
+    sees it. ch8 (2026-09-02) flagged it as a hallucination and the
+    writer deleted correct prose in response.
+
+    A macro qualifies only if its replacement text STARTS with an
+    identifier that the struct really declares. `sys/sys/proc.h` alone
+    holds 326 `#define`s; accepting them all would turn the field
+    verifier into a rubber stamp that certifies any capitalised noise as
+    a field. The prefix rule admits the alias forms actually used —
+    `td_uretoff.tdu_retval`, `m_ext.extpg_pa` — and rejects flag
+    constants, lock macros, and predicates, none of which begin with a
+    field name.
+
+    Aliases-onto-aliases (`#define m_epg_startcopy m_epg_npgs`) resolve
+    by iterating to a fixed point.
+    """
+    if not real_fields:
+        return []
+    # `#define NAME REPLACEMENT` — object-like macros only. A `(` glued
+    # to the name makes it function-like (`#define PROC_LOCK(p) ...`),
+    # which is never a field alias.
+    define_re = re.compile(
+        r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_][A-Za-z_0-9]*)[ \t]+"
+        r"([A-Za-z_][A-Za-z_0-9]*)",
+        re.MULTILINE,
+    )
+    pairs = [(m.group(1), m.group(2))
+             for m in define_re.finditer(_strip_c_comments(content))]
+    known = set(real_fields)
+    aliases: List[str] = []
+    # Fixed point: each pass may resolve aliases whose base was itself
+    # defined by an earlier alias. Bounded by len(pairs).
+    while True:
+        grew = False
+        for name, base in pairs:
+            if name in known:
+                continue
+            if base in known:
+                known.add(name)
+                aliases.append(name)
+                grew = True
+        if not grew:
+            break
+    return aliases
+
+
 def _real_struct_fields(struct_name: str, src_root: str,
                         extra_search_dirs: Optional[List[str]] = None
                         ) -> frozenset:
@@ -8408,6 +8463,22 @@ def _real_struct_fields(struct_name: str, src_root: str,
 
     if distinct:
         real = next(iter(distinct))
+        # `#define` aliases onto nested members are real field names in
+        # every sense that matters to a reader (`td_retval`), but they
+        # are not declarators, so the body parser missed them. Harvest
+        # them from the file that won, not from every candidate — a
+        # homonym's macros are not this struct's fields.
+        win_path = distinct[real]
+        try:
+            with open(win_path, "r", encoding="utf-8",
+                      errors="replace") as f:
+                win_content = f.read()
+        except OSError:
+            win_content = ""
+        if win_content:
+            extra = _struct_field_aliases(win_content, set(real))
+            if extra:
+                real = frozenset(real | set(extra))
         _STRUCT_FIELDS_CACHE[cache_key] = real
         return real
 

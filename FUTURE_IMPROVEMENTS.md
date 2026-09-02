@@ -98,6 +98,65 @@ regardless of filename. Falls back to the original ordering on
 grep failure or timeout. `thread` now resolves to 127 fields, `proc`
 to 100.
 
+**A fourth defect, same struct, found in ch8's output (2026-09-02):
+`#define` field aliases.** The fact-check flagged `struct
+thread->td_retval` as a nonexistent field. It exists — as a macro
+alias onto a nested union member:
+
+```c
+/* sys/sys/proc.h:365 */
+#define td_retval    td_uretoff.tdu_retval
+```
+
+~95 files under `sys/` spell the field that way; `td_uretoff.tdu_retval`
+is how nobody writes it. `_parse_struct_fields` reads only
+`;`-terminated declarators inside the struct body, so alias `#define`s
+were invisible to all three verification layers at once.
+
+This one is *not* a near-miss. The ch4 defect was caught by the
+writer's refusal; here the writer **complied**. `README_process.md`
+shipped with the `td_retval` prose deleted, `grep -c UNVERIFIED` = 0,
+and every later stage certifying it clean. Third confirmed instance of
+the same root shape: **the verifier's model of C is narrower than C**
+(struct homonyms, the `FOO` placeholder class, now macro aliases).
+
+**Fix.** `_struct_field_aliases` harvests object-like `#define`s from
+the winning definition's file and unions them into the returned field
+set — placed in `_real_struct_fields` because all three layers share
+it, so one change repairs every consumer. Admission rule: the
+replacement text must begin with an identifier the struct really
+declares. That is the load-bearing constraint — `proc.h` alone holds
+**326** `#define`s, and admitting them wholesale would convert the
+field verifier into a rubber stamp certifying any capitalised noise as
+a field. Verified no leakage of `TDF_BORROWING`, `PROC_LOCK`,
+`TD_IS_RUNNING`, etc. Both `.` and `->` alias forms are handled
+(`b_object` is `b_bufobj->bo_object`); aliases-onto-aliases resolve by
+fixed point (`m_epg_startcopy` → `m_epg_npgs`).
+
+Deltas are small enough to audit by eye, which is the point — a fix
+here that doubled a field count would be indistinguishable from a
+rubber stamp:
+
+| struct | before | after | admitted |
+|---|---|---|---|
+| `thread` | 127 | 133 | `td_retval`, `td_siglist`, `td_start/endzero`, `td_start/endcopy` |
+| `proc` | 100 | 107 | `p_pgid`, `p_session`, `p_siglist`, … |
+| `mbuf` | 28 | 33 | `m_epg_pa`, `m_epg_hdr`, `m_epg_trail`, … |
+| `vnode` | 35 | 38 | `v_type`, `v_state`, `v_object` |
+| `buf` | 43 | 45 | `b_error`, `b_object` |
+| `vm_page`, `socket` | 16, 58 | unchanged | — |
+
+**Accepted imprecision.** `td_startzero`/`td_endzero` are bcopy-range
+markers aliased onto `td_flags`/`td_sigmask`, not field names a reader
+would write. They are structurally indistinguishable from real
+aliases, and admitting them fails *open* (a rarely-cited name goes
+unflagged) — the correct direction for this verifier. No heuristic
+added to exclude them.
+
+Guard: `tests/test_struct_define_alias.py`, which pins the literal
+ch8 string `struct thread->td_retval` as not-flagged and asserts an
+invented field is still caught. Confirmed to fail on pre-fix code.
+
 **That prefilter caused a regression, repaired in the same change.**
 Promoting definition sites pulled `sys/netpfil/ipfw/test/dn_test.h` —
 dummynet's two-field *fake mbuf* — into the slice, which made the real

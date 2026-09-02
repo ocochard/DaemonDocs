@@ -264,7 +264,9 @@ pattern.
   `path/file.c`-shaped collisions where a backticked file path
   is misread as `var.field`. ch2 (Boot Process, 2026-05-02) shipped
   with all three escape hatches simultaneously open and motivated
-  the layered design.
+  the layered design. All three compare against
+  `_real_struct_fields`, so alias handling (below) fixes every layer
+  at once — put field-truth changes there, not at a flag site.
 - **`_extract_struct_names` matches both `struct NAME` and
   ``\`NAME\` structure``** — backticked-prose form catches the
   writer naming a fictional type without the `struct` keyword
@@ -347,6 +349,22 @@ pattern.
   sends the writer to rewrite prose into an unrelated file. A
   wrong correction is worse than no correction: the writer trusts
   it.
+- **`#define` field aliases count as real fields.** FreeBSD exposes
+  nested union members under flat names (`sys/sys/proc.h:365`,
+  `#define td_retval td_uretoff.tdu_retval`) and ~95 files under `sys/`
+  spell the field that way. These are not `;`-terminated declarators,
+  so `_parse_struct_fields` never saw them: ch8 (2026-09-02) flagged
+  `struct thread->td_retval` as nonexistent and the writer deleted
+  correct prose, shipping `README_process.md` damaged with no
+  UNVERIFIED banner. `_struct_field_aliases` harvests them from the
+  *winning* definition's file only (a homonym's macros are not this
+  struct's fields) and unions them in. A macro qualifies only if its
+  replacement text starts with an identifier the struct really
+  declares — `proc.h` holds 326 `#define`s and admitting all of them
+  would make the verifier a rubber stamp. Both `.` and `->` alias
+  forms work; aliases-onto-aliases resolve by fixed point. Deltas are
+  small and checkable (`thread` 127→133, `mbuf` 28→33).
+  Guard: `tests/test_struct_define_alias.py`.
 - **Ambiguous struct names are not verified at all.**
   `_real_struct_fields` collects every *distinct* parsed definition
   and returns empty when they disagree, logging the competing paths.
