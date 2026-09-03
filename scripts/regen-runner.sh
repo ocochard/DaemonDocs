@@ -106,7 +106,38 @@ fetch_decode_total() {
     echo "$fetch_out" | awk '/^llamacpp:n_decode_total /{print $2; exit}'
 }
 
-echo "[$LABEL] starting at $(date -u +%FT%TZ) endpoint=$URL reviewer_thinking=$RTHINK rationale_enum=$RATENUM watchdog=${WATCHDOG_SECS}s recover=$RECOVER" >> "$LOG"
+# Routing alias for chat-completion requests. Ask the endpoint what it
+# serves rather than assuming: llmsrv.sh gives each recipe its own alias
+# (qwen38-mtp -> Qwen3.8-27B-Q8_0-MTP, qwen38-q8 -> Qwen3.8-27B-UD-Q8_K_XL),
+# so a hardcoded value silently mismatches whenever the endpoint is
+# restarted on the other slot. Explicit MODEL_ALIAS still wins, and the
+# literal below is only reached when the endpoint cannot be queried at all.
+# Same fetch-then-curl pattern as fetch_decode_total above.
+MODELS_URL=$(echo "$URL" | sed -e 's#/*$##')/models
+resolve_alias() {
+    ra_out=$(fetch -q -T 8 -o - "$MODELS_URL" 2>/dev/null \
+             || curl -s -m 8 "$MODELS_URL" 2>/dev/null)
+    # First "id" under .data[] — llama-server serves exactly one model.
+    # Plain sed so this needs no python/jq on the runner host.
+    echo "$ra_out" \
+      | tr ',{}' '\n\n\n' \
+      | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | head -1
+}
+
+if [ -z "${MODEL_ALIAS:-}" ]; then
+    MODEL_ALIAS=$(resolve_alias)
+    if [ -n "$MODEL_ALIAS" ]; then
+        ALIAS_SRC="endpoint"
+    else
+        MODEL_ALIAS="Qwen3.8-27B-UD-Q8_K_XL"
+        ALIAS_SRC="fallback-literal"
+    fi
+else
+    ALIAS_SRC="env"
+fi
+
+echo "[$LABEL] starting at $(date -u +%FT%TZ) endpoint=$URL reviewer_thinking=$RTHINK rationale_enum=$RATENUM watchdog=${WATCHDOG_SECS}s recover=$RECOVER model_alias=$MODEL_ALIAS($ALIAS_SRC)" >> "$LOG"
 
 # Startup inflight handling. A leftover file means the previous run of this
 # label died between popping a chapter and finishing it.
@@ -188,7 +219,7 @@ while :; do
     t0=$(date +%s)
 
     OPENAI_BASE_URL="$URL" \
-    OPENAI_MODEL="${MODEL_ALIAS:-Qwen3.8-27B-UD-Q8_K_XL}" \
+    OPENAI_MODEL="$MODEL_ALIAS" \
     DAEMONDOCS_WRITER_THINKING=1 \
     DAEMONDOCS_REVIEWER_THINKING="$RTHINK" \
     DAEMONDOCS_RATIONALE_ENUM="$RATENUM" \
