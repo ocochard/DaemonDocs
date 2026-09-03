@@ -43,7 +43,8 @@ default; `qwen38-q8` is the spec-off fallback.
 
 **You normally do not set `MODEL_ALIAS`.** `scripts/regen-runner.sh`
 resolves it from the endpoint's own `/v1/models` at startup
-(`scripts/regen-runner.sh:128-138`) and logs which source it used as
+(the `resolve_alias` block in `scripts/regen-runner.sh`) and logs which
+source it used as
 `model_alias=<alias>(endpoint|env|fallback-literal)`. Setting
 `MODEL_ALIAS` explicitly still wins, and is only needed to force a
 mismatch deliberately. Resolution happens once at startup, so an
@@ -53,6 +54,14 @@ stale alias; the log line is where that shows up.
 Earlier revisions of this file claimed the two recipes deliberately
 shared one alias. They never did; that guidance was wrong and is the
 reason `curl /models` was previously described as non-diagnostic.
+
+**The runner is deployed, not run from this repo.** `scripts/regen-runner.sh`
+is the source of truth; the copy that actually executes lives in the
+queue directory as `runner.sh`. They silently diverged in both directions
+once before, so the deployed copy ran without alias resolution while this
+repo said it had it. Deploy with `deploy-runner.sh` in the queue dir,
+which refuses to swap while a runner is alive — overwriting the script a
+running `sh` is mid-way through makes it execute garbage.
 
 The MTP draft path had a **known fault on `framework`
 (FreeBSD/Mesa 26)**: a 2026-08-15 bench recorded a RADV GPUVM fault in
