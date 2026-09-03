@@ -750,7 +750,7 @@ second pass. That number is low only because 1 of 40 chapters has a
 Glossary today — the linker's yield scales with the next full
 regeneration, exactly as predicted above.
 
-#### Step 3 — broaden criterion 8 and split its verdict [MEASURED, INCONCLUSIVE — still default OFF]
+#### Step 3 — broaden criterion 8 and split its verdict [MEASURED, NEGATIVE — stays default OFF, blocked on step 4]
 
 Two changes to the reviewer rubric:
 
@@ -816,29 +816,50 @@ those decide it on their own — the target defect has no mechanical
 detector, so one manual read of the bio chapter is what actually decides
 keep-vs-revert.
 
-**A/B run 2026-09-02/03 — inconclusive, flag stays OFF.** Control on
+**A/B run 2026-09-02/03 — negative result, flag stays OFF.** Control on
 `framework` (enum=0), treatment on `framework2` (enum=1), same queue, both
-arms writing the same output paths. Three of the five planned chapters
-completed on both arms before this was written: ch11 (bio/buf, the
-motivating defect), ch9 (locking), ch36 (mbuf/allocator). ch3 and ch18
-(the architecture-prose inflation controls) were still running.
+arms writing the same output paths. Four of the five planned chapters
+completed on both arms: ch11 (bio/buf, the motivating defect), ch9
+(locking), ch36 (mbuf/allocator), and ch3 (the first architecture-prose
+inflation control). ch18, the second inflation control, was killed
+mid-flight by a planned power outage with control in round 2 and
+treatment still in round 1; it produced no usable data and is not
+counted here.
 
-*Mechanically, the change does what it was built to do.* No faults, no
-parse failures, no round inflation. Per-round `rationale_missing`:
+*Mechanically, the change mostly does what it was built to do.* No faults
+and no parse failures on either arm. Round inflation did occur, but on
+exactly one chapter — ch3, the control chosen because it has no flags to
+explain. Per-round `rationale_missing`:
 
 | chapter | control rounds → final | treatment rounds → final | `rationale_missing` |
 |---|---|---|---|
 | ch11 bio/buf | 3 → 7/8 | 3 → 7/8 | 1 → 0 → 0 (converged) |
 | ch9 locking | 3 → 6/8 | 3 → 7/8 | 2 → 0 → 1 (regressed) |
 | ch36 mbuf | 3 → PASS 8/8 | 2 → PASS 8/8 | 0 → 0 (nothing enumerated) |
+| ch3 architecture | 2 → PASS 8/8 | 3 → PASS 8/8 | 0 → **3** → 0 (all three false) |
 
 Criterion-8 FAIL at round 1 rose in treatment on ch11 and ch9, as
 predicted. Control-arm logs carry no `rationale_missing` suffix at all, so
 the byte-inertness of the OFF arm held. ch36 enumerated nothing, which is
-the "does not manufacture findings" check passing on the one chapter that
-had no unexplained flags.
+the "does not manufacture findings" check passing on one of the two
+chapters that had no unexplained flags.
 
-*The manual reads do not support keeping it.* All three chapters were read
+**ch3 is the other one, and it failed that check.** Note the shape of its
+trajectory: round 1 enumerated nothing, round 2 produced three findings,
+round 3 cleared them. The reviewer passed the chapter's rationale, then
+manufactured three findings against prose it had already accepted, and
+that second round is the extra round — treatment took 3 where control took
+2. This is the plan's first named risk ("revision-round inflation": *"do
+not stop at three" removes the stopping point*) firing on the exact
+chapter type chosen to detect it.
+
+Wall-clock is not a usable cost signal here and should not be quoted as
+one. Control was the slower arm on ch11 (14821s vs 10921s) and ch36
+(17101s vs 12541s), and only on ch3 was treatment slower (13741s vs
+4860s). Endpoint variance dominates; the round count is the honest
+measure of what the change costs.
+
+*The manual reads do not support keeping it.* All four chapters were read
 against source. Attribution is by each arm's own `<arm>-ch<N>.log`, not by
 the file on disk — see the methodology warning below.
 
@@ -847,6 +868,7 @@ the file on disk — see the methodology warning below.
 | ch11 bio/buf | `BIO_UNMAPPED` explained — **inverted** | flag absent entirely |
 | ch9 locking | `ADAPTIVE_MUTEXES` explained — **correct** | `MTX_SPIN`/adaptive — **inverted** |
 | ch36 mbuf | reclaim mechanism — **fabricated** | not read |
+| ch3 architecture | **3 false findings**, all already glossed inline | 2 rounds, clean |
 
 Treatment's ch11 rationale fused `BIO_UNMAPPED` with `BIO_TRANSIENT_MAPPING`
 — the flag that `vfs_bio.c:4490-4492` *clears* at the moment it *sets*
@@ -858,13 +880,35 @@ not the default that unmapped optimizes away. Control simply dropped the
 flag: zero occurrences of `BIO_UNMAPPED` or "unmapped" anywhere in its
 draft.
 
-Treatment's ch9 is the counter-example and the reason this is inconclusive
-rather than a revert. It puts adaptive spinning on the *sleep* mutex,
+Treatment's ch9 is the one clear success, and the reason the result is a
+negative rather than a unanimous one. It puts adaptive spinning on the *sleep* mutex,
 matching `kern_mutex.c:75-76` and the three `ADAPTIVE_MUTEXES` blocks that
 all live inside `__mtx_lock_sleep`. Control inverted exactly that: it
 claimed a *spin* mutex "falls back to sleeping on a turnstile" under
 `ADAPTIVE_MUTEXES`, when `_mtx_lock_spin_cookie` contains no turnstile or
 sleepq call at all and cannot sleep by construction.
+
+**ch3 is the cleanest evidence against the change.** It is an
+architecture chapter with no flags or modes to explain, included
+specifically as a check that the broadened criterion does not manufacture
+findings where there is nothing to find. It manufactured three, and all
+three were false — each names a term the draft had already glossed inline,
+in the same sentence that introduces it:
+
+| reviewer's `rationale_missing` entry | what the draft actually says |
+|---|---|
+| context ID (ARM64) — "no explanation of what it is or why" | "the context ID (a register that tags TLB entries to prevent stale translations from a previous kernel or hypervisor)" |
+| `PSL_KERNEL` — "no prose explanation of what it is" | "pushes `PSL_KERNEL` (a known-good program status word that sets the CPU into a safe kernel-mode state with interrupts disabled)" |
+| `struct vmspace` — "no explanation of what it is" | "there is no `struct vmspace` (the per-process virtual address space descriptor) for a user process" |
+
+The context-ID gloss even supplies the *why* criterion 8 asks for. The
+`PSL_KERNEL` entry is self-refuting on its own wording — the reviewer
+described it as "pushed in btext with code-comment rationale but no prose
+explanation" while the prose explanation sits in the same line. This is
+the plan's second named risk ("the list can be wrong ... a confident entry
+for a mechanism the draft *did* explain sends the writer to pad correct
+prose") realized, and it cost a full revision round of padding already
+correct text.
 
 **ch36 is the finding that matters most, and it is not about step 3.**
 Treatment graded PASS 8/8 with `rationale_missing=0` — the new criterion
@@ -887,16 +931,34 @@ limit"). And it does not walk socket buffers: the entire body is
 `EVENTHANDLER_INVOKE(mbuf_lowmem, VM_LOW_MBUFS)`. The parenthetical about
 acknowledged data is invented outright.
 
-**Conclusion: the variable under test is not the dominant one.** Confident,
-fluent, source-shaped prose asserting false semantics about *real* symbols
-appears in both arms, including in a chapter where criterion 8 was
-satisfied and nothing was enumerated. Two treatment fabrications, one
-treatment correction, one control fabrication, one control omission — at
-n=3 there is no principled way to weight ch11's inversion against ch9's
-correction. Broadening criterion 8 reliably finds unexplained mechanisms
-and cannot tell whether the explanation it elicits is true, which is
-exactly step 4's gap. **Step 3 should not be switched on before step 4
-exists; it is a precondition, not a follow-on.** That reorders the roadmap.
+**Conclusion: one success in four chapters, and both named risks fired.**
+Treatment produced one correct new rationale (ch9), one inverted one
+(ch11), one fabricated mechanism in a chapter it graded PASS 8/8 with
+nothing enumerated (ch36), and three false findings costing an extra
+round on a chapter with no flags at all (ch3). Of the four `rationale_missing`
+entries this run produced whose content could be checked against source,
+three were wrong. That is not a close call at n=4, and it is worse than
+the earlier three-chapter read suggested: ch3 converts "inconclusive" into
+a negative result, because it is the designed control for manufactured
+findings and it failed.
+
+**The change is not the dominant defect, but it is not neutral either.**
+Confident, fluent, source-shaped prose asserting false semantics about
+*real* symbols appears in both arms — control inverted ch9's adaptive
+mutex and dropped ch11's flag entirely — so switching step 3 off does not
+buy correctness. What step 3 adds on top is a second generator of the same
+class of error, now aimed by the reviewer at specific terms, with the
+writer instructed to address every entry. Broadening criterion 8 reliably
+finds unexplained mechanisms and cannot tell whether the explanation it
+elicits is true, nor whether the mechanism was unexplained in the first
+place. Both gaps are step 4.
+
+**Step 3 stays default OFF and should not be switched on before step 4
+exists; it is a precondition, not a follow-on.** That reorders the
+roadmap. Re-run the A/B after step 4 lands, with the two instrumentation
+fixes below and with ch18 included — it was the second inflation control
+and is the one chapter that would have told us whether ch3's result
+generalizes.
 
 **Two instrumentation defects this run exposed, both worth fixing before
 any re-run:**
