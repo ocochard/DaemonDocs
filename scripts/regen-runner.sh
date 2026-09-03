@@ -148,7 +148,31 @@ INFLIGHT="$QUEUE_DIR/queue.inflight.$LABEL"
 # 2026-08-22 kills actually landed.
 WATCHDOG_SECS="${WATCHDOG_SECS:-2400}"
 
-cd /home/olivier/DaemonDocs || exit 1
+# Repo root. Everything below runs relative to it (.venv/bin/python,
+# generate-doc.py), so a wrong value here fails in confusing ways much
+# later. Resolution order:
+#
+#   1. $DAEMONDOCS_DIR, for the deployed copy, which lives in the queue
+#      directory outside the repo and cannot derive anything from $0.
+#   2. The parent of this script's own directory, correct whenever the
+#      script is run from its scripts/ home in a checkout.
+#
+# Validated either way rather than trusted: a bare `cd` to a stale path
+# would otherwise start the pipeline in the wrong tree. This replaced a
+# hardcoded absolute checkout path, which also baked one operator's home
+# directory into a public repo.
+if [ -n "${DAEMONDOCS_DIR:-}" ]; then
+    REPO_DIR="$DAEMONDOCS_DIR"
+    REPO_SRC="env"
+else
+    REPO_DIR=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+    REPO_SRC="script-relative"
+fi
+if [ -z "$REPO_DIR" ] || [ ! -f "$REPO_DIR/generate-doc.py" ]; then
+    echo "$SELF_NAME: '$REPO_DIR' is not a DaemonDocs checkout (no generate-doc.py); set DAEMONDOCS_DIR" >&2
+    exit 1
+fi
+cd "$REPO_DIR" || exit 1
 
 # Cumulative decode-token counter from llama-server's /metrics, or empty
 # if unavailable. Empty is treated by callers as "cannot confirm the model
@@ -194,7 +218,7 @@ else
     ALIAS_SRC="env"
 fi
 
-echo "[$LABEL] starting at $(date -u +%FT%TZ) endpoint=$URL reviewer_thinking=$RTHINK rationale_enum=$RATENUM watchdog=${WATCHDOG_SECS}s recover=$RECOVER model_alias=$MODEL_ALIAS($ALIAS_SRC)" >> "$LOG"
+echo "[$LABEL] starting at $(date -u +%FT%TZ) endpoint=$URL reviewer_thinking=$RTHINK rationale_enum=$RATENUM watchdog=${WATCHDOG_SECS}s recover=$RECOVER model_alias=$MODEL_ALIAS($ALIAS_SRC) repo=$REPO_DIR($REPO_SRC)" >> "$LOG"
 
 # Startup inflight handling. A leftover file means the previous run of this
 # label died between popping a chapter and finishing it.

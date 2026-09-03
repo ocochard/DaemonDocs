@@ -63,6 +63,13 @@ repo said it had it. Deploy with `deploy-runner.sh` in the queue dir,
 which refuses to swap while a runner is alive — overwriting the script a
 running `sh` is mid-way through makes it execute garbage.
 
+Because the deployed copy sits outside the checkout, it cannot derive the
+repo root from its own location: **launch it with `DAEMONDOCS_DIR` set**.
+Run from `scripts/` in a checkout it resolves the root itself and needs
+nothing. Either way it refuses to start unless the resolved directory
+holds `generate-doc.py`, and the startup log records which it used as
+`repo=<path>(env|script-relative)`.
+
 The MTP draft path had a **known fault on `framework`
 (FreeBSD/Mesa 26)**: a 2026-08-15 bench recorded a RADV GPUVM fault in
 the `draft-mtp` dispatch path on a coin-flip of cold starts, where a
