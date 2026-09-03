@@ -750,7 +750,7 @@ second pass. That number is low only because 1 of 40 chapters has a
 Glossary today — the linker's yield scales with the next full
 regeneration, exactly as predicted above.
 
-#### Step 3 — broaden criterion 8 and split its verdict [BUILT, UNMEASURED — default OFF]
+#### Step 3 — broaden criterion 8 and split its verdict [MEASURED, INCONCLUSIVE — still default OFF]
 
 Two changes to the reviewer rubric:
 
@@ -816,12 +816,128 @@ those decide it on their own — the target defect has no mechanical
 detector, so one manual read of the bio chapter is what actually decides
 keep-vs-revert.
 
+**A/B run 2026-09-02/03 — inconclusive, flag stays OFF.** Control on
+`framework` (enum=0), treatment on `framework2` (enum=1), same queue, both
+arms writing the same output paths. Three of the five planned chapters
+completed on both arms before this was written: ch11 (bio/buf, the
+motivating defect), ch9 (locking), ch36 (mbuf/allocator). ch3 and ch18
+(the architecture-prose inflation controls) were still running.
+
+*Mechanically, the change does what it was built to do.* No faults, no
+parse failures, no round inflation. Per-round `rationale_missing`:
+
+| chapter | control rounds → final | treatment rounds → final | `rationale_missing` |
+|---|---|---|---|
+| ch11 bio/buf | 3 → 7/8 | 3 → 7/8 | 1 → 0 → 0 (converged) |
+| ch9 locking | 3 → 6/8 | 3 → 7/8 | 2 → 0 → 1 (regressed) |
+| ch36 mbuf | 3 → PASS 8/8 | 2 → PASS 8/8 | 0 → 0 (nothing enumerated) |
+
+Criterion-8 FAIL at round 1 rose in treatment on ch11 and ch9, as
+predicted. Control-arm logs carry no `rationale_missing` suffix at all, so
+the byte-inertness of the OFF arm held. ch36 enumerated nothing, which is
+the "does not manufacture findings" check passing on the one chapter that
+had no unexplained flags.
+
+*The manual reads do not support keeping it.* All three chapters were read
+against source. Attribution is by each arm's own `<arm>-ch<N>.log`, not by
+the file on disk — see the methodology warning below.
+
+| chapter | treatment | control |
+|---|---|---|
+| ch11 bio/buf | `BIO_UNMAPPED` explained — **inverted** | flag absent entirely |
+| ch9 locking | `ADAPTIVE_MUTEXES` explained — **correct** | `MTX_SPIN`/adaptive — **inverted** |
+| ch36 mbuf | reclaim mechanism — **fabricated** | not read |
+
+Treatment's ch11 rationale fused `BIO_UNMAPPED` with `BIO_TRANSIENT_MAPPING`
+— the flag that `vfs_bio.c:4490-4492` *clears* at the moment it *sets*
+`BIO_UNMAPPED`, after tearing the transient mapping down — and reversed the
+causality: the flag is set because there is no KVA mapping (`bdata2bio`
+takes that branch when `!buf_mapped(bp)`), and mapping is the on-demand
+fallback when a consumer lacks `G_PF_ACCEPT_UNMAPPED` (`geom_io.c:481-484`),
+not the default that unmapped optimizes away. Control simply dropped the
+flag: zero occurrences of `BIO_UNMAPPED` or "unmapped" anywhere in its
+draft.
+
+Treatment's ch9 is the counter-example and the reason this is inconclusive
+rather than a revert. It puts adaptive spinning on the *sleep* mutex,
+matching `kern_mutex.c:75-76` and the three `ADAPTIVE_MUTEXES` blocks that
+all live inside `__mtx_lock_sleep`. Control inverted exactly that: it
+claimed a *spin* mutex "falls back to sleeping on a turnstile" under
+`ADAPTIVE_MUTEXES`, when `_mtx_lock_spin_cookie` contains no turnstile or
+sleepq call at all and cannot sleep by construction.
+
+**ch36 is the finding that matters most, and it is not about step 3.**
+Treatment graded PASS 8/8 with `rationale_missing=0` — the new criterion
+enumerated nothing and the reviewer was fully satisfied — and the chapter
+still ships a fabricated mechanism, stated three times (Quick Summary,
+"Exhaustion and reclaim", "Theory connection"):
+
+> When a `M_NOWAIT` allocation finds its UMA zone empty, it does not
+> sleep; it first consults the *reclaim* path. The allocator can invoke a
+> registered reclaim callback that walks socket buffers and frees mbufs
+> that are safe to drop (e.g. data already acknowledged), then retries the
+> allocation.
+
+Three errors. `mb_reclaim` is registered with `uma_zone_set_maxaction`, and
+`zone_maxaction` (`uma_core.c:1092-1096`) does `taskqueue_enqueue` — it is
+asynchronous, so the failing allocation cannot consult the result and there
+is no "then retries". The trigger is the zone *limit*, not emptiness
+(`kern_mbuf.c:820-821`: "whenever any of the mbuf zones is closed to its
+limit"). And it does not walk socket buffers: the entire body is
+`EVENTHANDLER_INVOKE(mbuf_lowmem, VM_LOW_MBUFS)`. The parenthetical about
+acknowledged data is invented outright.
+
+**Conclusion: the variable under test is not the dominant one.** Confident,
+fluent, source-shaped prose asserting false semantics about *real* symbols
+appears in both arms, including in a chapter where criterion 8 was
+satisfied and nothing was enumerated. Two treatment fabrications, one
+treatment correction, one control fabrication, one control omission — at
+n=3 there is no principled way to weight ch11's inversion against ch9's
+correction. Broadening criterion 8 reliably finds unexplained mechanisms
+and cannot tell whether the explanation it elicits is true, which is
+exactly step 4's gap. **Step 3 should not be switched on before step 4
+exists; it is a precondition, not a follow-on.** That reorders the roadmap.
+
+**Two instrumentation defects this run exposed, both worth fixing before
+any re-run:**
+
+1. **`rationale_missing` logs only a count, never the entries.** The log
+   suffix was built to give the A/B a per-round scalar, and it does — but
+   every prose read then had to hunt the affected passages by grep, which
+   is how the ch9 attribution went wrong on the first pass. Log the list
+   contents.
+2. **Both arms write the same output paths, so the tree cannot attribute
+   anything.** Whichever arm finished a chapter last owns the file, and
+   phase 4 (`build_navigation` / `build_chapter_index`, called with the
+   *full* chapter list on every `--chapter N` run) then rewrites the nav
+   and index blocks of all 40 READMEs, giving every file a uniform mtime
+   unrelated to who authored its body. Reading `sys/kern/README_locking.md`
+   at a moment when control's ch9 had overwritten treatment's attributed an
+   inverted passage to the wrong arm; the correction came from grepping each
+   arm's own chapter log for the sentence. **Attribute from
+   `<arm>-ch<N>.log`, never from the file on disk** — the final draft is
+   recoverable from the log's `Final answer: # <title>` marker. An A/B where
+   the arms share output paths needs per-arm snapshots taken at completion,
+   not after.
+
 #### Step 4 — rationale correctness is unverifiable [OPEN, no approach yet]
 
 Steps 1-3 raise the floor: the term gets defined, and the reviewer is
 forced to account for it. **None of them can tell a correct rationale
 from a plausible invented one.** The `BIO_UNMAPPED` pageout-daemon
 confabulation would still ship today.
+
+The step-3 A/B (2026-09-02/03, results above) demoted this from
+"next roadmap item" to **blocking**. Three chapters read against source
+produced three more confabulations of exactly this shape, in both arms:
+`BIO_UNMAPPED` fused with `BIO_TRANSIENT_MAPPING` and its causality
+reversed; `ADAPTIVE_MUTEXES` attached to the spin mutex with an invented
+turnstile fallback; and an mbuf reclaim path described as synchronous,
+limit-triggered as empty-triggered, and walking socket buffers it never
+touches. The last one graded PASS 8/8 with criterion 8 satisfied and
+nothing enumerated. Raising the floor on *whether* rationale is present
+does not touch whether it is true, and pushing harder for rationale
+produces more of it either way.
 
 Every verifier in `generate-doc.py` is symbol-shaped: it asks whether a
 name exists, whether an arity matches, whether a field is real. A claim
