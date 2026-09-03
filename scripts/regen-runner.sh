@@ -72,8 +72,65 @@ RTHINK="${3:-1}"
 # without the 4th argument runs today's rubric unchanged.
 RATENUM="${4:-0}"
 
-QUEUE_DIR="/tmp/regen-queue"
-QUEUE="$QUEUE_DIR/queue.txt"
+# Directory holding queue.txt, logs and inflight state. Defaults to the
+# directory this script lives in, so moving the harness needs no edit.
+QUEUE_DIR="${REGEN_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+# `./runner.sh` invoked from a different cwd resolves dirname to THAT cwd,
+# which would silently run against the wrong directory. Require the dir to
+# actually hold this script and its siblings, so a stray copy elsewhere
+# cannot pass. Keyed off $0's own basename because this file is deployed
+# under a different name (runner.sh) than it carries here.
+SELF_NAME=$(basename "$0")
+if [ ! -f "$QUEUE_DIR/$SELF_NAME" ] || [ ! -f "$QUEUE_DIR/ab-verdicts.awk" ]; then
+    echo "$SELF_NAME: '$QUEUE_DIR' is not the harness dir; set REGEN_DIR" >&2
+    exit 1
+fi
+# Single-instance interlock per label. Two runners sharing one label both
+# pop from the same queue and fight over the same inflight file: the second
+# one declares the first one's live chapter "stale", then pops and burns
+# further chapters. That happened on 2026-09-02 (a stray `runner.sh fw x`
+# set ch25 aside as stale and destroyed ch13 and ch21 against a bogus
+# endpoint) and cost two chapters. The stale-inflight path below tells the
+# operator to run this pgrep by hand; doing it here is what actually stops
+# the collision.
+#
+# Matching must be anchored to "a shell RUNNING this script", not to the
+# bare string, because the string appears in unrelated command lines:
+#
+#   - any wrapper/editor/agent shell whose argv or heredoc merely
+#     CONTAINS `runner.sh fw ...` (an interactive `sh -c` launching this
+#     script matches itself, so a legitimate first launch is refused);
+#   - grep/tail/pgrep pipelines typed by the operator.
+#
+# daemon(8) is NOT one of them: it retitles itself to
+# `daemon: <path>[<childpid>]`, so the supervisor never matches. That was
+# misdiagnosed once (2026-09-02) and cost a wrong "exclude $PPID" patch.
+#
+# `pgrep -lf` (pid + argv; FreeBSD has no `-a`) plus an interpreter
+# prefix keeps exactly the real case: `/bin/sh ./runner.sh fw <url>`.
+# Every daemon(8) launch silently returned rc=0 while being refused,
+# because daemon detaches before the child's stderr exists -- the
+# refusal is visible only with `daemon -o`.
+#
+# $$ is excluded because pgrep matches this very process. Advisory-only
+# against a determined racer (two simultaneous starts could both pass)
+# but it catches every accidental double-launch, which is the real
+# failure mode.
+# Dots in the basename are escaped: unescaped, `runner.sh` would also
+# match `runnerXsh`. Harmless here, but the deployed copy escaped it and
+# a regex that quietly widens is not worth inheriting.
+SELF_RE=$(echo "$SELF_NAME" | sed 's/[.[\*^$]/\\&/g')
+OTHERS=$(pgrep -lf "$SELF_RE $LABEL( |$)" 2>/dev/null \
+    | grep -E '^[0-9]+ (/[^ ]*/)?[a-z]*sh +[^ ]*'"$SELF_RE"' ' \
+    | awk '{print $1}' | grep -v "^$$\$" | tr '\n' ' ')
+if [ -n "$(echo "$OTHERS" | tr -d ' ')" ]; then
+    echo "$SELF_NAME: a runner for label '$LABEL' is already alive (pid$OTHERS); refusing to start a second one. Kill it first, or use a different LABEL." >&2
+    exit 1
+fi
+
+# Queue file is overridable so an A/B can give each arm its own chapter
+# list; unset it and the shared queue.txt behaves exactly as before.
+QUEUE="${QUEUE_FILE:-$QUEUE_DIR/queue.txt}"
 LOCK="$QUEUE_DIR/queue.lock"
 LOG="$QUEUE_DIR/$LABEL.log"
 INFLIGHT="$QUEUE_DIR/queue.inflight.$LABEL"
