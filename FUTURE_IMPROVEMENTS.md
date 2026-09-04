@@ -2699,6 +2699,109 @@ ch21 went 6/8 → 6/8 → 7/8 across rounds and still failed. Fixing the
 reviewer's false-positive rate is worth more than any further prompt
 tuning of the writer.
 
+**A third class, and the worst one — the pipeline tells the reviewer to
+trust a list that is wrong (ch21, 2026-09-04).** This is not a reviewer
+hallucination. `build_review_prompt` computes an "Undefined Terms
+Detected" block from `_extract_unglossed_jargon` and
+`_extract_unexpanded_acronyms`, and hands it over with three
+instructions that remove the reviewer's discretion:
+
+- `## Undefined Terms Detected (mechanical scan — trust this list)`
+- `These are NOT hallucinations — the terms are real and correctly used.`
+- `you MUST account for every term listed above: either FAIL the
+  criterion and name the terms in issues, or explain per term why a
+  gloss is genuinely unnecessary`
+
+So a detector false positive is not a hint the reviewer can weigh
+against the draft — it is a mandatory FAIL. ch21's round-1 verdict was
+literally `"accessibility": "FAIL: Five terms from the undefined-terms
+list lack ..."`. The reviewer cited the list, not the chapter.
+
+All five terms were already glossed at first prose use, and
+`_has_gloss` returns True for every one of them:
+
+| term | state in `sys/netpfil/pf/README.md` |
+|---|---|
+| `mbuf` | glossed line 44 |
+| `NAT` | glossed line 8, also in Glossary |
+| `SCTP` | glossed line 12 |
+| `VNET` | glossed line 48 |
+| `BINAT`, `RDR` | glossed line 10, also in Glossary |
+| `preemption` | **does not occur in the file at all** |
+
+The acronym detector's own limits are what put them on the list:
+
+- `SCTP` (129 chars) and `VNET` (112) have correct multi-word
+  expansions that exceed the `[^)]{4,80}` cap in
+  `_extract_unexpanded_acronyms`, so `paren_after` never matches.
+- `BINAT` is backticked at its expansion site, so `_strip_inline_code`
+  erases the token before the regex can anchor to it.
+- `INIT`/`RDR` have single-word expansions (`initialization`,
+  `redirect`) that cannot satisfy the initials test for a multi-letter
+  acronym.
+- `preemption` was padding — the model extended a list it had been told
+  to trust.
+
+**The trap this sets.** The prompt's phrasing is not a bug on its own;
+it was added deliberately, because ch12 used `KVM` five times and
+criterion 8 passed it, and "asking the model to simulate a junior
+reader does not work; handing it an explicit list does." That reasoning
+holds. What breaks is the coupling: the block's authority is absolute
+while the detectors behind it are explicitly conservative and known to
+over-report. Under that instruction the only escape hatch is the
+per-term justification, which the model will not reliably take against
+a list labelled `trust this list`.
+
+It also actively punishes correct prose. The apparent fix — "gloss the
+terms" — means padding text that is already glossed, or shortening a
+129-char expansion to fit an 80-char regex. Both make the chapter
+worse to satisfy a lint. This was nearly done on 2026-09-04 and was
+stopped only by checking each term against the file.
+
+**Fix, in preference order:**
+
+1. **[DONE 2026-09-04] Validate the block before emitting it.**
+   `_extract_unexpanded_acronyms` now re-runs `_has_gloss` at the
+   term's first prose offset and drops anything that passes, so a
+   detector artifact can no longer reach the reviewer as a mandatory
+   FAIL. Note the asymmetry that made this the right lever: the
+   *jargon* path has always consulted `_has_gloss` and was never the
+   problem — only the acronym path skipped it. Deliberately narrower
+   than widening the caps (proposal 2): this only suppresses a report
+   when a gloss demonstrably exists, whereas raising `{4,80}` trades a
+   false positive for false negatives. Regression tests in
+   `tests/test_jargon_gloss.py` pin the 129-char-expansion case, the
+   em-dash and verbal-cue forms, the `n < 2` rule, and — separately,
+   through the jargon path — the original ch12 `KVM` defect, so a
+   future edit here cannot be mistaken for covering it.
+2. **Raise or remove the 80-char expansion cap**, and stop
+   `_strip_inline_code` from erasing an acronym that is backticked at
+   its own expansion site. These are the three mechanical causes above.
+3. **Soften the block's authority to match the detector's precision** —
+   "the scan is conservative and over-reports; verify each term against
+   the draft before failing." Do this only alongside (1), or ch12's
+   `KVM` regression comes back.
+4. Accept single-word expansions when the acronym's initials are a
+   prefix of the expansion (`RDR`/`redirect`, `INIT`/`initialization`).
+
+**Outcome of the 2026-09-04 requeue.** All three chapters recovered on
+the strength of the two verifier fixes plus hand-applied glosses: ch4
+PASS 8/8 (3 revisions), ch11 PASS 8/8 (2), ch21 PASS 8/8 (2), none
+carrying an UNVERIFIED banner. ch21's bogus Accessibility FAIL did not
+survive its revision round — the reviewer graded Accessibility PASS on
+the following pass over prose that had not changed in the flagged
+respects. So this class costs revision rounds rather than approvals.
+That makes it a cost-and-noise defect, not a blocker, and is why the
+fix below is a validation step rather than a prompt rewrite.
+
+Revised tally across the chapters triaged 2026-09-03/04: **eight of
+nine blocking FAILs were false positives** — four traceable to the
+reviewer, four to the verifiers, one to the jargon block laundering a
+detector artifact into a mandatory FAIL — against one real finding.
+The single highest-value fix in this whole section is (1): it is a
+handful of lines, it needs no prompt edit, and it closes the only
+failure mode here that makes the pipeline argue against true prose.
+
 ---
 
 ## What "improve coverage" can mean

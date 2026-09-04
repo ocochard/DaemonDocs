@@ -7817,6 +7817,45 @@ def _extract_unexpanded_acronyms(text: str) -> List[str]:
             if len(re.findall(r"[A-Za-z]+", head)) >= 2:
                 expanded = True
         if not expanded:
+            # Last resort before reporting: ask the gloss detector.
+            #
+            # The two regexes above look for a *parenthetical expansion*
+            # specifically, and both have blind spots that this function's
+            # own docstring promises it is conservative about -- but the
+            # `Undefined Terms Detected` block in `build_review_prompt`
+            # tells the reviewer to `trust this list` and to FAIL
+            # Accessibility for anything on it. A false positive is
+            # therefore not a hint the reviewer can weigh; it is a
+            # mandatory FAIL against prose that is already correct.
+            #
+            # ch21 (2026-09-04) failed Accessibility on five such terms,
+            # every one glossed at first prose use. The three mechanical
+            # causes, all still live above:
+            #   - `SCTP` (129 chars) and `VNET` (112) have correct
+            #     multi-word expansions longer than the `[^)]{4,80}` cap,
+            #     so `paren_after` never matches.
+            #   - `BINAT` is backticked at its own expansion site, so
+            #     `_strip_inline_code` erased the token before the regex
+            #     could anchor to it.
+            #   - `RDR`/`redirect` and `INIT`/`initialization` are
+            #     single-word expansions, which cannot satisfy the
+            #     initials test for a multi-letter acronym.
+            #
+            # `_has_gloss` answers the question the reviewer actually
+            # cares about -- "does a reader learn what this means here?"
+            # -- and accepts forms the expansion regexes cannot see (an
+            # em-dash clause, a "that is" / "which means" cue, a gloss
+            # sitting after a markdown link suffix). Deliberately NOT
+            # widening the caps instead: raising `{4,80}` trades this
+            # false positive for false *negatives* elsewhere, whereas
+            # this only suppresses a report when a gloss demonstrably
+            # exists. Same asymmetry as the jargon path, which has
+            # always consulted `_has_gloss`; only this acronym path
+            # never did.
+            m_first = re.search(rf"\b{re.escape(tok)}\b", prose)
+            if m_first and _has_gloss(
+                    prose[m_first.end():m_first.end() + _GLOSS_WINDOW_CHARS]):
+                continue
             unexpanded.append(tok)
     return sorted(unexpanded)
 

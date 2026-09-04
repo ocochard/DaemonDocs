@@ -203,6 +203,65 @@ clean = ("## Deep Dive\n\n"
 check("no block on a clean draft",
       HEADING not in mod.build_review_prompt(chapter, clean))
 
+
+# --- Acronym reports are validated against _has_gloss ---------------------
+#
+# The `trust this list` framing above makes a false positive here a
+# MANDATORY Accessibility FAIL, not a hint. ch21 (2026-09-04) was failed
+# over five terms that were all glossed at first prose use, because the
+# two paren-expansion regexes in _extract_unexpanded_acronyms have blind
+# spots: an expansion longer than the `[^)]{4,80}` cap, an acronym
+# backticked at its own expansion site, and single-word expansions that
+# cannot satisfy the initials test. `_has_gloss` is now consulted before
+# reporting.
+#
+# `ZORP` is deliberately a nonsense token: KVM/TLB and friends sit in
+# _ACRONYM_GLOSS_EXEMPT and never reach this code path, so using one of
+# them here would pass no matter what the function did.
+print()
+print("acronym reports are cross-checked against _has_gloss")
+
+_acro = mod._extract_unexpanded_acronyms
+for _label, _text, _want in [
+        ("unexpanded acronym still reported",
+         "The ZORP mapping is used by ZORP consumers. ZORP is in ZORP code.",
+         ["ZORP"]),
+        ("short paren expansion accepted (pre-existing behaviour)",
+         "The ZORP (zero-order retry protocol) is used by ZORP in ZORP code.",
+         []),
+        # The literal SCTP case: a correct multi-word expansion 129 chars
+        # long, which `paren_after`'s {4,80} cap cannot match.
+        ("expansion longer than the 80-char cap accepted",
+         "The ZORP (Zero Order Retry Protocol, a reliable transport mechanism "
+         "similar to TCP but with multi-stream and multi-homing support) is "
+         "used by ZORP in ZORP code.",
+         []),
+        # Requires a real em dash: _GLOSS_ADJACENT_RE matches [—–], never
+        # an ASCII double-hyphen.
+        ("em-dash gloss accepted",
+         "The ZORP — that is, the zero-order retry path — is used by ZORP "
+         "and ZORP code.",
+         []),
+        ("verbal is-a cue accepted",
+         "The ZORP is a zero-order retry path used widely. ZORP appears in "
+         "ZORP code too.",
+         []),
+        ("single mention still ignored (n < 2 rule intact)",
+         "The ZORP is mentioned exactly once here.",
+         []),
+]:
+    _got = _acro(_text)
+    check(f"{_label}: got {_got}", _got == _want, f"wanted {_want}")
+
+# The ch12 regression this whole block exists to prevent. It is owned by
+# the JARGON path, which has always consulted _has_gloss -- pinned here so
+# a future edit to the acronym path cannot be mistaken for covering it.
+check("ch12 guard: unglossed KVM still caught by the jargon path",
+      "KVM" in mod._extract_unglossed_jargon(
+          "The KVM mapping is used by KVM consumers. KVM is everywhere in "
+          "KVM code and KVM callers."),
+      "the KVM-five-times defect must still be detected")
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {', '.join(failures)}")
