@@ -2593,6 +2593,112 @@ What's still open:
   reviewer's Accuracy criterion still doesn't gate on prose-vs-source
   field-name consistency. Separate work.
 
+### Reviewer invents source-level contradictions, and stale FAILs block approval
+
+Observed 2026-09-03/04 while triaging why five chapters shipped
+UNVERIFIED. Of the four criteria FAILs blocking ch9 and ch21, **three
+were reviewer errors, not draft defects.** Both chapters are
+substantively clean but carry `NEEDS_REVISION` and cost a full regen
+cycle each (ch21's requeue: 13,621s) to arrive at a wrong verdict.
+
+**Failure 1 — the reviewer asserts a real symbol is fabricated.**
+ch21 `accuracy` FAIL: "The draft cites `struct pf_frag_tree` as a real
+FreeBSD structure". It is real — `sys/netpfil/pf/pf_norm.c:79` has
+`RB_HEAD(pf_frag_tree, pf_fragment)` and `:89` uses
+`struct pf_frag_tree fn_tree`. The draft even pre-empted the confusion,
+explaining that the type has no explicit `struct { ... }` definition
+because `RB_HEAD` generates it. The writer was right; the reviewer
+graded it down anyway.
+
+**Failure 2 — the reviewer asserts a contradiction between two facts
+that are both true.** ch9 `accuracy` FAIL: turnstiles cannot be both
+"looked up in a hash table by lock address" and "pre-allocated one per
+thread", concluding "In FreeBSD, turnstiles are per-lock". Both halves
+of the draft are correct: `sys/kern/kern_thread.c:466` does
+`td->td_turnstile = turnstile_alloc()` at thread creation and `:484`
+frees it at destruction, while the lock-address hash is the lookup
+path. A thread donates its pre-allocated turnstile to whichever lock it
+first blocks on. The reviewer's "correction" is the actual error.
+
+This is the same failure class as the fact-check homonym bug fixed in
+`a88d7fe` ("stop guessing between homonym structs"), but on the
+reviewer side, where nothing verifies the claim. The reviewer has no
+source access — it grades from the draft alone — so a confident
+`accuracy` FAIL naming a symbol is unfalsifiable within the loop and
+consumes a revision round. Worth considering: run the existing
+`_verify_structs` / `resolve_c_definition` machinery over symbols the
+reviewer names in an `accuracy` FAIL, and drop the FAIL when the symbol
+resolves. The verifiers already exist; the reviewer's findings just
+aren't routed through them.
+
+**Failure 3 — stale FAILs re-reported after the writer fixed them.**
+ch21 `accessibility` FAIL at round 3 quoted two unglossed terms
+('atomic', 'slab') from prose the round-2 revision had already
+rewritten. The shipped draft glosses both — `sys/netpfil/pf/README.md`
+line 598 ("CPU instructions that read-modify-write a memory location
+without being interrupted by another core") and line 453 ("one that
+pre-allocates a contiguous block of memory and carves it into
+equal-sized object slots", plus a glossary link). So the final round
+FAILed on text that no longer existed, and that single stale finding is
+what pushed the chapter to UNVERIFIED. Whether the reviewer is being
+re-shown an old draft or is quoting from its own prior review needs
+checking in `run_chapter`'s round ordering.
+
+Only one of the four FAILs was real: ch9's `no_marketing`, the word
+"simply" in one sentence — a one-word hand fix, applied 2026-09-04.
+
+**A second, mechanical class — ch4 and ch11 (both fixed 2026-09-04).**
+Triaging the other two never-approved chapters found `accuracy` FAILs
+that were *not* reviewer inventions: the reviewer was faithfully
+relaying a fabricated missing-symbol list from the verifier. Two
+independent causes, both now fixed and pinned by tests.
+
+1. **`source_dirs` is not `extra_search_dirs`, and only the latter
+   widens the verifier.** ch4 (build system) cites `struct cfgfile`
+   (`usr.sbin/config/config.h:97`) and `struct file_list` (`:103`) —
+   both real. A 2026-09-01 fix had already diagnosed this and added
+   `usr.sbin/config` to ch4's **`source_dirs`**, leaving a comment
+   saying the fact-checker could now see them. It could not:
+   `source_dirs` steers the writer, while the fact-check grep stays
+   `sys/`-only until a chapter opts in via `extra_search_dirs`. So the
+   false positives survived and failed ch4 on both arms of the
+   2026-09-03 A/B. All three of ch4's `source_dirs` are outside `sys/`,
+   so all three are now listed in `extra_search_dirs`. **The general
+   lesson: adding a dir to `source_dirs` invites the writer to cite
+   symbols the verifier cannot see, so the two keys should be checked
+   together.** A startup assertion that every non-`sys/` `source_dirs`
+   entry also appears in `extra_search_dirs` would have caught this
+   three days earlier — worth adding.
+2. **`shape_grep` rejected `extern struct NAME {`.** ch11 cites
+   `struct bio_ops`, which is real at `sys/sys/buf.h:64` — inside the
+   search path — but spelled `extern struct bio_ops {`, declaration and
+   definition in one statement. The stage-2 shape filter allowed a
+   `typedef` prefix and leading whitespace but not `extern`, so the
+   line was discarded before `pattern_template` (which *did* match it)
+   ever ran. Fifth shape in the same family as the tab, nested and
+   queue(3) gaps already documented in that function. Only 2 exist
+   tree-wide (`bio_ops`, `ar8327_led_mapping`), but it cost ch11 its
+   Accuracy pass on both arms. Fixed by extending the prefix group to
+   `(typedef[ \t]+|extern[ \t]+)?`; the required trailing brace is what
+   keeps it safe, since `extern struct NAME;` and `extern struct NAME
+   *p;` are declarations and neither ends in `{`.
+
+Tally across the four never-approved chapters triaged 2026-09-03/04:
+**seven of eight blocking FAILs were false positives** — three
+reviewer hallucinations, four verifier defects — against one real
+finding (a single stylistic word). Every one of them consumed
+revision rounds and, for ch4/ch11/ch21, whole regen cycles. The
+recurring shape is that a chapter is unapprovable for a reason the
+writer cannot act on, because the claim it is being asked to retract
+is true.
+
+**Cost.** Approval is gated on all 8 criteria, so a single bogus FAIL
+is indistinguishable from a genuine one and burns
+`max_revisions`. Requeuing does not help when the finding is invented:
+ch21 went 6/8 → 6/8 → 7/8 across rounds and still failed. Fixing the
+reviewer's false-positive rate is worth more than any further prompt
+tuning of the writer.
+
 ---
 
 ## What "improve coverage" can mean

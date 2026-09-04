@@ -43,6 +43,7 @@ tree is absent.
 """
 import importlib.util
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -190,6 +191,48 @@ if HAVE_SRC:
           "_shape_only_never_defined" in verify(
               ["_shape_only_never_defined"]),
           "verifier must require definition evidence")
+else:
+    print(f"  [SKIP] {SRC}/sys not present")
+
+print()
+print("7) `extern struct NAME {` definitions verify")
+# Fifth shape, and the rarest: 2 in the tree. `sys/sys/buf.h:64` spells
+# `bio_ops` as `extern struct bio_ops {` -- declaration and definition
+# in one statement. `pattern_template` already matched that line; only
+# this stage-2 filter dropped it, so the symbol came back missing and
+# ch11 (buffer cache) was graded FAIL on Accuracy over a real struct on
+# BOTH arms of the 2026-09-03 A/B. Same stage-2/stage-3 split as the
+# tab and typedef gaps above.
+check("the extern prefix is accepted next to typedef",
+      "extern" in sg,
+      f"got {sg!r}")
+
+# Positive and negative shapes, asserted against the captured pattern
+# rather than a re-typed copy of it. The brace requirement is what
+# keeps `extern` safe: a forward declaration or pointer use never
+# ends in `{`, so widening the prefix cannot admit a non-definition.
+#
+# Splitting on a bare `|` would cut inside the pattern's OWN
+# `(typedef|extern)` group and yield an unterminated subpattern; the
+# brace-alternative boundary is the `\{|` that ends it.
+_first_alt = sg.split("\\{|")[0] + "\\{"
+for _line, _want, _why in [
+        ("extern struct bio_ops {", True, "the ch11 case"),
+        ("extern\tstruct tabbed {", True, "extern + literal tab"),
+        ("extern struct bio_ops;", False, "forward declaration"),
+        ("extern struct bio_ops *p;", False, "pointer use"),
+        ("\textern struct foo *bar;", False, "indented pointer use"),
+]:
+    check(f"{'matches' if _want else 'rejects'}: {_line!r}",
+          bool(re.match(_first_alt, _line)) == _want, _why)
+
+if HAVE_SRC:
+    check("struct bio_ops verifies (sys/sys/buf.h)",
+          "bio_ops" not in verify(["bio_ops"]),
+          "extern struct dropped by the shape filter -> ch11 FAIL")
+    check("struct ar8327_led_mapping verifies",
+          "ar8327_led_mapping" not in verify(["ar8327_led_mapping"]),
+          "the other extern struct in the tree")
 else:
     print(f"  [SKIP] {SRC}/sys not present")
 

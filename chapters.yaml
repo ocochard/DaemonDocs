@@ -172,6 +172,19 @@ chapters:
       # roots the fact-checker cannot see those definitions and (ch4,
       # 2026-09-01) flagged all three as hallucinated.
       - "usr.sbin/config"
+    # `source_dirs` steers the WRITER; it does not widen the fact-check
+    # grep, which is `sys/`-only until a chapter opts in here. The
+    # 2026-09-01 fix above added `usr.sbin/config` to source_dirs alone,
+    # so the verifier still could not see `usr.sbin/config/config.h` and
+    # ch4 failed Accuracy again on BOTH arms of the 2026-09-03 A/B over
+    # `struct cfgfile` (config.h:97) and `struct file_list` (:103) --
+    # real structs the writer could not remove and the reviewer kept
+    # flagging. Every one of this chapter's source_dirs is outside
+    # `sys/`, so all three are listed.
+    extra_search_dirs:
+      - "share/mk"
+      - "tools/build"
+      - "usr.sbin/config"
     source_files:
       - "Makefile.inc1"
       - "share/mk/bsd.sys.mk"

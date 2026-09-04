@@ -6889,11 +6889,24 @@ def _verify_structs(structs: List[str], src_root: str,
             # declarations do not occur with a brace, and none exist
             # in the tree at all.
             #
+            # `extern struct NAME {` is the fifth shape and the rarest:
+            # only 2 in the tree (`bio_ops` in `sys/sys/buf.h`, whose
+            # definition and declaration are one statement, and
+            # `ar8327_led_mapping`). It cost ch11 its Accuracy pass on
+            # BOTH arms of the 2026-09-03 A/B -- the reviewer was handed
+            # `struct bio_ops` as missing and correctly failed the
+            # chapter over a struct that is real. `pattern_template`
+            # above already matched the line; only this filter dropped
+            # it, which is the same stage-2/stage-3 split that hid the
+            # tab and typedef gaps. Requiring the brace keeps it safe:
+            # `extern struct NAME;` and `extern struct NAME *p;` are
+            # declarations, not definitions, and neither ends in `{`.
+            #
             # The brackets hold a LITERAL tab, not `\t`: this is a BSD
             # `grep -E` pattern (see `_batched_grep_present`), and a
             # bracket expression there does not interpret `\t` -- it
             # would match space, backslash or `t` and never a tab.
-            "^[ 	]*(typedef[ 	]+)?struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*\\{|"
+            "^[ 	]*(typedef[ 	]+|extern[ 	]+)?struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*\\{|"
             "^struct[ 	]+[A-Za-z_][A-Za-z0-9_]*[ 	]*$|"
             #
             # Fourth spelling: the queue(3) macros DECLARE a struct.
