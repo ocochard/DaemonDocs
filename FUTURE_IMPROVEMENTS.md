@@ -960,6 +960,26 @@ fixes below and with ch18 included — it was the second inflation control
 and is the one chapter that would have told us whether ch3's result
 generalizes.
 
+**A third negative signal, from re-reading ch9's logs 2026-09-04: the
+enumeration ratchets instead of converging.** The treatment arm failed
+criterion 8 in round 1 on two entries, the writer addressed both, and
+round 3 failed it again on a *newly* found third — `rm_writecpus`,
+described structurally with no reason given for per-CPU tracking. The
+round-3 verdict names eight mechanisms that *do* carry rationale
+("turnstile hash-table indirection, cookie one-word design, adaptive
+spin-then-sleep, rmlock write-lock union mtx-vs-sx, WITNESS
+runtime-vs-static, Giant rules, cv_waiters optimization,
+SLEEPQ_CONDVAR-vs-SLEEPQ_SLEEP") and FAILs on the one it does not.
+This is "do not stop at three" behaving as specified and as the plan's
+risk section predicted: on a long chapter there is always one more
+mechanism, so the criterion has no fixed point and each round converts
+a fresh finding into writer instructions. Note the arm still ended at
+7/8 — the enumeration did not block it — but it spent rounds without
+approaching approval. **Any re-run after step 4 needs a stopping rule**
+(cap the list, or require the reviewer to weigh a new finding against
+what is already explained) or criterion 8 will consume `max_revisions`
+on exactly the long, dense chapters it was written for.
+
 **Two instrumentation defects this run exposed, both worth fixing before
 any re-run:**
 
@@ -2619,6 +2639,50 @@ of the draft are correct: `sys/kern/kern_thread.c:466` does
 frees it at destruction, while the lock-address hash is the lookup
 path. A thread donates its pre-allocated turnstile to whichever lock it
 first blocks on. The reviewer's "correction" is the actual error.
+
+**This one recurred and became ch9's sole blocker (closed 2026-09-04
+by hand).** It reappeared in the fw arm's round 3 with the same
+reasoning, and the kept draft — revision 2, 7/8, seven criteria PASS —
+fails on nothing else. Full source basis, since this objection has now
+cost two rounds across two runs: per-thread allocation at
+`sys/kern/kern_thread.c:466` and `:484` with the field declared
+`struct turnstile *td_turnstile;` at `sys/sys/proc.h:249`; chain-hash
+lookup at `sys/kern/subr_turnstile.c:98`
+(`#define TC_LOOKUP(lock) &turnstile_chains[TC_HASH(lock)]`), with
+`LIST_ENTRY(turnstile) ts_hash;` at `:124` and
+`struct turnstile_chain` at `:131`. No prose edit can satisfy this
+objection, because rewriting to appease it would make the chapter
+*less* accurate — which is why ch9 could never converge. The UNVERIFIED
+banner was replaced with a note recording the objection and its
+refutation, rather than deleted, so a reader learns the review history
+instead of silently inheriting an approval that never happened.
+
+**Correction to Failure 3's framing, and to "only one of four FAILs was
+real."** Both were written from round-3 review text without checking
+which draft shipped. `run_chapter` keeps the *best* draft, not the
+last, so ch9's round-3 findings describe a draft that was **discarded**:
+`__sx_slock()` (a genuine writer hallucination — only `__sx_slock_try`
+exists, `sys/kern/kern_sx.c:992`), the turnstile complaint, and the
+`no_marketing` "simply" are all absent from the shipped 7/8 revision.
+The "one-word hand fix applied 2026-09-04" was therefore applied to
+text that had already been superseded — harmless, but it was not what
+unblocked anything. **Before triaging a FAIL, confirm it describes the
+draft that shipped:** check `grade=` per round against
+`✓ wrote N lines`, and run the detectors over the on-disk file. Doing
+that for ch9 turned a three-term `accessibility` FAIL into a non-issue
+— it was round 1, the writer fixed it in round 2, and both detectors
+return `[]` against the shipped file. Two rounds of triage went into
+complaints about drafts that no longer existed.
+
+**A related reviewer-accuracy failure: it hallucinates the very gloss
+it demands.** ch9 round 1 failed `accessibility` over `UMA` and
+prescribed the fix: "a junior reader needs 'UMA (the kernel's
+user-managed allocator)'". UMA is the **Universal Memory Allocator**
+(the zone allocator). Taking a reviewer-suggested gloss verbatim would
+ship a wrong definition into a chapter that had no error. Reviewer
+prescriptions about *content* deserve the same distrust as its
+`accuracy` FAILs; only its detections of *absence* are reliable, and
+those come from the mechanical scan rather than the model.
 
 This is the same failure class as the fact-check homonym bug fixed in
 `a88d7fe` ("stop guessing between homonym structs"), but on the
